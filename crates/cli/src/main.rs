@@ -1,4 +1,4 @@
-//! The `chibi` binary: `init`, `run`, and `status`.
+//! The `chibi` binary: `init`, `run`, `stop`, and `status`.
 
 #![allow(
     clippy::print_stdout,
@@ -7,23 +7,22 @@
 )]
 
 mod config;
+mod init;
 mod rpc;
+mod run;
 
 use std::fmt;
-use std::io::{self, BufRead, Write};
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{Address, U256};
-use chibi_node::{Network, Node, NodeConfig, Snapshot, Token, read_snapshot};
+use alloy_primitives::U256;
+use chibi_node::{Disk, Network, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
-use eyre::WrapErr;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, data_dir, default_config_path, parse_address};
-use crate::rpc::RpcConfig;
+use crate::config::{Config, data_dir, default_config_path};
+use crate::init::InitArgs;
+use crate::run::RunArgs;
 
 /// Decimal places of one ether.
 const ETH_DECIMALS: u8 = 18;
@@ -43,29 +42,24 @@ struct Cli {
 enum Command {
     /// Write the config file, asking for whatever the flags leave out.
     Init {
-        /// Network to follow (sepolia or mainnet); prompted for when omitted.
-        #[arg(long)]
-        network: Option<Network>,
-        /// Watch-only address to track; repeat for several. Prompted for when omitted.
-        #[arg(long = "address", value_name = "ADDRESS", value_parser = parse_address)]
-        addresses: Vec<Address>,
+        #[command(flatten)]
+        answers: InitArgs,
         /// Config file to write instead of the default location.
         #[arg(long)]
         config: Option<PathBuf>,
     },
     /// Follow the chain and serve JSON-RPC to the wallet.
-    Run {
-        /// Network to follow instead of the configured one.
+    Run(RunArgs),
+    /// Stop the chibi running in the background.
+    Stop {
+        /// Network whose chibi to stop instead of the configured one.
         #[arg(long)]
         network: Option<Network>,
-        /// Address to serve JSON-RPC on instead of the configured one.
-        #[arg(long)]
-        rpc_addr: Option<SocketAddr>,
         /// Config file to read instead of the default location.
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Show the balances saved at the last verified head, without starting a node.
+    /// Show whether chibi runs and the balances saved at the last verified head.
     Status {
         /// Config file to read instead of the default location.
         #[arg(long)]
@@ -75,16 +69,14 @@ enum Command {
 
 fn main() -> eyre::Result<()> {
     match Cli::parse().command {
-        Command::Init {
-            network,
-            addresses,
-            config,
-        } => init(network, addresses, config),
-        Command::Run {
-            network,
-            rpc_addr,
-            config,
-        } => run(network, rpc_addr, config),
+        Command::Init { answers, config } => {
+            init::init(answers, &config_path(config.clone())?, config.as_deref())
+        }
+        Command::Run(args) => run::run(&args, &config_path(args.config.clone())?),
+        Command::Stop { network, config } => {
+            let config = Config::load(&config_path(config)?)?;
+            run::stop(network.unwrap_or(config.network))
+        }
         Command::Status { config } => status(config),
     }
 }
@@ -96,88 +88,21 @@ fn config_path(path: Option<PathBuf>) -> eyre::Result<PathBuf> {
     }
 }
 
-fn init(
-    network: Option<Network>,
-    addresses: Vec<Address>,
-    path: Option<PathBuf>,
-) -> eyre::Result<()> {
-    let path = config_path(path)?;
-    let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
-    if path.exists() {
-        let question = format!("{} already exists. Overwrite it?", path.display());
-        if !confirm(&mut input, &mut output, &question)? {
-            writeln!(output, "kept the existing config at {}", path.display())?;
-            return Ok(());
-        }
-    }
-    let network = match network {
-        Some(network) => network,
-        None => prompt_network(&mut input, &mut output)?,
-    };
-    let addresses = if addresses.is_empty() {
-        prompt_addresses(&mut input, &mut output)?
-    } else {
-        unique(addresses)
-    };
-    let config = Config::new(network, addresses);
-    config.save(&path)?;
-    write_next_steps(&mut output, &path, &config)?;
-    Ok(())
-}
-
-fn run(
-    network: Option<Network>,
-    rpc_addr: Option<SocketAddr>,
-    path: Option<PathBuf>,
-) -> eyre::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-    let mut config = Config::load(&config_path(path)?)?;
-    if let Some(network) = network {
-        config.network = network;
-    }
-    if let Some(rpc_addr) = rpc_addr {
-        config.rpc_addr = rpc_addr;
-    }
-    let node_config = config.node_config(data_dir(config.network)?);
-    tokio::runtime::Runtime::new()?.block_on(serve(node_config, config.rpc()))
-}
-
-async fn serve(node_config: NodeConfig, rpc_config: RpcConfig) -> eyre::Result<()> {
-    info!(
-        network = %node_config.network,
-        watched = node_config.watch.addresses.len(),
-        tokens = node_config.watch.tokens.len(),
-        data_dir = %node_config.data_dir.display(),
-        "starting"
-    );
-    let (node, follower) = Node::start(node_config).await?;
-    tokio::select! {
-        result = follower.run() => result.wrap_err("head follower stopped"),
-        result = rpc::serve(node, rpc_config) => result.wrap_err("JSON-RPC server stopped"),
-        result = tokio::signal::ctrl_c() => {
-            result?;
-            info!("shutting down");
-            Ok(())
-        }
-    }
-}
-
 fn status(path: Option<PathBuf>) -> eyre::Result<()> {
     let config = Config::load(&config_path(path)?)?;
-    match read_snapshot(&data_dir(config.network)?)? {
+    let data_dir = data_dir(config.network)?;
+    let mut output = io::stdout().lock();
+    write_running(&mut output, Disk::running(&data_dir)?, &config)?;
+    match read_snapshot(&data_dir)? {
         Some(snapshot) => {
             let spec = config.network.spec();
-            write_status(&mut io::stdout().lock(), &snapshot, spec.tokens, unix_now())?;
+            write_status(&mut output, &snapshot, spec.tokens, unix_now())?;
         }
-        None => println!(
+        None => writeln!(
+            output,
             "no snapshot for {} yet; it is saved once `chibi run` verifies its first head",
             config.network
-        ),
+        )?,
     }
     Ok(())
 }
@@ -188,125 +113,11 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// Input ended before a required answer.
-#[derive(Debug, thiserror::Error)]
-enum PromptError {
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error("input ended before {0}")]
-    Ended(&'static str),
-}
-
-/// Prints `prompt` and reads one trimmed line; `None` once input is exhausted.
-fn ask<R: BufRead, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    prompt: fmt::Arguments<'_>,
-) -> io::Result<Option<String>> {
-    output.write_fmt(prompt)?;
-    output.flush()?;
-    let mut line = String::new();
-    if input.read_line(&mut line)? == 0 {
-        writeln!(output)?;
-        return Ok(None);
+fn write_running<W: Write>(output: &mut W, pid: Option<u32>, config: &Config) -> io::Result<()> {
+    match pid {
+        Some(pid) => writeln!(output, "running (pid {pid}), JSON-RPC {}", config.rpc_url()),
+        None => writeln!(output, "not running"),
     }
-    Ok(Some(line.trim().to_owned()))
-}
-
-fn prompt_network<R: BufRead, W: Write>(
-    input: &mut R,
-    output: &mut W,
-) -> Result<Network, PromptError> {
-    let default = Network::default();
-    loop {
-        let answer = ask(input, output, format_args!("Network [{default}]: "))?
-            .ok_or(PromptError::Ended("a network was chosen"))?;
-        if answer.is_empty() {
-            return Ok(default);
-        }
-        match answer.to_ascii_lowercase().parse() {
-            Ok(network) => return Ok(network),
-            Err(unknown) => writeln!(output, "{unknown}")?,
-        }
-    }
-}
-
-fn prompt_addresses<R: BufRead, W: Write>(
-    input: &mut R,
-    output: &mut W,
-) -> Result<Vec<Address>, PromptError> {
-    let mut addresses = Vec::new();
-    loop {
-        let answer = ask(
-            input,
-            output,
-            format_args!("Watch-only address (blank to finish): "),
-        )?;
-        match answer.as_deref() {
-            None if addresses.is_empty() => {
-                return Err(PromptError::Ended("a watch-only address was entered"));
-            }
-            None => return Ok(addresses),
-            Some("") if addresses.is_empty() => {
-                writeln!(output, "Enter at least one address.")?;
-            }
-            Some("") => return Ok(addresses),
-            Some(text) => match parse_address(text) {
-                Ok(address) if addresses.contains(&address) => {
-                    writeln!(output, "{address} is already on the list.")?;
-                }
-                Ok(address) => addresses.push(address),
-                Err(invalid) => writeln!(output, "{invalid}")?,
-            },
-        }
-    }
-}
-
-fn confirm<R: BufRead, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    question: &str,
-) -> io::Result<bool> {
-    let answer = ask(input, output, format_args!("{question} [y/N] "))?;
-    Ok(answer.is_some_and(|answer| {
-        answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
-    }))
-}
-
-fn unique(addresses: Vec<Address>) -> Vec<Address> {
-    let mut kept = Vec::with_capacity(addresses.len());
-    for address in addresses {
-        if !kept.contains(&address) {
-            kept.push(address);
-        }
-    }
-    kept
-}
-
-fn write_next_steps<W: Write>(output: &mut W, path: &Path, config: &Config) -> io::Result<()> {
-    let spec = config.network.spec();
-    let count = config.addresses.len();
-    let plural = if count == 1 { "" } else { "es" };
-    write!(
-        output,
-        "wrote {} ({}, {count} address{plural}",
-        path.display(),
-        config.network
-    )?;
-    for (i, token) in spec.token("USDC").iter().enumerate() {
-        let lead = if i == 0 { ", tracking " } else { ", " };
-        write!(output, "{lead}{}", token.symbol)?;
-    }
-    writeln!(output, ")")?;
-    writeln!(output)?;
-    writeln!(output, "Next steps:")?;
-    writeln!(output, "  1. chibi run")?;
-    writeln!(
-        output,
-        "  2. In your wallet, add a custom network with RPC URL http://{} and chain id {}.",
-        config.rpc_addr,
-        spec.chain_id()
-    )
 }
 
 fn write_status<W: Write>(
@@ -380,10 +191,8 @@ impl fmt::Display for Age {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use alloy_eips::BlockNumHash;
-    use alloy_primitives::{B256, address};
+    use alloy_primitives::{Address, B256, address};
     use chibi_node::Holding;
 
     use super::*;
@@ -391,104 +200,24 @@ mod tests {
     const ALICE: Address = address!("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063");
     const BOB: Address = address!("0x00000000000000000000000000000000000000b0");
 
-    fn scripted<T>(
-        script: &str,
-        prompt: impl FnOnce(&mut Cursor<&[u8]>, &mut Vec<u8>) -> T,
-    ) -> (T, String) {
-        let mut input = Cursor::new(script.as_bytes());
-        let mut output = Vec::new();
-        let result = prompt(&mut input, &mut output);
-        (result, String::from_utf8(output).unwrap())
-    }
-
     #[test]
-    fn network_prompt_defaults_to_sepolia() {
-        let (network, output) = scripted("\n", |i, o| prompt_network(i, o));
-        assert_eq!(network.unwrap(), Network::Sepolia);
-        assert_eq!(output, "Network [sepolia]: ");
-    }
-
-    #[test]
-    fn network_prompt_reprompts_on_unknown_names() {
-        let (network, output) = scripted("goerli\n  Mainnet \n", |i, o| prompt_network(i, o));
-        assert_eq!(network.unwrap(), Network::Mainnet);
+    fn status_line_names_the_pid_and_rpc_url() {
+        let mut config = Config::new(Network::Sepolia, vec![ALICE]);
+        let line = |pid, config: &Config| {
+            let mut output = Vec::new();
+            write_running(&mut output, pid, config).unwrap();
+            String::from_utf8(output).unwrap()
+        };
         assert_eq!(
-            output,
-            "Network [sepolia]: unknown network \"goerli\"; expected sepolia or mainnet\n\
-             Network [sepolia]: "
+            line(Some(4242), &config),
+            "running (pid 4242), JSON-RPC http://127.0.0.1:8545\n"
         );
-    }
-
-    #[test]
-    fn network_prompt_fails_when_input_ends() {
-        let (network, _) = scripted("goerli\n", |i, o| prompt_network(i, o));
-        assert!(matches!(network, Err(PromptError::Ended(_))));
-    }
-
-    #[test]
-    fn address_prompt_validates_dedupes_and_requires_one() {
-        let script = "\n\
-                      0x1234\n\
-                      0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6a063\n\
-                      0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063\n\
-                      0x8f3cf7ad23cd3cadbd9735aff958023239c6a063\n\
-                      0x00000000000000000000000000000000000000b0\n\
-                      \n";
-        let (addresses, output) = scripted(script, |i, o| prompt_addresses(i, o));
-        assert_eq!(addresses.unwrap(), vec![ALICE, BOB]);
-        let prompt = "Watch-only address (blank to finish): ";
+        config.rpc_host = "chibi.local".parse().unwrap();
         assert_eq!(
-            output,
-            format!(
-                "{prompt}Enter at least one address.\n\
-                 {prompt}\"0x1234\" is not an address (expected 0x followed by 40 hex digits)\n\
-                 {prompt}\"0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6a063\" has an invalid checksum\n\
-                 {prompt}\
-                 {prompt}{ALICE} is already on the list.\n\
-                 {prompt}\
-                 {prompt}"
-            )
+            line(Some(7), &config),
+            "running (pid 7), JSON-RPC http://chibi.local:8545\n"
         );
-    }
-
-    #[test]
-    fn address_prompt_ends_with_input_once_one_is_entered() {
-        let (addresses, _) = scripted("0x00000000000000000000000000000000000000b0\n", |i, o| {
-            prompt_addresses(i, o)
-        });
-        assert_eq!(addresses.unwrap(), vec![BOB]);
-
-        let (none, _) = scripted("\n", |i, o| prompt_addresses(i, o));
-        assert!(matches!(none, Err(PromptError::Ended(_))));
-    }
-
-    #[test]
-    fn overwrite_needs_an_explicit_yes() {
-        for (script, expected) in [("y\n", true), ("YES\n", true), ("\n", false), ("", false)] {
-            let (answer, output) = scripted(script, |i, o| confirm(i, o, "Overwrite?"));
-            assert_eq!(answer.unwrap(), expected, "{script:?}");
-            assert!(output.starts_with("Overwrite? [y/N] "));
-        }
-    }
-
-    #[test]
-    fn flag_addresses_are_deduplicated_in_order() {
-        assert_eq!(unique(vec![BOB, ALICE, BOB, ALICE]), vec![BOB, ALICE]);
-    }
-
-    #[test]
-    fn next_steps_name_the_rpc_url_and_chain_id() {
-        let mut output = Vec::new();
-        let config = Config::new(Network::Sepolia, vec![ALICE]);
-        write_next_steps(&mut output, Path::new("/cfg/config.toml"), &config).unwrap();
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "wrote /cfg/config.toml (sepolia, 1 address, tracking USDC)\n\
-             \n\
-             Next steps:\n\
-             \x20 1. chibi run\n\
-             \x20 2. In your wallet, add a custom network with RPC URL http://127.0.0.1:8545 and chain id 11155111.\n"
-        );
+        assert_eq!(line(None, &config), "not running\n");
     }
 
     #[test]

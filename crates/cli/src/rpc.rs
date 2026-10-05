@@ -160,6 +160,11 @@ impl AllowedHost {
             })
             .collect()
     }
+
+    /// Admits `host`, a name or bracketed IPv6 address, bare and with the listen port.
+    pub fn bare(host: String) -> Self {
+        Self { host, port: None }
+    }
 }
 
 impl fmt::Display for AllowedHost {

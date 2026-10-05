@@ -51,11 +51,12 @@ for address in "$@"; do
     addresses="$addresses --address $address"
 done
 # shellcheck disable=SC2086
-"$run_dir/bin/chibi" init --network "$network" $addresses >"$run_dir/evidence/init.txt"
+"$run_dir/bin/chibi" init --network "$network" $addresses --token USDC \
+    --rpc-host 127.0.0.1 --rpc-port "$port" </dev/null >"$run_dir/evidence/init.txt"
 
 # env and nohup exec in place, so $! is chibi's own pid.
 env RUST_LOG="${CHIBI_VERIFY_LOG:-info,chibi::devp2p=debug}" \
-    nohup "$run_dir/bin/chibi" run --rpc-addr "127.0.0.1:$port" >"$run_dir/chibi.log" 2>&1 &
+    nohup "$run_dir/bin/chibi" run --rpc-host 127.0.0.1 --rpc-port "$port" >"$run_dir/chibi.log" 2>&1 &
 echo $! >"$run_dir/chibi.pid"
 
 waited=0

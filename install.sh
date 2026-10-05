@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs chibi from this checkout, writes its config on first use, and starts it.
+# Installs chibi from this checkout and writes its config. It does not start chibi.
 set -eu
 
 repo=$(cd "$(dirname "$0")" && pwd)
@@ -12,10 +12,19 @@ fi
 
 cargo install --locked --path "$repo/crates/cli"
 # cargo's bin directory may not be on PATH yet right after a fresh rustup install.
-chibi="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/chibi"
+bin="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
 
+echo
 if [ -t 0 ]; then
-    "$chibi" init
+    "$bin/chibi" init
+else
+    echo "Input is not a terminal, so chibi was not set up. Run \`chibi init\` to write its config."
 fi
 
-exec "$chibi" run
+echo
+if ! command -v chibi >/dev/null 2>&1; then
+    echo "Add $bin to your PATH to use the commands below."
+fi
+echo "Start chibi:      chibi run      (foreground; Ctrl-C stops it)"
+echo "              or  chibi run -b   (background; \`chibi stop\` stops it)"
+echo "Check on chibi:   chibi status"

@@ -1,12 +1,15 @@
 //! `config.toml`: parsed into typed values at load, so everything downstream trusts it.
 
+use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use alloy_primitives::{Address, B256};
 use chibi_node::devp2p::Ports;
-use chibi_node::{Network, NodeConfig, Watchlist};
+use chibi_node::{Network, NodeConfig, Token, Watchlist};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
@@ -14,43 +17,91 @@ use url::Url;
 use crate::rpc::{AllowedHost, OriginPattern, RpcConfig};
 
 /// The JSON-RPC port wallets expect from a local node.
-const DEFAULT_RPC_PORT: u16 = 8545;
+pub const DEFAULT_RPC_PORT: NonZeroU16 = match NonZeroU16::new(8545) {
+    Some(port) => port,
+    None => panic!("8545 is not zero"),
+};
+
+/// Tokens tracked when the user picks none explicitly.
+pub const DEFAULT_TOKENS: [&str; 1] = ["USDC"];
 
 /// Origins of browser-extension pages; ordinary websites cannot read tracked balances.
 const DEFAULT_CORS_ORIGINS: [&str; 2] = ["chrome-extension://*", "moz-extension://*"];
 
 /// The contents of `config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ConfigFile")]
 pub struct Config {
     /// The chain to follow.
-    #[serde(default)]
     pub network: Network,
     /// Watch-only addresses whose balances are tracked.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_addresses",
-        serialize_with = "serialize_addresses"
-    )]
+    #[serde(serialize_with = "serialize_addresses")]
     pub addresses: Vec<Address>,
+    /// Tokens from the network's registry tracked for every watched address.
+    #[serde(serialize_with = "serialize_tokens")]
+    pub tokens: Vec<Token>,
     /// Beacon API endpoint; the network's default when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub beacon_url: Option<Url>,
     /// Weak-subjectivity checkpoint override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<B256>,
-    /// Where the JSON-RPC server listens.
-    #[serde(default = "default_rpc_addr")]
-    pub rpc_addr: SocketAddr,
+    /// The host wallets use to reach the JSON-RPC server; it also decides where it listens.
+    pub rpc_host: RpcHost,
+    /// The JSON-RPC port.
+    pub rpc_port: NonZeroU16,
     /// Browser origins allowed to read responses cross-origin.
-    #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<OriginPattern>,
-    /// `Host` headers the JSON-RPC server answers, as `host` or `host:port`.
-    #[serde(default = "AllowedHost::loopback")]
+    /// `Host` headers the JSON-RPC server answers besides `rpc_host`, as `host` or `host:port`.
     pub allowed_hosts: Vec<AllowedHost>,
     /// devp2p listen port for both RLPx and discovery; the OS picks one when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_port: Option<u16>,
+}
+
+/// `config.toml` as written, before token symbols are resolved against the network.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    #[serde(default)]
+    network: Network,
+    #[serde(default, deserialize_with = "deserialize_addresses")]
+    addresses: Vec<Address>,
+    #[serde(default = "default_token_symbols")]
+    tokens: Vec<String>,
+    #[serde(default)]
+    beacon_url: Option<Url>,
+    #[serde(default)]
+    checkpoint: Option<B256>,
+    #[serde(default)]
+    rpc_host: RpcHost,
+    #[serde(default = "default_rpc_port")]
+    rpc_port: NonZeroU16,
+    #[serde(default = "default_cors_origins")]
+    cors_origins: Vec<OriginPattern>,
+    #[serde(default = "AllowedHost::loopback")]
+    allowed_hosts: Vec<AllowedHost>,
+    #[serde(default)]
+    p2p_port: Option<u16>,
+}
+
+impl TryFrom<ConfigFile> for Config {
+    type Error = UnknownToken;
+
+    fn try_from(file: ConfigFile) -> Result<Self, UnknownToken> {
+        Ok(Self {
+            tokens: resolve_tokens(file.network, &file.tokens)?,
+            network: file.network,
+            addresses: file.addresses,
+            beacon_url: file.beacon_url,
+            checkpoint: file.checkpoint,
+            rpc_host: file.rpc_host,
+            rpc_port: file.rpc_port,
+            cors_origins: file.cors_origins,
+            allowed_hosts: file.allowed_hosts,
+            p2p_port: file.p2p_port,
+        })
+    }
 }
 
 impl Config {
@@ -59,9 +110,11 @@ impl Config {
         Self {
             network,
             addresses,
+            tokens: default_tokens(network),
             beacon_url: None,
             checkpoint: None,
-            rpc_addr: default_rpc_addr(),
+            rpc_host: RpcHost::default(),
+            rpc_port: DEFAULT_RPC_PORT,
             cors_origins: default_cors_origins(),
             allowed_hosts: AllowedHost::loopback(),
             p2p_port: None,
@@ -114,7 +167,7 @@ impl Config {
             checkpoint: self.checkpoint,
             watch: Watchlist {
                 addresses: self.addresses.clone(),
-                tokens: self.network.spec().token("USDC").into_iter().collect(),
+                tokens: self.tokens.clone(),
             },
             ports: Ports {
                 rlpx: port,
@@ -123,14 +176,207 @@ impl Config {
         }
     }
 
-    /// The JSON-RPC server settings.
-    pub fn rpc(&self) -> RpcConfig {
-        RpcConfig {
-            addr: self.rpc_addr,
+    /// The JSON-RPC server settings, with `rpc_host` resolved to the listen address.
+    pub fn rpc(&self) -> Result<RpcConfig, ResolveError> {
+        Ok(RpcConfig {
+            addr: self.rpc_host.bind_addr(self.rpc_port)?,
             cors_origins: self.cors_origins.clone(),
-            allowed_hosts: self.allowed_hosts.clone(),
+            allowed_hosts: self.effective_allowed_hosts(),
+        })
+    }
+
+    /// `allowed_hosts` plus `rpc_host`, so the name the wallet was given is always answered.
+    pub fn effective_allowed_hosts(&self) -> Vec<AllowedHost> {
+        let chosen = AllowedHost::bare(self.rpc_host.url_host());
+        let mut hosts = self.allowed_hosts.clone();
+        if !hosts.contains(&chosen) {
+            hosts.push(chosen);
+        }
+        hosts
+    }
+
+    /// The URL a wallet uses to reach the JSON-RPC server.
+    pub fn rpc_url(&self) -> String {
+        format!("http://{}:{}", self.rpc_host.url_host(), self.rpc_port)
+    }
+}
+
+/// Where wallets reach the JSON-RPC server: an IP address or a DNS name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum RpcHost {
+    /// A literal address, written without brackets.
+    Ip(IpAddr),
+    /// A DNS name, lowercased.
+    Name(String),
+}
+
+impl RpcHost {
+    /// The host as it appears in a URL or `Host` header, with IPv6 addresses bracketed.
+    pub fn url_host(&self) -> String {
+        match self {
+            Self::Ip(IpAddr::V6(ip)) => format!("[{ip}]"),
+            Self::Ip(IpAddr::V4(ip)) => ip.to_string(),
+            Self::Name(name) => name.clone(),
         }
     }
+
+    /// The socket address to listen on: the IP itself, or the name's first IPv4 address, else
+    /// its first address. `localhost` often resolves to `::1` first, while wallets and tools
+    /// commonly try `127.0.0.1`.
+    pub fn bind_addr(&self, port: NonZeroU16) -> Result<SocketAddr, ResolveError> {
+        match self {
+            Self::Ip(ip) => Ok(SocketAddr::new(*ip, port.get())),
+            Self::Name(name) => {
+                let addrs: Vec<SocketAddr> = (name.as_str(), port.get())
+                    .to_socket_addrs()
+                    .map_err(|source| ResolveError::Lookup {
+                        host: name.clone(),
+                        source,
+                    })?
+                    .collect();
+                addrs
+                    .iter()
+                    .find(|addr| addr.is_ipv4())
+                    .or_else(|| addrs.first())
+                    .copied()
+                    .ok_or_else(|| ResolveError::NoAddress(name.clone()))
+            }
+        }
+    }
+}
+
+impl Default for RpcHost {
+    fn default() -> Self {
+        Self::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    }
+}
+
+impl fmt::Display for RpcHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(ip) => write!(f, "{ip}"),
+            Self::Name(name) => f.write_str(name),
+        }
+    }
+}
+
+impl FromStr for RpcHost {
+    type Err = InvalidRpcHost;
+
+    fn from_str(text: &str) -> Result<Self, InvalidRpcHost> {
+        let text = text.trim();
+        if let Ok(ip) = text.parse() {
+            return Ok(Self::Ip(ip));
+        }
+        let bracketed = text.strip_prefix('[').and_then(|t| t.strip_suffix(']'));
+        if let Some(Ok(ip)) = bracketed.map(str::parse::<std::net::Ipv6Addr>) {
+            return Ok(Self::Ip(IpAddr::V6(ip)));
+        }
+        if is_host_name(text) {
+            Ok(Self::Name(text.to_ascii_lowercase()))
+        } else {
+            Err(InvalidRpcHost(text.to_owned()))
+        }
+    }
+}
+
+impl TryFrom<String> for RpcHost {
+    type Error = InvalidRpcHost;
+
+    fn try_from(text: String) -> Result<Self, InvalidRpcHost> {
+        text.parse()
+    }
+}
+
+impl From<RpcHost> for String {
+    fn from(host: RpcHost) -> Self {
+        host.to_string()
+    }
+}
+
+/// RFC 1123 host name; an all-numeric last label would be a malformed IPv4 address.
+fn is_host_name(text: &str) -> bool {
+    let valid_label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    text.len() <= 253
+        && text.split('.').all(valid_label)
+        && text
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A `rpc_host` that is neither an IP address nor a host name.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not an IP address or host name")]
+pub struct InvalidRpcHost(String);
+
+/// Why `rpc_host` gave no address to listen on.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    /// The name lookup failed.
+    #[error("cannot resolve rpc_host {host}: {source}")]
+    Lookup {
+        /// The configured name.
+        host: String,
+        /// The resolver failure.
+        source: io::Error,
+    },
+    /// The name resolved to nothing.
+    #[error("rpc_host {0} resolves to no address")]
+    NoAddress(String),
+}
+
+/// A token symbol that is not in the network's registry.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown token {symbol:?} on {network}; known tokens: {}", known_symbols(.network))]
+pub struct UnknownToken {
+    /// The network whose registry was searched.
+    pub network: Network,
+    /// The symbol as given.
+    pub symbol: String,
+}
+
+fn known_symbols(network: &Network) -> String {
+    let spec = network.spec();
+    let symbols: Vec<&str> = spec.tokens.iter().map(|token| token.symbol).collect();
+    symbols.join(", ")
+}
+
+/// The registry tokens named by `symbols`, ignoring case, deduplicated in order.
+pub fn resolve_tokens<S: AsRef<str>>(
+    network: Network,
+    symbols: &[S],
+) -> Result<Vec<Token>, UnknownToken> {
+    let spec = network.spec();
+    let mut tokens = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let symbol = symbol.as_ref().trim();
+        let token = spec.token(symbol).ok_or_else(|| UnknownToken {
+            network,
+            symbol: symbol.to_owned(),
+        })?;
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    Ok(tokens)
+}
+
+/// The tokens tracked unless the user chooses otherwise.
+pub fn default_tokens(network: Network) -> Vec<Token> {
+    let spec = network.spec();
+    DEFAULT_TOKENS
+        .iter()
+        .filter_map(|symbol| spec.token(symbol))
+        .collect()
 }
 
 /// `config.toml` in the user's config directory.
@@ -216,8 +462,15 @@ pub enum ConfigError {
     },
 }
 
-fn default_rpc_addr() -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RPC_PORT))
+fn default_rpc_port() -> NonZeroU16 {
+    DEFAULT_RPC_PORT
+}
+
+fn default_token_symbols() -> Vec<String> {
+    DEFAULT_TOKENS
+        .iter()
+        .map(|symbol| (*symbol).to_owned())
+        .collect()
 }
 
 fn default_cors_origins() -> Vec<OriginPattern> {
@@ -243,20 +496,37 @@ fn serialize_addresses<S: Serializer>(
     serializer.collect_seq(addresses.iter().map(|a| a.to_checksum(None)))
 }
 
+fn serialize_tokens<S: Serializer>(tokens: &[Token], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(tokens.iter().map(|token| token.symbol))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+
     use alloy_primitives::address;
 
     use super::*;
 
     const ALICE: Address = address!("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063");
 
+    fn token(network: Network, symbol: &str) -> Token {
+        network.spec().token(symbol).unwrap()
+    }
+
+    fn port(port: u16) -> NonZeroU16 {
+        NonZeroU16::new(port).unwrap()
+    }
+
     #[test]
     fn minimal_config_takes_defaults() {
         let config =
             Config::parse(r#"addresses = ["0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"]"#).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, vec![ALICE]));
-        assert_eq!(config.rpc_addr.to_string(), "127.0.0.1:8545");
+        assert_eq!(config.tokens, vec![token(Network::Sepolia, "USDC")]);
+        assert_eq!(config.rpc_host, RpcHost::Ip(Ipv4Addr::LOCALHOST.into()));
+        assert_eq!(config.rpc_port, port(8545));
+        assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
         assert_eq!(
             config.cors_origins,
             vec![
@@ -280,9 +550,11 @@ mod tests {
             r#"
             network = "mainnet"
             addresses = ["0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"]
+            tokens = ["wbtc", "USDT", "WBTC"]
             beacon_url = "https://beacon.example/"
             checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
-            rpc_addr = "127.0.0.1:9545"
+            rpc_host = "Chibi.Example"
+            rpc_port = 9545
             cors_origins = ["https://app.example", "chrome-extension://abc*"]
             allowed_hosts = ["localhost", "chibi.local:9545"]
             p2p_port = 30303
@@ -294,9 +566,14 @@ mod tests {
             Config {
                 network: Network::Mainnet,
                 addresses: vec![ALICE],
+                tokens: vec![
+                    token(Network::Mainnet, "WBTC"),
+                    token(Network::Mainnet, "USDT")
+                ],
                 beacon_url: Some(Url::parse("https://beacon.example/").unwrap()),
                 checkpoint: Some(B256::repeat_byte(0x11)),
-                rpc_addr: "127.0.0.1:9545".parse().unwrap(),
+                rpc_host: RpcHost::Name("chibi.example".to_owned()),
+                rpc_port: port(9545),
                 cors_origins: vec![
                     OriginPattern::Exact("https://app.example".to_owned()),
                     OriginPattern::Prefix("chrome-extension://abc".to_owned()),
@@ -317,6 +594,40 @@ mod tests {
             }
         );
         assert_eq!(node.watch.addresses, vec![ALICE]);
+        assert_eq!(node.watch.tokens, config.tokens);
+    }
+
+    #[test]
+    fn unknown_token_is_rejected_naming_the_known_ones() {
+        let error = Config::parse(r#"tokens = ["USDC", "XYZ"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"XYZ\""), "{error}");
+        assert!(error.contains("USDC, USDT, DAI, WETH, LINK"), "{error}");
+
+        let error = Config::parse(r#"tokens = ["WBTC"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown token \"WBTC\" on sepolia"),
+            "{error}"
+        );
+        assert!(
+            Config::parse("network = \"mainnet\"\ntokens = [\"WBTC\"]").is_ok(),
+            "WBTC is in the mainnet registry"
+        );
+    }
+
+    #[test]
+    fn empty_token_list_tracks_none() {
+        let config = Config::parse("tokens = []").unwrap();
+        assert!(
+            config
+                .node_config(PathBuf::from("/data"))
+                .watch
+                .tokens
+                .is_empty()
+        );
     }
 
     #[test]
@@ -361,8 +672,10 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field() {
-        let error = Config::parse("rpc_port = 8545").unwrap_err().to_string();
-        assert!(error.contains("rpc_port"), "{error}");
+        let error = Config::parse(r#"rpc_addr = "127.0.0.1:8545""#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rpc_addr"), "{error}");
     }
 
     #[test]
@@ -370,7 +683,11 @@ mod tests {
         for text in [
             r#"beacon_url = "not a url""#,
             r#"checkpoint = "0x11""#,
-            r#"rpc_addr = "localhost""#,
+            r#"rpc_host = "chibi_local""#,
+            r#"rpc_host = "http://localhost""#,
+            "rpc_port = 0",
+            "rpc_port = 70000",
+            r#"tokens = "USDC""#,
             r#"cors_origins = ["chrome-*-extension://"]"#,
             r#"cors_origins = [""]"#,
             r#"allowed_hosts = ["http://localhost"]"#,
@@ -378,6 +695,77 @@ mod tests {
         ] {
             assert!(Config::parse(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn rpc_host_accepts_ips_and_host_names() {
+        let parse = |text: &str| text.parse::<RpcHost>();
+        assert_eq!(
+            parse("0.0.0.0"),
+            Ok(RpcHost::Ip(Ipv4Addr::UNSPECIFIED.into()))
+        );
+        assert_eq!(parse("::1"), Ok(RpcHost::Ip(Ipv6Addr::LOCALHOST.into())));
+        assert_eq!(parse("[::1]"), Ok(RpcHost::Ip(Ipv6Addr::LOCALHOST.into())));
+        assert_eq!(
+            parse("LocalHost"),
+            Ok(RpcHost::Name("localhost".to_owned()))
+        );
+        assert_eq!(
+            parse("node-1.chibi.example"),
+            Ok(RpcHost::Name("node-1.chibi.example".to_owned()))
+        );
+        for bad in [
+            "",
+            "1.2.3",
+            "300.1.1.1",
+            "-chibi.example",
+            "chibi..example",
+            "a b",
+            "host:8545",
+        ] {
+            assert_eq!(parse(bad), Err(InvalidRpcHost(bad.to_owned())), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allowlist_adds_the_chosen_rpc_host() {
+        let mut config = Config::new(Network::Sepolia, vec![ALICE]);
+        let shown = |config: &Config| {
+            config
+                .effective_allowed_hosts()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&config), ["localhost", "127.0.0.1", "[::1]"]);
+
+        config.rpc_host = "::1".parse().unwrap();
+        assert_eq!(shown(&config), ["localhost", "127.0.0.1", "[::1]"]);
+
+        config.rpc_host = "chibi.example".parse().unwrap();
+        assert_eq!(
+            shown(&config),
+            ["localhost", "127.0.0.1", "[::1]", "chibi.example"]
+        );
+        assert_eq!(config.rpc_url(), "http://chibi.example:8545");
+    }
+
+    #[test]
+    fn bind_address_resolves_names_and_keeps_ips() {
+        let localhost = RpcHost::Name("localhost".to_owned())
+            .bind_addr(port(8745))
+            .unwrap();
+        assert!(localhost.ip().is_loopback(), "{localhost}");
+        assert_eq!(localhost.port(), 8745);
+
+        let any = RpcHost::Ip(Ipv4Addr::UNSPECIFIED.into());
+        assert_eq!(
+            any.bind_addr(port(8545)).unwrap(),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8545))
+        );
+        let v6 = RpcHost::Ip(Ipv6Addr::LOCALHOST.into());
+        assert_eq!(v6.url_host(), "[::1]");
+        assert_eq!(v6.bind_addr(port(9)).unwrap().to_string(), "[::1]:9");
     }
 
     #[test]
@@ -389,7 +777,13 @@ mod tests {
             .cors_origins
             .push(OriginPattern::Exact("https://app.example".to_owned()));
         config.p2p_port = Some(30304);
+        config.tokens = resolve_tokens(Network::Mainnet, &["dai", "WBTC"]).unwrap();
+        config.rpc_host = "::1".parse().unwrap();
+        config.rpc_port = port(9545);
         config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"tokens = ["DAI", "WBTC"]"#), "{text}");
+        assert!(text.contains(r#"rpc_host = "::1""#), "{text}");
         assert_eq!(Config::load(&path).unwrap(), config);
     }
 
