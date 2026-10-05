@@ -58,6 +58,8 @@ pub struct Log {
     pub penalized: Vec<PeerKey>,
     /// Account, storage, and code requests served.
     pub proofs: usize,
+    /// Block bodies served.
+    pub bodies: usize,
     /// Broadcasts, in order.
     pub broadcasts: Vec<Broadcast>,
 }
@@ -305,6 +307,7 @@ impl Peers for FixturePeers {
         if self.inner.faults.lock().withhold_bodies {
             return Err(NetError::Rejected);
         }
+        self.inner.log.lock().bodies += blocks.len();
         let world = self.inner.world.lock();
         Self::honest(blocks.iter().map(|hash| world.body(*hash)).collect())
     }
@@ -318,7 +321,7 @@ impl Peers for FixturePeers {
         let raw = Bytes::from(transaction.encoded_2718());
         let persisted = dir
             .and_then(|dir| read_state(&dir).ok().flatten())
-            .is_some_and(|file| file.outbox().contains(&raw));
+            .is_some_and(|file| file.outbox().iter().any(|saved| saved.raw == raw));
         self.inner.log.lock().broadcasts.push(Broadcast {
             transaction,
             persisted,

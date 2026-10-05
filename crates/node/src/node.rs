@@ -17,7 +17,7 @@ use chibi_core::exec::{
     self, CallRequest, ChainEnv, EstimateError, ExecError, ExecutionResult, HaltReason, Misses,
 };
 use chibi_core::state::{Account, Key, Miss, State, StateError, Store};
-use chibi_core::tx::{self, FeeSample, Lookup, PendingTx, TxBook, VerifiedReceipt};
+use chibi_core::tx::{self, FeeSample, Lookup, PendingTx, VerifiedReceipt};
 use chibi_core::verify::{VerifiedBody, VerifyError};
 use chibi_core::wire::Transaction;
 use parking_lot::Mutex;
@@ -28,7 +28,7 @@ use url::Url;
 
 use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
 use crate::devp2p::{Devp2p, Devp2pError, HeadHint, Ports};
-use crate::disk::{Disk, StateFile};
+use crate::disk::{Disk, OutboxTx, StateFile};
 use crate::fetch::{self, Fetched};
 use crate::follow::Search;
 use crate::heads::Heads;
@@ -424,7 +424,8 @@ impl<P: Peers> Node<P> {
             )
         });
         info!(target: "chibi::node", head = number, keys, "anchored");
-        // Restored transactions may already sit in blocks this run never passed.
+        // Restored transactions may already sit in blocks this run never passed; the search
+        // reaches back to their submission anchors.
         let floor = (!restored).then(|| anchor.num_hash());
         Ok((
             Self {
@@ -723,7 +724,8 @@ impl<P: Peers> Node<P> {
     pub async fn submit(&self, raw: &[u8]) -> Result<TxHash, NodeError> {
         let transaction = Transaction::decode_2718_exact(raw)
             .map_err(|_| NodeError::InvalidTransaction("malformed EIP-2718 transaction"))?;
-        let pending = self.shared.accept(transaction)?;
+        let since = self.shared.read(|s| s.anchor().num_hash());
+        let pending = self.shared.accept(transaction, since)?;
         let hash = pending.hash;
         let transaction = pending.tx.clone();
         self.shared.record(pending).await?;
@@ -957,7 +959,7 @@ impl<P: Peers> Shared<P> {
                 let (tracked, outbox, store) = shared.read(|s| {
                     (
                         s.tracked().collect::<Vec<_>>(),
-                        outbox(s.txs()),
+                        outbox(s.txs().pending()),
                         s.snapshot(),
                     )
                 });
@@ -974,7 +976,10 @@ impl<P: Peers> Shared<P> {
     /// book, so a submission reported as failed is never broadcast or counted.
     async fn record(self: &Arc<Self>, pending: PendingTx) -> Result<(), NodeError> {
         let shared = Arc::clone(self);
-        let raw = Bytes::from(pending.tx.encoded_2718());
+        let entry = OutboxTx {
+            raw: Bytes::from(pending.tx.encoded_2718()),
+            since: pending.since,
+        };
         let (hash, sender, nonce) = (pending.hash, pending.sender, pending.nonce);
         blocking(move || {
             shared.disk.save_then(
@@ -982,14 +987,15 @@ impl<P: Peers> Shared<P> {
                     let outbox = shared.read(|s| {
                         let txs = s.txs();
                         if !matches!(txs.lookup(hash), Lookup::Unknown) {
-                            return outbox(txs);
+                            return outbox(txs.pending());
                         }
-                        txs.pending()
-                            .iter()
-                            .filter(|p| p.sender != sender || p.nonce != nonce)
-                            .map(|p| Bytes::from(p.tx.encoded_2718()))
-                            .chain(std::iter::once(raw))
-                            .collect()
+                        let mut entries = outbox(
+                            txs.pending()
+                                .iter()
+                                .filter(|p| p.sender != sender || p.nonce != nonce),
+                        );
+                        entries.push(entry);
+                        entries
                     });
                     file.set_outbox(outbox);
                 },
@@ -999,8 +1005,13 @@ impl<P: Peers> Shared<P> {
         .await
     }
 
-    /// Checks a submitted transaction and recovers its sender.
-    fn accept(&self, transaction: Transaction) -> Result<PendingTx, NodeError> {
+    /// Checks a submitted transaction and recovers its sender. `since` is the anchor read
+    /// before the outbox write; an older one only widens the search for the transaction.
+    fn accept(
+        &self,
+        transaction: Transaction,
+        since: BlockNumHash,
+    ) -> Result<PendingTx, NodeError> {
         if matches!(transaction, Transaction::Eip4844(_)) {
             return Err(NodeError::InvalidTransaction(
                 "blob transactions are not supported",
@@ -1022,7 +1033,7 @@ impl<P: Peers> Shared<P> {
         let sender = transaction
             .recover_signer()
             .map_err(|_| NodeError::InvalidTransaction("invalid signature"))?;
-        Ok(PendingTx::new(transaction, sender))
+        Ok(PendingTx::new(transaction, sender, since))
     }
 
     /// Sends `transaction` to peers. Failure is logged: the follower re-broadcasts.
@@ -1039,11 +1050,11 @@ impl<P: Peers> Shared<P> {
     }
 
     /// Records and re-broadcasts outbox transactions saved by an earlier run.
-    async fn restore_outbox(&self, outbox: &[Bytes]) {
-        for raw in outbox {
-            let accepted = Transaction::decode_2718_exact(raw)
+    async fn restore_outbox(&self, outbox: &[OutboxTx]) {
+        for saved in outbox {
+            let accepted = Transaction::decode_2718_exact(&saved.raw)
                 .map_err(|_| NodeError::InvalidTransaction("malformed EIP-2718 transaction"))
-                .and_then(|transaction| self.accept(transaction));
+                .and_then(|transaction| self.accept(transaction, saved.since));
             match accepted {
                 Ok(pending) => {
                     let transaction = pending.tx.clone();
@@ -1123,10 +1134,13 @@ fn misses(misses: Misses) -> Vec<Miss> {
     misses.into_iter().collect()
 }
 
-fn outbox(txs: &TxBook) -> Vec<Bytes> {
-    txs.pending()
-        .iter()
-        .map(|pending| Bytes::from(pending.tx.encoded_2718()))
+fn outbox<'a>(pending: impl IntoIterator<Item = &'a PendingTx>) -> Vec<OutboxTx> {
+    pending
+        .into_iter()
+        .map(|p| OutboxTx {
+            raw: Bytes::from(p.tx.encoded_2718()),
+            since: p.since,
+        })
         .collect()
 }
 

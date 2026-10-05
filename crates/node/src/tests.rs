@@ -8,7 +8,7 @@ use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use chibi_core::exec::{CallRequest, ExecutionResult};
-use chibi_core::state::Key;
+use chibi_core::state::{HEADER_WINDOW, Key};
 use chibi_core::testing::{
     BASE_FEE, BlockWrites, EIP1967_IMPLEMENTATION_SLOT, GAS_PRICE, WorldAccount,
     balance_of_calldata, delegating_proxy_code, eth, legacy_transfer, mapping_reader_code,
@@ -371,6 +371,99 @@ async fn a_transaction_mined_in_a_gap_block_gets_its_receipt_after_a_reanchor() 
         node.transaction(hash).unwrap().unwrap().included,
         Some((block, 0))
     );
+}
+
+fn mine_empty_unseen(fixture: &Fixture, blocks: usize) -> B256 {
+    let mut head = B256::ZERO;
+    for _ in 0..blocks {
+        head = fixture.mine_unseen(BlockWrites::default());
+    }
+    head
+}
+
+#[tokio::test]
+async fn a_restart_past_the_header_window_finds_the_transaction_mined_after_submission() {
+    let signer = PrivateKeySigner::random();
+    let sender = signer.address();
+    let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let tx = signed_transfer(&signer, 1, 0);
+    let hash = *tx.tx_hash();
+    {
+        let (node, _follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+        node.submit(&tx.encoded_2718()).await.unwrap();
+    }
+    let mined = fixture.mine_unseen(included(sender, &tx));
+    let head = mine_empty_unseen(&fixture, HEADER_WINDOW + 44);
+    fixture.publish(head);
+    let block = fixture.world(|w| w.verified(mined)).num_hash();
+
+    let (node, mut follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    assert_eq!(node.head().hash(), head);
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    assert_eq!(
+        node.transaction(hash).unwrap().unwrap().included,
+        Some((block, 0))
+    );
+    assert_eq!(node.receipt(hash).unwrap().unwrap().receipt.block(), block);
+    assert!(read_state(dir.path()).unwrap().unwrap().outbox().is_empty());
+}
+
+#[tokio::test]
+async fn a_step_past_the_header_window_finds_the_transaction_and_does_not_search_again() {
+    let signer = PrivateKeySigner::random();
+    let sender = signer.address();
+    let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    let tx = signed_transfer(&signer, node.chain_id(), 0);
+    let hash = node.submit(&tx.encoded_2718()).await.unwrap();
+
+    let mined = fixture.mine_unseen(included(sender, &tx));
+    let head = mine_empty_unseen(&fixture, HEADER_WINDOW + 44);
+    fixture.publish(head);
+    let block = fixture.world(|w| w.verified(mined)).num_hash();
+    assert!(matches!(
+        follower.step().await.unwrap(),
+        Stepped::Reanchored(_)
+    ));
+    assert_eq!(
+        node.transaction(hash).unwrap().unwrap().included,
+        Some((block, 0))
+    );
+    assert_eq!(node.receipt(hash).unwrap().unwrap().receipt.block(), block);
+
+    let next = signed_transfer(&signer, node.chain_id(), 1);
+    node.submit(&next.encoded_2718()).await.unwrap();
+    let searched = fixture.log().bodies;
+    fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    assert_eq!(fixture.log().bodies - searched, 1);
+    assert_eq!(
+        node.transaction(*next.tx_hash()).unwrap().unwrap().included,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_transaction_whose_nonce_another_took_is_dropped_once_its_blocks_were_searched() {
+    let signer = PrivateKeySigner::random();
+    let sender = signer.address();
+    let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    let ours = signed_transfer(&signer, node.chain_id(), 0);
+    let hash = node.submit(&ours.encoded_2718()).await.unwrap();
+
+    let theirs = legacy_transfer(0, BOB, eth(1));
+    fixture.mine(
+        BlockWrites::default()
+            .nonce(sender, 1)
+            .tx(theirs, 21_000, 0),
+    );
+    follower.step().await.unwrap();
+    assert_eq!(node.transaction(hash).unwrap(), None);
+    assert!(read_state(dir.path()).unwrap().unwrap().outbox().is_empty());
 }
 
 #[cfg(unix)]

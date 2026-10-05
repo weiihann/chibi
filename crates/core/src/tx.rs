@@ -27,16 +27,21 @@ pub struct PendingTx {
     pub nonce: u64,
     /// The signed transaction.
     pub tx: wire::Transaction,
+    /// The anchor chibi held at submission. Inclusion can only be in a later block, so a
+    /// search for the transaction need not reach further back.
+    pub since: BlockNumHash,
 }
 
 impl PendingTx {
-    /// A pending record for `tx` signed by `sender`. The caller recovered `sender`.
-    pub fn new(tx: wire::Transaction, sender: Address) -> Self {
+    /// A pending record for `tx` signed by `sender`, submitted while chibi was anchored at
+    /// `since`. The caller recovered `sender`.
+    pub fn new(tx: wire::Transaction, sender: Address, since: BlockNumHash) -> Self {
         Self {
             hash: *tx.tx_hash(),
             sender,
             nonce: tx.nonce(),
             tx,
+            since,
         }
     }
 }
@@ -54,6 +59,8 @@ pub struct Located {
     pub nonce: u64,
     /// The signed transaction, kept so a reorg can return it to pending.
     pub tx: wire::Transaction,
+    /// The anchor at submission, kept so a reorg returns the transaction to pending with it.
+    pub since: BlockNumHash,
     /// The verified receipt, once fetched.
     pub receipt: Option<VerifiedReceipt>,
 }
@@ -135,6 +142,7 @@ impl TxBook {
                     sender: pending.sender,
                     nonce: pending.nonce,
                     tx: pending.tx,
+                    since: pending.since,
                     receipt: None,
                 },
             );
@@ -167,6 +175,7 @@ impl TxBook {
                     sender: located.sender,
                     nonce: located.nonce,
                     tx: located.tx,
+                    since: located.since,
                 });
             }
         }
@@ -402,7 +411,11 @@ mod tests {
         let mut world = World::genesis([(alice, WorldAccount::eoa(eth(10)))]);
         let first = legacy_transfer(0, bob, eth(1));
         let second = legacy_transfer(1, bob, eth(1));
-        let pending = PendingTx::new(second.clone(), alice);
+        let pending = PendingTx::new(
+            second.clone(),
+            alice,
+            world.verified(world.head()).num_hash(),
+        );
         let mut book = TxBook::default();
         book.submit(pending.clone());
         assert_eq!(book.pending_nonce(alice, 1), 2);
@@ -442,6 +455,7 @@ mod tests {
                 sender: alice,
                 nonce: 1,
                 tx: pending.tx,
+                since: pending.since,
                 receipt: Some(receipt),
             }
         );
@@ -452,7 +466,11 @@ mod tests {
         let alice = address!("0x00000000000000000000000000000000000a11ce");
         let bob = address!("0x0000000000000000000000000000000000000b0b");
         let mut world = World::genesis([(alice, WorldAccount::eoa(eth(10)))]);
-        let pending = PendingTx::new(legacy_transfer(0, bob, eth(1)), alice);
+        let pending = PendingTx::new(
+            legacy_transfer(0, bob, eth(1)),
+            alice,
+            world.verified(world.head()).num_hash(),
+        );
         let mut book = TxBook::default();
         book.submit(pending.clone());
 
@@ -493,7 +511,11 @@ mod tests {
         let bob = address!("0x0000000000000000000000000000000000000b0b");
         let alice = address!("0x00000000000000000000000000000000000a11ce");
         let mut book = TxBook::default();
-        let tx = PendingTx::new(legacy_transfer(3, bob, eth(1)), alice);
+        let tx = PendingTx::new(
+            legacy_transfer(3, bob, eth(1)),
+            alice,
+            BlockNumHash::default(),
+        );
         book.submit(tx.clone());
         assert_eq!(book.prune(alice, 4), vec![tx.hash]);
         assert_eq!(book.lookup(tx.hash), Lookup::Unknown);

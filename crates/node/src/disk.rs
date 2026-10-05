@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, Bytes, U256, hex};
 use chibi_core::state::Key;
 use parking_lot::Mutex;
@@ -52,12 +53,22 @@ impl From<SavedKey> for Key {
     }
 }
 
+/// A submitted transaction not yet located, and the anchor chibi held when it was submitted.
+/// Inclusion can only be in a later block, so a search for it need not reach further back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OutboxTx {
+    /// The EIP-2718 encoding.
+    pub(crate) raw: Bytes,
+    /// The anchor at submission.
+    pub(crate) since: BlockNumHash,
+}
+
 /// The state file's contents.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StateFile {
     tracked: Vec<SavedKey>,
     snapshot: Option<Snapshot>,
-    outbox: Vec<Bytes>,
+    outbox: Vec<OutboxTx>,
     peers: Vec<String>,
 }
 
@@ -80,12 +91,12 @@ impl StateFile {
         self.snapshot = Some(snapshot);
     }
 
-    /// Raw EIP-2718 transactions submitted and not yet located.
-    pub(crate) fn outbox(&self) -> &[Bytes] {
+    /// Transactions submitted and not yet located.
+    pub(crate) fn outbox(&self) -> &[OutboxTx] {
         &self.outbox
     }
 
-    pub(crate) fn set_outbox(&mut self, outbox: Vec<Bytes>) {
+    pub(crate) fn set_outbox(&mut self, outbox: Vec<OutboxTx>) {
         self.outbox = outbox;
     }
 
@@ -252,7 +263,7 @@ fn io_error(path: &Path, err: &std::io::Error) -> NodeError {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::address;
+    use alloy_primitives::{B256, address};
 
     use super::*;
 
@@ -280,16 +291,24 @@ mod tests {
         )
     }
 
+    fn queued(byte: u8, since: u64) -> OutboxTx {
+        OutboxTx {
+            raw: Bytes::from(vec![byte]),
+            since: BlockNumHash::new(since, B256::repeat_byte(byte)),
+        }
+    }
+
     #[test]
     fn saved_state_round_trips_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let alice = address!("0x00000000000000000000000000000000000a11ce");
         let keys = [Key::Slot(alice, U256::from(7)), Key::Account(alice)];
+        let outbox = vec![queued(1, 9), queued(2, 11)];
         {
             let disk = Disk::open(dir.path()).unwrap();
             disk.save(|file| {
                 file.set_tracked(keys);
-                file.set_outbox(vec![Bytes::from_static(&[1, 2, 3])]);
+                file.set_outbox(outbox.clone());
                 file.remember_peers(&[record(1, 30303)]);
             })
             .unwrap();
@@ -301,7 +320,7 @@ mod tests {
                 file.tracked().collect::<Vec<_>>(),
                 vec![Key::Account(alice), Key::Slot(alice, U256::from(7))]
             );
-            assert_eq!(file.outbox(), &[Bytes::from_static(&[1, 2, 3])]);
+            assert_eq!(file.outbox(), outbox.as_slice());
             assert_eq!(file.peers(), vec![record(1, 30303)]);
         });
     }
@@ -325,17 +344,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let disk = Disk::open(dir.path()).unwrap();
-        disk.save(|file| file.set_outbox(vec![Bytes::from_static(&[1])]))
+        disk.save(|file| file.set_outbox(vec![queued(1, 1)]))
             .unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
         let mut committed = false;
         let saved = disk.save_then(
-            |file| file.set_outbox(vec![Bytes::from_static(&[2])]),
+            |file| file.set_outbox(vec![queued(2, 1)]),
             || committed = true,
         );
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(saved, Err(NodeError::Disk(_))));
         assert!(!committed);
-        disk.read(|file| assert_eq!(file.outbox(), &[Bytes::from_static(&[1])]));
+        disk.read(|file| assert_eq!(file.outbox(), &[queued(1, 1)]));
     }
 }
