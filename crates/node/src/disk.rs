@@ -23,6 +23,9 @@ const STATE_FILE: &str = "state.json";
 const STATE_TEMP: &str = "state.json.tmp";
 const KEY_FILE: &str = "devp2p.key";
 
+/// Most snap/2 peers remembered across restarts.
+const REMEMBERED_PEERS: usize = 16;
+
 /// A key as the state file stores it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -94,11 +97,15 @@ impl StateFile {
             .collect()
     }
 
-    /// Remembers `records`, keeping earlier ones when no snap/2 peer is connected now.
-    pub(crate) fn set_peers(&mut self, records: &[NodeRecord]) {
-        if !records.is_empty() {
-            self.peers = records.iter().map(NodeRecord::to_string).collect();
+    /// Remembers `records` ahead of earlier ones, so peers that drop off do not erase the list.
+    pub(crate) fn remember_peers(&mut self, records: &[NodeRecord]) {
+        let mut merged: Vec<NodeRecord> = Vec::with_capacity(REMEMBERED_PEERS);
+        for record in records.iter().copied().chain(self.peers()) {
+            if merged.len() < REMEMBERED_PEERS && merged.iter().all(|kept| kept.id != record.id) {
+                merged.push(record);
+            }
         }
+        self.peers = merged.iter().map(NodeRecord::to_string).collect();
     }
 }
 
@@ -150,13 +157,27 @@ impl Disk {
     }
 
     /// Edits the state file and writes it out before releasing it, so concurrent writers
-    /// cannot reorder their writes.
+    /// cannot reorder their writes. Blocks on fsync; call it off the async workers.
     pub(crate) fn save(&self, edit: impl FnOnce(&mut StateFile)) -> Result<(), NodeError> {
+        self.save_then(edit, || ())
+    }
+
+    /// Like [`Disk::save`], and runs `written` once the file is durable, still holding the
+    /// file, so no other write lands between the two. On failure the loaded state is left as
+    /// it was and `written` does not run.
+    pub(crate) fn save_then<R>(
+        &self,
+        edit: impl FnOnce(&mut StateFile),
+        written: impl FnOnce() -> R,
+    ) -> Result<R, NodeError> {
         let mut file = self.file.lock();
-        edit(&mut file);
-        let json = serde_json::to_vec_pretty(&*file)
+        let mut next = file.clone();
+        edit(&mut next);
+        let json = serde_json::to_vec_pretty(&next)
             .map_err(|err| NodeError::Disk(format!("encoding the state file: {err}")))?;
-        write_atomic(&self.dir, &json)
+        write_atomic(&self.dir, &json)?;
+        *file = next;
+        Ok(written())
     }
 
     /// The devp2p secret key, created on first use so the node keeps one identity.
@@ -252,23 +273,26 @@ mod tests {
         assert_eq!(key, again);
     }
 
+    fn record(id: u8, port: u16) -> NodeRecord {
+        NodeRecord::new(
+            ([10, 0, 0, id], port).into(),
+            alloy_primitives::B512::repeat_byte(id),
+        )
+    }
+
     #[test]
     fn saved_state_round_trips_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let alice = address!("0x00000000000000000000000000000000000a11ce");
         let keys = [Key::Slot(alice, U256::from(7)), Key::Account(alice)];
-        let record: NodeRecord = "enode://6f8a80d14311c39f35f516fa664deaaaa13e85b2f7493f37f6144d86991ec012937307647bd3b9a82abe2974e1407241d54947bbb39763a4cac9f77166ad92a0@10.3.58.6:30303"
-            .parse()
-            .unwrap();
         {
             let disk = Disk::open(dir.path()).unwrap();
             disk.save(|file| {
                 file.set_tracked(keys);
                 file.set_outbox(vec![Bytes::from_static(&[1, 2, 3])]);
-                file.set_peers(&[record]);
+                file.remember_peers(&[record(1, 30303)]);
             })
             .unwrap();
-            disk.save(|file| file.set_peers(&[])).unwrap();
         }
         assert!(!dir.path().join(STATE_TEMP).exists());
         let disk = Disk::open(dir.path()).unwrap();
@@ -278,7 +302,40 @@ mod tests {
                 vec![Key::Account(alice), Key::Slot(alice, U256::from(7))]
             );
             assert_eq!(file.outbox(), &[Bytes::from_static(&[1, 2, 3])]);
-            assert_eq!(file.peers(), vec![record]);
+            assert_eq!(file.peers(), vec![record(1, 30303)]);
         });
+    }
+
+    #[test]
+    fn remembered_peers_merge_newest_first_dedupe_by_id_and_cap() {
+        let mut file = StateFile::default();
+        file.remember_peers(&[record(1, 1), record(2, 2)]);
+        file.remember_peers(&[]);
+        assert_eq!(file.peers(), vec![record(1, 1), record(2, 2)]);
+        file.remember_peers(&[record(2, 9)]);
+        assert_eq!(file.peers(), vec![record(2, 9), record(1, 1)]);
+        let many: Vec<NodeRecord> = (10..40).map(|id| record(id, 1)).collect();
+        file.remember_peers(&many);
+        assert_eq!(file.peers(), many[..REMEMBERED_PEERS].to_vec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_leaves_the_loaded_state_and_skips_the_commit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.save(|file| file.set_outbox(vec![Bytes::from_static(&[1])]))
+            .unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let mut committed = false;
+        let saved = disk.save_then(
+            |file| file.set_outbox(vec![Bytes::from_static(&[2])]),
+            || committed = true,
+        );
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(saved, Err(NodeError::Disk(_))));
+        assert!(!committed);
+        disk.read(|file| assert_eq!(file.outbox(), &[Bytes::from_static(&[1])]));
     }
 }

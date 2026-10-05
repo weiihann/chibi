@@ -45,6 +45,7 @@ impl Network {
                 helios: helios_ethereum::config::networks::Network::Sepolia,
                 default_beacon: "https://ethereum-sepolia-beacon-api.publicnode.com",
                 boot_nodes: sepolia_nodes(),
+                snap_peers: Vec::new(),
                 tokens: SEPOLIA_TOKENS,
                 clock: BlockClock {
                     number: sepolia::SEPOLIA_OSAKA_BLOCK,
@@ -57,6 +58,7 @@ impl Network {
                 helios: helios_ethereum::config::networks::Network::Mainnet,
                 default_beacon: "https://ethereum-beacon-api.publicnode.com",
                 boot_nodes: mainnet_nodes(),
+                snap_peers: Vec::new(),
                 tokens: MAINNET_TOKENS,
                 clock: BlockClock {
                     number: mainnet::MAINNET_OSAKA_BLOCK,
@@ -104,6 +106,9 @@ pub struct NetworkSpec {
     pub default_beacon: &'static str,
     /// devp2p boot nodes.
     pub boot_nodes: Vec<NodeRecord>,
+    /// Known snap/2 peers, dialed as static peers at start because discovery can take minutes
+    /// to find one.
+    pub snap_peers: Vec<NodeRecord>,
     /// Tokens tracked for every watched address.
     pub tokens: &'static [Token],
     /// A block with a known number and timestamp, for estimating the head from the wall clock.

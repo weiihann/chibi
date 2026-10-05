@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Transaction as _;
 use alloy_consensus::transaction::SignerRecoverable as _;
@@ -30,6 +30,7 @@ use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
 use crate::devp2p::{Devp2p, Devp2pError, HeadHint, Ports};
 use crate::disk::{Disk, StateFile};
 use crate::fetch::{self, Fetched};
+use crate::follow::Search;
 use crate::heads::Heads;
 use crate::network::{Network, NetworkSpec, Token};
 use crate::peers::{NetError, Peers};
@@ -67,8 +68,11 @@ const CHECKPOINT_ATTEMPTS: u32 = 4;
 /// helios's checkpoint file inside the data directory.
 const HELIOS_CHECKPOINT: &str = "checkpoint";
 
-/// How long `start` waits for discovery to find a snap/2 peer.
-const SNAP_PEER_WAIT: Duration = Duration::from_secs(300);
+/// The length of a checkpoint helios can load; any other file makes it use its shipped default.
+const CHECKPOINT_BYTES: u64 = 32;
+
+/// How often `start` reports that it is still waiting for a snap/2 peer.
+const SNAP_PEER_PROGRESS: Duration = Duration::from_secs(30);
 
 /// Everything `Node::start` needs. The CLI builds it from the config file and flags.
 #[derive(Clone, Debug)]
@@ -128,6 +132,8 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) beacon: Option<Beacon>,
     /// Heads moved past since start, for pacing rebroadcasts.
     pub(crate) moves: u64,
+    /// Which blocks have been searched for pending transactions.
+    pub(crate) search: Search,
     /// Blocks holding located transactions whose receipts are not yet verified.
     pub(crate) unreceipted: Vec<VerifiedBody>,
 }
@@ -243,7 +249,12 @@ impl Node<Devp2p> {
         let spec = config.network.spec();
         let disk = Disk::open(&config.data_dir)?;
         let secret_key = disk.secret_key()?;
-        let known_peers = disk.read(StateFile::peers);
+        let known_peers: Vec<_> = spec
+            .snap_peers
+            .iter()
+            .copied()
+            .chain(disk.read(StateFile::peers))
+            .collect();
         let checkpoint = checkpoint(&spec, config.checkpoint, &config.data_dir).await?;
         let url = match config.beacon_url {
             Some(url) => url,
@@ -268,27 +279,38 @@ impl Node<Devp2p> {
         let net =
             Devp2p::start(&spec, secret_key, config.ports, HeadHint::Attested(trusted)).await?;
         net.add_peers(&known_peers);
-        info!(
-            target: "chibi::node",
-            remembered = known_peers.len(),
-            "waiting for a snap/2 peer",
-        );
-        let mut sessions = net.sessions();
-        let found = tokio::time::timeout(
-            SNAP_PEER_WAIT,
-            sessions.wait_for(|sessions| sessions.values().any(|session| session.snap)),
-        )
-        .await
-        .is_ok_and(|seen| seen.is_ok());
-        if !found {
-            return Err(NodeError::Net(NetError::NoPeer {
-                capability: "snap/2",
-            }));
-        }
+        wait_for_snap_peer(&net, known_peers.len()).await?;
 
         let (node, mut follower) = Node::with_parts(spec, net, heads, disk, &config.watch).await?;
         follower.beacon = Some(beacon);
         Ok((node, follower))
+    }
+}
+
+/// Waits until a snap/2 session is up, however long discovery takes, reporting progress.
+async fn wait_for_snap_peer(net: &Devp2p, dialed: usize) -> Result<(), NodeError> {
+    let started = Instant::now();
+    let mut sessions = net.sessions();
+    loop {
+        let census = net.census();
+        info!(
+            target: "chibi::node",
+            peers = census.peers,
+            snap_peers = census.snap_peers,
+            dialed,
+            elapsed_s = started.elapsed().as_secs(),
+            "waiting for a snap/2 peer",
+        );
+        let waited = tokio::time::timeout(
+            SNAP_PEER_PROGRESS,
+            sessions.wait_for(|sessions| sessions.values().any(|session| session.snap)),
+        )
+        .await;
+        match waited {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(_)) => return Err(NodeError::Net(NetError::Stopped)),
+            Err(_) => {}
+        }
     }
 }
 
@@ -303,7 +325,7 @@ async fn checkpoint(
     if let Some(checkpoint) = user {
         return Ok(Some(checkpoint));
     }
-    if data_dir.join(HELIOS_CHECKPOINT).exists() {
+    if has_saved_checkpoint(data_dir).await {
         return Ok(None);
     }
     let mut attempt = 1;
@@ -325,6 +347,14 @@ async fn checkpoint(
             Err(err) => return Err(err.into()),
         }
     }
+}
+
+/// Whether helios will load its saved checkpoint. helios rewrites the file in place without
+/// fsync and silently falls back to its shipped default unless it holds exactly 32 bytes.
+async fn has_saved_checkpoint(data_dir: &Path) -> bool {
+    tokio::fs::metadata(data_dir.join(HELIOS_CHECKPOINT))
+        .await
+        .is_ok_and(|meta| meta.len() == CHECKPOINT_BYTES)
 }
 
 async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeError> {
@@ -361,11 +391,19 @@ impl<P: Peers> Node<P> {
             state: Mutex::new(State::new(anchor.clone(), tracked)),
             fees: Mutex::new(HashMap::new()),
         });
-        shared.reanchor(anchor).await?;
+        shared.reanchor(anchor.clone()).await?;
         shared.restore_outbox(&outbox).await;
-        shared.persist()?;
-        let (number, keys) = shared.read(|s| (s.anchor().number(), s.tracked().count()));
+        shared.persist().await?;
+        let (number, keys, restored) = shared.read(|s| {
+            (
+                s.anchor().number(),
+                s.tracked().count(),
+                s.txs().has_pending(),
+            )
+        });
         info!(target: "chibi::node", head = number, keys, "anchored");
+        // Restored transactions may already sit in blocks this run never passed.
+        let floor = (!restored).then(|| anchor.num_hash());
         Ok((
             Self {
                 shared: Arc::clone(&shared),
@@ -375,6 +413,7 @@ impl<P: Peers> Node<P> {
                 heads,
                 beacon: None,
                 moves: 0,
+                search: Search::new(floor),
                 unreceipted: Vec::new(),
             },
         ))
@@ -665,8 +704,7 @@ impl<P: Peers> Node<P> {
         let pending = self.shared.accept(transaction)?;
         let hash = pending.hash;
         let transaction = pending.tx.clone();
-        self.shared.update(|s| s.txs_mut().submit(pending));
-        self.shared.persist_outbox()?;
+        self.shared.record(pending).await?;
         self.shared.broadcast(transaction).await;
         Ok(hash)
     }
@@ -889,26 +927,54 @@ impl<P: Peers> Shared<P> {
     }
 
     /// Writes tracked keys, the snapshot, the outbox, and snap/2 peers to the state file.
-    pub(crate) fn persist(&self) -> Result<(), NodeError> {
-        let census = self.peers.census();
-        self.disk.save(|file| {
-            let (tracked, outbox, store) = self.read(|s| {
-                (
-                    s.tracked().collect::<Vec<_>>(),
-                    outbox(s.txs()),
-                    s.snapshot(),
-                )
-            });
-            file.set_tracked(tracked);
-            file.set_outbox(outbox);
-            file.set_snapshot(self.snapshot(&store));
-            file.set_peers(&census.snap_records);
+    pub(crate) async fn persist(self: &Arc<Self>) -> Result<(), NodeError> {
+        let shared = Arc::clone(self);
+        blocking(move || {
+            let census = shared.peers.census();
+            shared.disk.save(|file| {
+                let (tracked, outbox, store) = shared.read(|s| {
+                    (
+                        s.tracked().collect::<Vec<_>>(),
+                        outbox(s.txs()),
+                        s.snapshot(),
+                    )
+                });
+                file.set_tracked(tracked);
+                file.set_outbox(outbox);
+                file.set_snapshot(shared.snapshot(&store));
+                file.remember_peers(&census.snap_records);
+            })
         })
+        .await
     }
 
-    fn persist_outbox(&self) -> Result<(), NodeError> {
-        self.disk
-            .save(|file| file.set_outbox(self.read(|s| outbox(s.txs()))))
+    /// Persists an outbox holding `pending`, and only once that is durable records it in the
+    /// book, so a submission reported as failed is never broadcast or counted.
+    async fn record(self: &Arc<Self>, pending: PendingTx) -> Result<(), NodeError> {
+        let shared = Arc::clone(self);
+        let raw = Bytes::from(pending.tx.encoded_2718());
+        let (hash, sender, nonce) = (pending.hash, pending.sender, pending.nonce);
+        blocking(move || {
+            shared.disk.save_then(
+                |file| {
+                    let outbox = shared.read(|s| {
+                        let txs = s.txs();
+                        if !matches!(txs.lookup(hash), Lookup::Unknown) {
+                            return outbox(txs);
+                        }
+                        txs.pending()
+                            .iter()
+                            .filter(|p| p.sender != sender || p.nonce != nonce)
+                            .map(|p| Bytes::from(p.tx.encoded_2718()))
+                            .chain(std::iter::once(raw))
+                            .collect()
+                    });
+                    file.set_outbox(outbox);
+                },
+                || shared.update(|s| s.txs_mut().submit(pending)),
+            )
+        })
+        .await
     }
 
     /// Checks a submitted transaction and recovers its sender.
@@ -1042,6 +1108,15 @@ fn outbox(txs: &TxBook) -> Vec<Bytes> {
         .collect()
 }
 
+/// Runs blocking disk work off the async workers.
+async fn blocking<R: Send + 'static>(
+    work: impl FnOnce() -> Result<R, NodeError> + Send + 'static,
+) -> Result<R, NodeError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| NodeError::Disk(format!("state file writer failed: {err}")))?
+}
+
 /// `balanceOf(holder)` sent by the holder, so the run reads no account besides those it needs.
 fn balance_of(token: &Token, holder: Address) -> CallRequest {
     let mut input = Vec::with_capacity(36);
@@ -1146,5 +1221,23 @@ mod tests {
     fn tip_without_transactions_is_reths_default_and_is_capped() {
         assert_eq!(suggest_tip(&[sample(&[])]), DEFAULT_TIP);
         assert_eq!(suggest_tip(&[sample(&[u128::MAX])]), MAX_TIP);
+    }
+
+    #[tokio::test]
+    async fn only_a_32_byte_checkpoint_file_counts_as_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_saved_checkpoint(dir.path()).await);
+        let path = dir.path().join(HELIOS_CHECKPOINT);
+        for (len, saved) in [(0, false), (31, false), (32, true), (33, false)] {
+            std::fs::write(&path, vec![7u8; len]).unwrap();
+            assert_eq!(has_saved_checkpoint(dir.path()).await, saved, "{len} bytes");
+        }
+        let user = B256::repeat_byte(1);
+        assert_eq!(
+            checkpoint(&Network::Sepolia.spec(), Some(user), dir.path())
+                .await
+                .unwrap(),
+            Some(user)
+        );
     }
 }

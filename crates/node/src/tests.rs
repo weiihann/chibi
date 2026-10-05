@@ -275,14 +275,7 @@ async fn a_submitted_transaction_is_persisted_before_broadcast_and_gets_a_verifi
     assert_eq!(node.receipt(hash).unwrap(), None);
     assert_eq!(node.transaction(hash).unwrap().unwrap().included, None);
 
-    let cost = U256::from(21_000 * GAS_PRICE);
-    let mined = fixture.mine(
-        BlockWrites::default()
-            .balance(sender, eth(2) - cost)
-            .nonce(sender, 1)
-            .balance(BOB, eth(1))
-            .tx(tx.clone(), 21_000, 1),
-    );
+    let mined = fixture.mine(included(sender, &tx));
     let block = fixture.world(|w| w.verified(mined)).num_hash();
     assert_eq!(follower.step().await.unwrap(), Stepped::Extended(block));
 
@@ -303,6 +296,112 @@ async fn a_submitted_transaction_is_persisted_before_broadcast_and_gets_a_verifi
             .unwrap(),
         1
     );
+}
+
+fn included(sender: Address, tx: &Transaction) -> BlockWrites {
+    let cost = U256::from(21_000 * GAS_PRICE);
+    BlockWrites::default()
+        .balance(sender, eth(2) - cost)
+        .nonce(sender, 1)
+        .balance(BOB, eth(1))
+        .tx(tx.clone(), 21_000, 1)
+}
+
+#[tokio::test]
+async fn a_failed_body_search_keeps_the_mined_transaction_and_finds_it_next_head() {
+    let signer = PrivateKeySigner::random();
+    let sender = signer.address();
+    let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    let tx = signed_transfer(&signer, node.chain_id(), 0);
+    let hash = node.submit(&tx.encoded_2718()).await.unwrap();
+
+    fixture.fault(Fault::WithholdBodies);
+    let mined = fixture.mine(included(sender, &tx));
+    let block = fixture.world(|w| w.verified(mined)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(block));
+    assert_eq!(
+        node.transaction_count(sender, BlockSel::Latest)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(node.transaction(hash).unwrap().unwrap().included, None);
+    assert_eq!(read_state(dir.path()).unwrap().unwrap().outbox().len(), 1);
+
+    fixture.heal();
+    fixture.mine(BlockWrites::default());
+    assert!(matches!(
+        follower.step().await.unwrap(),
+        Stepped::Extended(_)
+    ));
+    assert_eq!(
+        node.transaction(hash).unwrap().unwrap().included,
+        Some((block, 0))
+    );
+    assert_eq!(node.receipt(hash).unwrap().unwrap().receipt.block(), block);
+}
+
+#[tokio::test]
+async fn a_transaction_mined_in_a_gap_block_gets_its_receipt_after_a_reanchor() {
+    let signer = PrivateKeySigner::random();
+    let sender = signer.address();
+    let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    let tx = signed_transfer(&signer, node.chain_id(), 0);
+    let hash = node.submit(&tx.encoded_2718()).await.unwrap();
+
+    let mined = fixture.mine_unseen(included(sender, &tx));
+    fixture.mine_unseen(BlockWrites::default());
+    let head = fixture.mine_without_bal(BlockWrites::default());
+    let (block, head) = fixture.world(|w| (w.verified(mined).num_hash(), w.verified(head)));
+    assert_eq!(
+        follower.step().await.unwrap(),
+        Stepped::Reanchored(head.num_hash())
+    );
+    assert!(matches!(
+        node.header(BlockSel::Number(block.number)),
+        Err(NodeError::Unsupported { .. })
+    ));
+    let receipt = node.receipt(hash).unwrap().unwrap();
+    assert_eq!(receipt.receipt.block(), block);
+    assert_eq!(
+        node.transaction(hash).unwrap().unwrap().included,
+        Some((block, 0))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_submission_whose_outbox_cannot_be_saved_is_neither_recorded_nor_sent() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let signer = PrivateKeySigner::random();
+    let sender = signer.address();
+    let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    fixture.watch_outbox(dir.path().to_path_buf());
+    let tx = signed_transfer(&signer, node.chain_id(), 0);
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let refused = node.submit(&tx.encoded_2718()).await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(refused, Err(NodeError::Disk(_))));
+    assert_eq!(node.transaction(*tx.tx_hash()).unwrap(), None);
+    assert_eq!(
+        node.transaction_count(sender, BlockSel::Pending)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(fixture.log().broadcasts.is_empty());
+
+    node.submit(&tx.encoded_2718()).await.unwrap();
+    let broadcasts = fixture.log().broadcasts;
+    assert_eq!(broadcasts.len(), 1);
+    assert!(broadcasts[0].persisted);
 }
 
 #[tokio::test]

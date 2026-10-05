@@ -184,40 +184,41 @@ pub(crate) async fn bals<P: Peers>(
     Ok(blocks)
 }
 
-/// The verified bodies of `headers`, in order.
+/// The verified bodies of `headers`, in order. Peers cap replies by size, so a reply that
+/// verified at least one more body is progress; only replies without any count as attempts.
 pub(crate) async fn bodies<P: Peers>(
     peers: &P,
     headers: &[VerifiedHeader],
 ) -> Result<Vec<VerifiedBody>, NodeError> {
     let mut verified = Vec::with_capacity(headers.len());
+    let mut stalls = 0;
     let mut last = None;
-    for _ in 0..ATTEMPTS {
+    while verified.len() < headers.len() && stalls < ATTEMPTS {
         let remaining = &headers[verified.len()..];
-        if remaining.is_empty() {
-            break;
-        }
         let hashes = remaining.iter().map(VerifiedHeader::hash).collect();
-        let reply = match timed(peers.bodies(hashes)).await {
-            Ok(reply) => reply,
+        let before = verified.len();
+        match timed(peers.bodies(hashes)).await {
+            Ok(reply) => {
+                for (header, body) in remaining.iter().zip(reply.value) {
+                    match verify::body(header.clone(), body) {
+                        Ok(body) => verified.push(body),
+                        Err(err) => {
+                            if err.blames_peer() {
+                                peers.penalize(reply.peer);
+                            }
+                            last = Some(NodeError::Unprovable(err));
+                            break;
+                        }
+                    }
+                }
+            }
             Err(Failure::Net(err @ (NetError::NoPeer { .. } | NetError::Stopped))) => {
                 return Err(NodeError::Net(err));
             }
-            Err(failure) => {
-                last = Some(failure.into_error());
-                continue;
-            }
-        };
-        for (header, body) in remaining.iter().zip(reply.value) {
-            match verify::body(header.clone(), body) {
-                Ok(body) => verified.push(body),
-                Err(err) => {
-                    if err.blames_peer() {
-                        peers.penalize(reply.peer);
-                    }
-                    last = Some(NodeError::Unprovable(err));
-                    break;
-                }
-            }
+            Err(failure) => last = Some(failure.into_error()),
+        }
+        if verified.len() == before {
+            stalls += 1;
         }
     }
     if verified.len() == headers.len() {

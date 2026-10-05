@@ -36,6 +36,8 @@ pub enum Fault {
     Unavailable(Address),
     /// BAL requests get no lists.
     WithholdBals,
+    /// Body requests fail.
+    WithholdBodies,
     /// The next account reply for this address claims this balance, sent by [`LIAR`].
     LieAboutBalance(Address, U256),
 }
@@ -65,6 +67,7 @@ struct Faults {
     drop_proof_node: HashSet<B256>,
     unavailable: HashSet<B256>,
     withhold_bals: bool,
+    withhold_bodies: bool,
     lie: Option<(B256, U256)>,
 }
 
@@ -175,6 +178,7 @@ impl Fixture {
                 faults.unavailable.insert(keccak256(address));
             }
             Fault::WithholdBals => faults.withhold_bals = true,
+            Fault::WithholdBodies => faults.withhold_bodies = true,
             Fault::LieAboutBalance(address, balance) => {
                 faults.lie = Some((keccak256(address), balance));
             }
@@ -222,6 +226,9 @@ impl Peers for FixturePeers {
         let world = self.inner.world.lock();
         let mut headers = Vec::new();
         let mut cursor = start;
+        if start == B256::ZERO {
+            return Self::honest(headers);
+        }
         while (headers.len() as u64) < count {
             let header = world.header(cursor);
             cursor = header.parent_hash;
@@ -295,6 +302,9 @@ impl Peers for FixturePeers {
     }
 
     async fn bodies(&self, blocks: Vec<B256>) -> Result<Reply<Vec<Body>>, NetError> {
+        if self.inner.faults.lock().withhold_bodies {
+            return Err(NetError::Rejected);
+        }
         let world = self.inner.world.lock();
         Self::honest(blocks.iter().map(|hash| world.body(*hash)).collect())
     }

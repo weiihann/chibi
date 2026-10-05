@@ -6,7 +6,6 @@
 //! unanswered.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,7 +32,7 @@ use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
 use reth_network::{
     FetchClient, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkHandle, NetworkManager,
 };
-use reth_network_api::Peers as _;
+use reth_network_api::{Direction, Peers as _};
 use reth_network_p2p::block_access_lists::client::{BalRequirement, BlockAccessListsClient};
 use reth_network_p2p::bodies::client::BodiesClient;
 use reth_network_p2p::download::DownloadClient;
@@ -98,8 +97,9 @@ pub struct Session {
     pub eth: u8,
     /// Whether the peer announced snap/2.
     pub snap: bool,
-    /// The remote socket address of the session.
-    pub addr: SocketAddr,
+    /// The record chibi dialed for a snap/2 session it opened, `None` otherwise. Only such
+    /// records are worth remembering for the next start.
+    pub dialable: Option<NodeRecord>,
 }
 
 /// Established sessions by peer.
@@ -189,7 +189,7 @@ impl Devp2p {
         );
         let tasks = [
             tokio::spawn(manager),
-            tokio::spawn(track_sessions(events, sessions_tx)),
+            tokio::spawn(track_sessions(events, handle.clone(), sessions_tx)),
             tokio::spawn(answer_inbound(requests)),
         ];
         Ok(Self {
@@ -206,7 +206,8 @@ impl Devp2p {
         self.sessions.clone()
     }
 
-    /// Asks the network to dial `records`, as for peers remembered from an earlier run.
+    /// Asks the network to dial `records` as static peers, such as snap/2 peers pinned in the
+    /// registry or remembered from an earlier run.
     pub fn add_peers(&self, records: &[NodeRecord]) {
         for record in records {
             self.handle.add_peer(record.id, record.tcp_addr());
@@ -459,18 +460,17 @@ impl Peers for Devp2p {
 
     fn census(&self) -> Census {
         let sessions = self.sessions.borrow();
-        let snap_records: Vec<NodeRecord> = sessions
-            .iter()
-            .filter(|(_, session)| session.snap)
-            .map(|(peer, session)| NodeRecord::new(session.addr, peer.0))
-            .collect();
         Census {
             peers: sessions.len(),
-            snap_peers: snap_records.len(),
-            snap_records,
+            snap_peers: sessions.values().filter(|session| session.snap).count(),
+            snap_records: sessions
+                .values()
+                .filter_map(|session| session.dialable)
+                .collect(),
         }
     }
 }
+
 /// The status head for a verified header.
 fn status_head(chain: &ChainSpec, header: &VerifiedHeader) -> Head {
     Head {
@@ -524,6 +524,7 @@ fn both_failed(snap: NetError, eth: NetError) -> NetError {
 
 async fn track_sessions(
     events: impl futures::Stream<Item = NetworkEvent>,
+    handle: NetworkHandle,
     sessions: watch::Sender<Sessions>,
 ) {
     let mut events = std::pin::pin!(events);
@@ -531,10 +532,14 @@ async fn track_sessions(
         match event {
             NetworkEvent::ActivePeerSession { info, .. }
             | NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
-                let (peer, session) = session(&info);
+                let (peer, mut session) = session(&info);
+                if session.snap {
+                    session.dialable = dialable(&handle, peer).await;
+                }
                 debug!(
                     target: "chibi::devp2p",
                     %peer, client = %session.client, eth = session.eth, snap = session.snap,
+                    dialable = session.dialable.is_some(),
                     "session established",
                 );
                 sessions.send_modify(|sessions| {
@@ -557,9 +562,19 @@ fn session(info: &SessionInfo) -> (PeerId, Session) {
         client: Arc::clone(&info.client_version),
         eth: info.version as u8,
         snap: info.capabilities.capabilities().contains(&SNAP_2),
-        addr: info.remote_addr,
+        dialable: None,
     };
     (info.peer_id, session)
+}
+
+/// The record chibi dialed to reach `peer`. Inbound sessions have none: their remote address
+/// carries the peer's ephemeral source port, not its listening port.
+async fn dialable(handle: &NetworkHandle, peer: PeerId) -> Option<NodeRecord> {
+    let info = handle.get_peer_by_id(peer).await.ok().flatten()?;
+    match info.direction {
+        Direction::Outgoing(_) => info.enode.parse().ok(),
+        Direction::Incoming => None,
+    }
 }
 
 async fn answer_inbound(mut requests: mpsc::Receiver<IncomingEthRequest>) {
