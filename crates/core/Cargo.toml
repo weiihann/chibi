@@ -20,7 +20,7 @@ alloy-rlp.workspace = true
 alloy-trie.workspace = true
 alloy-eip7928.workspace = true
 alloy-evm.workspace = true
-revm.workspace = true
+revm = { workspace = true, features = ["optional_block_gas_limit"] }
 reth-chainspec.workspace = true
 reth-trie-common.workspace = true
 thiserror.workspace = true
