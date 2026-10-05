@@ -1,0 +1,826 @@
+//! The devp2p adapter: [`Peers`] over a standalone reth-network.
+//!
+//! reth's wire messages are converted into [`chibi_core::wire`] shapes here, so no reth type
+//! reaches the rest of the node. chibi serves nothing, but it answers every inbound request with
+//! an empty response of the matching type, because peers drop sessions whose requests go
+//! unanswered.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use alloy_consensus::Header;
+use alloy_primitives::{B256, Bytes, U256};
+use chibi_core::wire::{
+    AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
+    Transaction,
+};
+use chibi_core::{TrustedHash, VerifiedHeader};
+use futures::StreamExt;
+use reth_chainspec::{ChainSpec, EthChainSpec, Head};
+use reth_eth_wire_types::snap::{
+    AccountData, AccountRangeMessage, BlockAccessListsMessage, ByteCodesMessage,
+    GetAccountRangeMessage, GetBlockAccessListsMessage, GetByteCodesMessage,
+    GetStorageRangesMessage, SnapProtocolMessage, StorageRangesMessage,
+};
+use reth_eth_wire_types::{
+    BlockAccessLists, BlockBodies, BlockHeaders, Capability, Cells, NodeData, Receipts, Receipts69,
+    Receipts70,
+};
+use reth_network::eth_requests::IncomingEthRequest;
+use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
+use reth_network::{
+    FetchClient, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkHandle, NetworkManager,
+};
+use reth_network_p2p::block_access_lists::client::{BalRequirement, BlockAccessListsClient};
+use reth_network_p2p::bodies::client::BodiesClient;
+use reth_network_p2p::download::DownloadClient;
+use reth_network_p2p::error::RequestError;
+use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
+use reth_network_p2p::receipts::client::ReceiptsClient;
+use reth_network_p2p::snap::client::{SnapClient, SnapResponse};
+use reth_network_peers::PeerId;
+use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, trace};
+
+pub use reth_network::config::{SecretKey, rng_secret_key};
+
+use crate::network::NetworkSpec;
+use crate::peers::{NetError, PeerKey, Peers, Reply};
+
+/// Soft cap on snap/2 response sizes, matching reth's own snap downloaders.
+const RESPONSE_BYTES: u64 = 512 * 1024;
+
+/// Most peers a transaction is sent to.
+const BROADCAST_FANOUT: usize = 8;
+
+/// Inbound requests buffered before reth drops new ones; reth's own handler uses the same.
+const INBOUND_CAPACITY: usize = 256;
+
+const ETH: &str = "eth";
+const SNAP: &str = "snap/2";
+
+/// The capability named when neither BAL source is connected.
+const BAL_SOURCES: &str = "snap/2 or eth/71";
+
+const SNAP_2: Capability = Capability::snap_2();
+
+/// Local listening ports. Zero lets the operating system pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ports {
+    /// RLPx TCP port.
+    pub rlpx: u16,
+    /// discv4 UDP port.
+    pub discovery: u16,
+}
+
+/// The head chibi advertises when the network starts.
+#[derive(Clone, Copy, Debug)]
+pub enum HeadHint<'a> {
+    /// A header already verified.
+    Verified(&'a VerifiedHeader),
+    /// Only the light client's hash is known; number and timestamp come from the wall clock.
+    /// The timestamp alone selects the right fork id.
+    Attested(TrustedHash),
+}
+
+/// One established peer session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    /// Client name and version the peer announced.
+    pub client: Arc<str>,
+    /// Negotiated eth protocol version.
+    pub eth: u8,
+    /// Whether the peer announced snap/2.
+    pub snap: bool,
+}
+
+/// Established sessions by peer.
+pub type Sessions = HashMap<PeerKey, Session>;
+
+/// devp2p failed to start.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Devp2pError {
+    /// [`Devp2p::start`] ran outside a tokio runtime.
+    #[error("devp2p must start inside a tokio runtime")]
+    NoRuntime,
+    /// reth's task runtime could not be built.
+    #[error("failed to build the devp2p task runtime: {0}")]
+    Runtime(String),
+    /// The network could not bind or initialise discovery.
+    #[error("failed to start devp2p: {0}")]
+    Network(String),
+}
+
+/// A running devp2p node that implements [`Peers`].
+///
+/// Dropping it stops the network tasks.
+#[derive(Debug)]
+pub struct Devp2p {
+    handle: NetworkHandle,
+    fetch: FetchClient,
+    chain: Arc<ChainSpec>,
+    sessions: watch::Receiver<Sessions>,
+    tasks: [JoinHandle<()>; 3],
+}
+
+impl Devp2p {
+    /// Starts discovery and sessions for `spec`, advertising snap/2 and `head`.
+    pub async fn start(
+        spec: &NetworkSpec,
+        secret_key: SecretKey,
+        ports: Ports,
+        head: HeadHint<'_>,
+    ) -> Result<Self, Devp2pError> {
+        let tokio = Handle::try_current().map_err(|_| Devp2pError::NoRuntime)?;
+        let runtime = RuntimeBuilder::new(
+            RuntimeConfig::default().with_tokio(TokioConfig::existing_handle(tokio)),
+        )
+        .build()
+        .map_err(|err| Devp2pError::Runtime(err.to_string()))?;
+
+        let head = match head {
+            HeadHint::Verified(header) => status_head(&spec.chain, header),
+            HeadHint::Attested(trusted) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                Head {
+                    number: spec.clock.estimate(now),
+                    hash: trusted.hash(),
+                    difficulty: U256::ZERO,
+                    total_difficulty: total_difficulty(&spec.chain),
+                    timestamp: now,
+                }
+            }
+        };
+        let config = NetworkConfigBuilder::eth(secret_key, runtime)
+            .boot_nodes(spec.boot_nodes.iter().copied())
+            .listener_port(ports.rlpx)
+            .discovery_port(ports.discovery)
+            .set_head(head)
+            .with_snap(true)
+            .disable_tx_gossip(true)
+            .build_with_noop_provider(Arc::clone(&spec.chain));
+
+        let (requests_tx, requests) = mpsc::channel(INBOUND_CAPACITY);
+        let manager = NetworkManager::eth(config)
+            .await
+            .map_err(|err| Devp2pError::Network(err.to_string()))?
+            .with_eth_request_handler(requests_tx);
+        let fetch = manager.fetch_client();
+        let handle = manager.handle().clone();
+        let events = handle.event_listener();
+        let (sessions_tx, sessions) = watch::channel(Sessions::new());
+
+        info!(
+            target: "chibi::devp2p",
+            network = %spec.network,
+            peer = %handle.peer_id(),
+            head = head.number,
+            "devp2p started",
+        );
+        let tasks = [
+            tokio::spawn(manager),
+            tokio::spawn(track_sessions(events, sessions_tx)),
+            tokio::spawn(answer_inbound(requests)),
+        ];
+        Ok(Self {
+            handle,
+            fetch,
+            chain: Arc::clone(&spec.chain),
+            sessions,
+            tasks,
+        })
+    }
+
+    /// The established sessions, updated as peers connect and disconnect.
+    pub fn sessions(&self) -> watch::Receiver<Sessions> {
+        self.sessions.clone()
+    }
+
+    /// Disconnects every session and stops the network tasks.
+    pub async fn shutdown(self) {
+        // An error only means the network task has already stopped.
+        let _ = self.handle.shutdown().await;
+    }
+
+    fn reply<T>(peer: PeerId, value: T) -> Reply<T> {
+        Reply {
+            peer: PeerKey(peer),
+            value,
+        }
+    }
+
+    /// Penalizes a peer whose reply cannot be parsed and turns it into an error.
+    fn garbled(&self, peer: PeerId) -> NetError {
+        self.fetch.report_bad_message(peer);
+        NetError::Rejected
+    }
+
+    async fn snap_block_access_lists(
+        &self,
+        blocks: Vec<B256>,
+    ) -> Result<Reply<Vec<Option<Bytes>>>, NetError> {
+        let requested = blocks.len();
+        let message = GetBlockAccessListsMessage {
+            request_id: 0,
+            block_hashes: blocks,
+            response_bytes: RESPONSE_BYTES,
+        };
+        let (peer, response) = SnapClient::get_block_access_lists(&self.fetch, message)
+            .await
+            .map_err(|err| net_error(&err, SNAP))?
+            .split();
+        match response {
+            SnapResponse::BlockAccessLists(message) => {
+                align(message.block_access_lists.0, requested)
+                    .map(|lists| Self::reply(peer, lists))
+                    .ok_or_else(|| self.garbled(peer))
+            }
+            SnapResponse::AccountRange(_)
+            | SnapResponse::StorageRanges(_)
+            | SnapResponse::ByteCodes(_) => Err(self.garbled(peer)),
+        }
+    }
+
+    async fn eth_block_access_lists(
+        &self,
+        blocks: Vec<B256>,
+    ) -> Result<Reply<Vec<Option<Bytes>>>, NetError> {
+        let requested = blocks.len();
+        let (peer, lists) = self
+            .fetch
+            .get_block_access_lists_with_requirement(blocks, BalRequirement::Optional)
+            .await
+            .map_err(|err| net_error(&err, "eth/71"))?
+            .split();
+        align(lists.0, requested)
+            .map(|lists| Self::reply(peer, lists))
+            .ok_or_else(|| self.garbled(peer))
+    }
+}
+
+impl Drop for Devp2p {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl Peers for Devp2p {
+    async fn headers(&self, start: B256, count: u64) -> Result<Reply<Vec<Header>>, NetError> {
+        let (peer, headers) = self
+            .fetch
+            .get_headers(HeadersRequest::falling(start.into(), count))
+            .await
+            .map_err(|err| net_error(&err, ETH))?
+            .split();
+        Ok(Self::reply(peer, headers))
+    }
+
+    async fn account_range(
+        &self,
+        request: AccountRangeRequest,
+    ) -> Result<Reply<AccountReply>, NetError> {
+        let message = GetAccountRangeMessage {
+            request_id: 0,
+            root_hash: request.root,
+            starting_hash: request.key,
+            limit_hash: request.key,
+            response_bytes: RESPONSE_BYTES,
+        };
+        let (peer, response) = self
+            .fetch
+            .get_account_range(message)
+            .await
+            .map_err(|err| net_error(&err, SNAP))?
+            .split();
+        match response {
+            SnapResponse::AccountRange(range) => Ok(Self::reply(
+                peer,
+                AccountReply {
+                    accounts: range
+                        .accounts
+                        .into_iter()
+                        .map(AccountData::into_trie_entry)
+                        .collect(),
+                    proof: range.proof,
+                },
+            )),
+            SnapResponse::StorageRanges(_)
+            | SnapResponse::ByteCodes(_)
+            | SnapResponse::BlockAccessLists(_) => Err(self.garbled(peer)),
+        }
+    }
+
+    async fn storage_range(
+        &self,
+        request: StorageRangeRequest,
+    ) -> Result<Reply<StorageReply>, NetError> {
+        let message = GetStorageRangesMessage {
+            request_id: 0,
+            root_hash: request.root,
+            account_hashes: vec![request.account],
+            starting_hash: request.slot.into(),
+            limit_hash: request.slot.into(),
+            response_bytes: RESPONSE_BYTES,
+        };
+        let (peer, response) = self
+            .fetch
+            .get_storage_ranges(message)
+            .await
+            .map_err(|err| net_error(&err, SNAP))?
+            .split();
+        let ranges = match response {
+            SnapResponse::StorageRanges(ranges) => ranges,
+            SnapResponse::AccountRange(_)
+            | SnapResponse::ByteCodes(_)
+            | SnapResponse::BlockAccessLists(_) => return Err(self.garbled(peer)),
+        };
+        let mut accounts = ranges.slots.into_iter();
+        let slots = accounts.next().unwrap_or_default();
+        if accounts.next().is_some() {
+            return Err(self.garbled(peer));
+        }
+        let slots = slots
+            .into_iter()
+            .map(|slot| slot.value().map(|value| (slot.hash, value)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| self.garbled(peer))?;
+        Ok(Self::reply(
+            peer,
+            StorageReply {
+                slots,
+                proof: ranges.proof,
+            },
+        ))
+    }
+
+    async fn byte_codes(&self, hashes: Vec<B256>) -> Result<Reply<Vec<Bytes>>, NetError> {
+        let message = GetByteCodesMessage {
+            request_id: 0,
+            hashes,
+            response_bytes: RESPONSE_BYTES,
+        };
+        let (peer, response) = self
+            .fetch
+            .get_byte_codes(message)
+            .await
+            .map_err(|err| net_error(&err, SNAP))?
+            .split();
+        match response {
+            SnapResponse::ByteCodes(codes) => Ok(Self::reply(peer, codes.codes)),
+            SnapResponse::AccountRange(_)
+            | SnapResponse::StorageRanges(_)
+            | SnapResponse::BlockAccessLists(_) => Err(self.garbled(peer)),
+        }
+    }
+
+    async fn block_access_lists(
+        &self,
+        blocks: Vec<B256>,
+    ) -> Result<Reply<Vec<Option<Bytes>>>, NetError> {
+        let snap = self.snap_block_access_lists(blocks.clone()).await;
+        if snap.as_ref().is_ok_and(has_any) {
+            return snap;
+        }
+        let eth = self.eth_block_access_lists(blocks).await;
+        match (snap, eth) {
+            (Ok(snap), Ok(eth)) => Ok(if has_any(&eth) { eth } else { snap }),
+            (Ok(reply), Err(_)) | (Err(_), Ok(reply)) => Ok(reply),
+            (Err(snap), Err(eth)) => Err(both_failed(snap, eth)),
+        }
+    }
+
+    async fn bodies(&self, blocks: Vec<B256>) -> Result<Reply<Vec<Body>>, NetError> {
+        let (peer, bodies) = self
+            .fetch
+            .get_block_bodies(blocks)
+            .await
+            .map_err(|err| net_error(&err, ETH))?
+            .split();
+        Ok(Self::reply(peer, bodies))
+    }
+
+    async fn receipts(&self, block: B256) -> Result<Reply<Vec<Receipt>>, NetError> {
+        let (peer, response) = self
+            .fetch
+            .get_receipts(vec![block])
+            .await
+            .map_err(|err| net_error(&err, ETH))?
+            .split();
+        let mut blocks = response.receipts.into_iter();
+        let receipts = blocks.next().unwrap_or_default();
+        if blocks.next().is_some() {
+            return Err(self.garbled(peer));
+        }
+        Ok(Self::reply(peer, receipts))
+    }
+
+    async fn broadcast(&self, transaction: Transaction) -> Result<usize, NetError> {
+        let transaction = Arc::new(transaction);
+        let mut sent = 0;
+        for peer in self.sessions.borrow().keys().take(BROADCAST_FANOUT) {
+            self.handle
+                .send_transactions(peer.0, vec![Arc::clone(&transaction)]);
+            sent += 1;
+        }
+        if sent == 0 {
+            return Err(NetError::NoPeer { capability: ETH });
+        }
+        debug!(target: "chibi::devp2p", hash = %transaction.hash(), sent, "broadcast transaction");
+        Ok(sent)
+    }
+
+    fn penalize(&self, peer: PeerKey) {
+        debug!(target: "chibi::devp2p", peer = %peer.0, "penalizing peer");
+        self.fetch.report_bad_message(peer.0);
+    }
+
+    fn announce(&self, head: &VerifiedHeader) {
+        self.handle.update_status(status_head(&self.chain, head));
+    }
+}
+/// The status head for a verified header.
+fn status_head(chain: &ChainSpec, header: &VerifiedHeader) -> Head {
+    Head {
+        number: header.number(),
+        hash: header.hash(),
+        difficulty: header.header().difficulty,
+        total_difficulty: total_difficulty(chain),
+        timestamp: header.header().timestamp,
+    }
+}
+
+/// Total difficulty stopped growing at the merge, so every post-merge head carries the final one.
+fn total_difficulty(chain: &ChainSpec) -> U256 {
+    chain.final_paris_total_difficulty().unwrap_or_default()
+}
+
+fn net_error(err: &RequestError, capability: &'static str) -> NetError {
+    match err {
+        RequestError::ChannelClosed => NetError::Stopped,
+        RequestError::UnsupportedCapability => NetError::NoPeer { capability },
+        RequestError::Timeout => NetError::Timeout,
+        RequestError::ConnectionDropped | RequestError::BadResponse => NetError::Rejected,
+    }
+}
+
+/// Pads a BAL reply to one entry per requested block. Peers may truncate at their size limit;
+/// a longer reply cannot correspond to the request.
+fn align(mut lists: Vec<Option<Bytes>>, requested: usize) -> Option<Vec<Option<Bytes>>> {
+    if lists.len() > requested {
+        return None;
+    }
+    lists.resize(requested, None);
+    Some(lists)
+}
+
+fn has_any(reply: &Reply<Vec<Option<Bytes>>>) -> bool {
+    reply.value.iter().any(Option::is_some)
+}
+
+/// The error for a BAL request that failed on both protocols: the snap/2 failure unless snap/2
+/// simply had no peer.
+fn both_failed(snap: NetError, eth: NetError) -> NetError {
+    match (snap, eth) {
+        (NetError::NoPeer { .. }, NetError::NoPeer { .. }) => NetError::NoPeer {
+            capability: BAL_SOURCES,
+        },
+        (NetError::NoPeer { .. }, eth) => eth,
+        (snap, _) => snap,
+    }
+}
+
+async fn track_sessions(
+    events: impl futures::Stream<Item = NetworkEvent>,
+    sessions: watch::Sender<Sessions>,
+) {
+    let mut events = std::pin::pin!(events);
+    while let Some(event) = events.next().await {
+        match event {
+            NetworkEvent::ActivePeerSession { info, .. }
+            | NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
+                let (peer, session) = session(&info);
+                debug!(
+                    target: "chibi::devp2p",
+                    %peer, client = %session.client, eth = session.eth, snap = session.snap,
+                    "session established",
+                );
+                sessions.send_modify(|sessions| {
+                    sessions.insert(PeerKey(peer), session);
+                });
+            }
+            NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
+                debug!(target: "chibi::devp2p", peer = %peer_id, ?reason, "session closed");
+                sessions.send_modify(|sessions| {
+                    sessions.remove(&PeerKey(peer_id));
+                });
+            }
+            NetworkEvent::Peer(PeerEvent::PeerAdded(_) | PeerEvent::PeerRemoved(_)) => {}
+        }
+    }
+}
+
+fn session(info: &SessionInfo) -> (PeerId, Session) {
+    let session = Session {
+        client: Arc::clone(&info.client_version),
+        eth: info.version as u8,
+        snap: info.capabilities.capabilities().contains(&SNAP_2),
+    };
+    (info.peer_id, session)
+}
+
+async fn answer_inbound(mut requests: mpsc::Receiver<IncomingEthRequest>) {
+    while let Some(request) = requests.recv().await {
+        answer_empty(request);
+    }
+}
+
+/// Replies to `request` with an empty response of the matching type. Dropping the sender or
+/// replying `Err` would send nothing, and the peer would time out and drop chibi.
+fn answer_empty(request: IncomingEthRequest) {
+    let (peer, delivered) = match request {
+        IncomingEthRequest::GetBlockHeaders {
+            peer_id, response, ..
+        } => (peer_id, response.send(Ok(BlockHeaders(Vec::new()))).is_ok()),
+        IncomingEthRequest::GetBlockBodies {
+            peer_id, response, ..
+        } => (peer_id, response.send(Ok(BlockBodies(Vec::new()))).is_ok()),
+        IncomingEthRequest::GetNodeData {
+            peer_id, response, ..
+        } => (peer_id, response.send(Ok(NodeData(Vec::new()))).is_ok()),
+        IncomingEthRequest::GetReceipts {
+            peer_id, response, ..
+        } => (peer_id, response.send(Ok(Receipts(Vec::new()))).is_ok()),
+        IncomingEthRequest::GetReceipts69 {
+            peer_id, response, ..
+        } => (peer_id, response.send(Ok(Receipts69(Vec::new()))).is_ok()),
+        IncomingEthRequest::GetReceipts70 {
+            peer_id, response, ..
+        } => {
+            let empty = Receipts70 {
+                last_block_incomplete: false,
+                receipts: Vec::new(),
+            };
+            (peer_id, response.send(Ok(empty)).is_ok())
+        }
+        IncomingEthRequest::GetBlockAccessLists {
+            peer_id, response, ..
+        } => (
+            peer_id,
+            response.send(Ok(BlockAccessLists(Vec::new()))).is_ok(),
+        ),
+        IncomingEthRequest::GetCells {
+            peer_id, response, ..
+        } => (peer_id, response.send(Ok(Cells::default())).is_ok()),
+        IncomingEthRequest::GetSnap {
+            peer_id,
+            request,
+            response,
+        } => (peer_id, response.send(Ok(empty_snap(&request))).is_ok()),
+    };
+    trace!(target: "chibi::devp2p", %peer, delivered, "answered inbound request with nothing");
+}
+
+/// The empty snap/2 response for `request`. The session routes response-shaped messages to
+/// their pending request, so only requests arrive here; the response arms exist for
+/// exhaustiveness.
+fn empty_snap(request: &SnapProtocolMessage) -> SnapResponse {
+    let request_id = request.request_id();
+    match request {
+        SnapProtocolMessage::GetAccountRange(_) | SnapProtocolMessage::AccountRange(_) => {
+            SnapResponse::AccountRange(AccountRangeMessage {
+                request_id,
+                accounts: Vec::new(),
+                proof: Vec::new(),
+            })
+        }
+        SnapProtocolMessage::GetStorageRanges(_) | SnapProtocolMessage::StorageRanges(_) => {
+            SnapResponse::StorageRanges(StorageRangesMessage {
+                request_id,
+                slots: Vec::new(),
+                proof: Vec::new(),
+            })
+        }
+        SnapProtocolMessage::GetByteCodes(_) | SnapProtocolMessage::ByteCodes(_) => {
+            SnapResponse::ByteCodes(ByteCodesMessage {
+                request_id,
+                codes: Vec::new(),
+            })
+        }
+        SnapProtocolMessage::GetBlockAccessLists(_) | SnapProtocolMessage::BlockAccessLists(_) => {
+            SnapResponse::BlockAccessLists(BlockAccessListsMessage {
+                request_id,
+                block_access_lists: BlockAccessLists(Vec::new()),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{B128, B512};
+    use reth_eth_wire_types::{
+        GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetReceipts,
+        GetReceipts70, HeadersDirection,
+    };
+    use reth_network_p2p::error::RequestResult;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    const PEER: PeerId = B512::repeat_byte(7);
+    const HASH: B256 = B256::repeat_byte(1);
+
+    /// Hands `answer_empty` a request built around a fresh response channel and returns the
+    /// reply it sent.
+    fn answered<T>(
+        request: impl FnOnce(oneshot::Sender<RequestResult<T>>) -> IncomingEthRequest,
+    ) -> RequestResult<T> {
+        let (response, mut reply) = oneshot::channel();
+        answer_empty(request(response));
+        reply
+            .try_recv()
+            .expect("answer_empty must reply before returning")
+    }
+
+    #[test]
+    fn every_eth_request_gets_an_empty_reply_of_its_type() {
+        let headers = GetBlockHeaders {
+            start_block: HASH.into(),
+            limit: 16,
+            skip: 0,
+            direction: HeadersDirection::Falling,
+        };
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetBlockHeaders {
+                peer_id: PEER,
+                request: headers,
+                response,
+            }),
+            Ok(BlockHeaders(Vec::new())),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetBlockBodies {
+                peer_id: PEER,
+                request: GetBlockBodies(vec![HASH]),
+                response,
+            }),
+            Ok(BlockBodies(Vec::new())),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetNodeData {
+                peer_id: PEER,
+                request: GetNodeData(vec![HASH]),
+                response,
+            }),
+            Ok(NodeData(Vec::new())),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetReceipts {
+                peer_id: PEER,
+                request: GetReceipts(vec![HASH]),
+                response,
+            }),
+            Ok(Receipts(Vec::new())),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetReceipts69 {
+                peer_id: PEER,
+                request: GetReceipts(vec![HASH]),
+                response,
+            }),
+            Ok(Receipts69(Vec::new())),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetReceipts70 {
+                peer_id: PEER,
+                request: GetReceipts70 {
+                    first_block_receipt_index: 3,
+                    block_hashes: vec![HASH]
+                },
+                response,
+            }),
+            Ok(Receipts70 {
+                last_block_incomplete: false,
+                receipts: Vec::new()
+            }),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetBlockAccessLists {
+                peer_id: PEER,
+                request: GetBlockAccessLists(vec![HASH]),
+                response,
+            }),
+            Ok(BlockAccessLists(Vec::new())),
+        );
+        assert_eq!(
+            answered(|response| IncomingEthRequest::GetCells {
+                peer_id: PEER,
+                request: GetCells {
+                    hashes: vec![HASH],
+                    cell_mask: B128::repeat_byte(0xff)
+                },
+                response,
+            }),
+            Ok(Cells::default()),
+        );
+    }
+
+    #[test]
+    fn every_snap_request_gets_an_empty_reply_keeping_its_id() {
+        let requests = [
+            SnapProtocolMessage::GetAccountRange(GetAccountRangeMessage {
+                request_id: 11,
+                root_hash: HASH,
+                starting_hash: B256::ZERO,
+                limit_hash: B256::repeat_byte(0xff),
+                response_bytes: RESPONSE_BYTES,
+            }),
+            SnapProtocolMessage::GetStorageRanges(GetStorageRangesMessage {
+                request_id: 12,
+                root_hash: HASH,
+                account_hashes: vec![HASH],
+                starting_hash: HASH.into(),
+                limit_hash: HASH.into(),
+                response_bytes: RESPONSE_BYTES,
+            }),
+            SnapProtocolMessage::GetByteCodes(GetByteCodesMessage {
+                request_id: 13,
+                hashes: vec![HASH],
+                response_bytes: RESPONSE_BYTES,
+            }),
+            SnapProtocolMessage::GetBlockAccessLists(GetBlockAccessListsMessage {
+                request_id: 14,
+                block_hashes: vec![HASH],
+                response_bytes: RESPONSE_BYTES,
+            }),
+        ];
+        let expected = [
+            SnapResponse::AccountRange(AccountRangeMessage {
+                request_id: 11,
+                accounts: Vec::new(),
+                proof: Vec::new(),
+            }),
+            SnapResponse::StorageRanges(StorageRangesMessage {
+                request_id: 12,
+                slots: Vec::new(),
+                proof: Vec::new(),
+            }),
+            SnapResponse::ByteCodes(ByteCodesMessage {
+                request_id: 13,
+                codes: Vec::new(),
+            }),
+            SnapResponse::BlockAccessLists(BlockAccessListsMessage {
+                request_id: 14,
+                block_access_lists: BlockAccessLists(Vec::new()),
+            }),
+        ];
+        for (request, expected) in requests.into_iter().zip(expected) {
+            let reply = answered(|response| IncomingEthRequest::GetSnap {
+                peer_id: PEER,
+                request,
+                response,
+            });
+            assert_eq!(reply, Ok(expected));
+        }
+    }
+
+    #[test]
+    fn bal_replies_align_to_the_request() {
+        let bal = Bytes::from_static(&[0xc0]);
+        assert_eq!(
+            align(vec![Some(bal.clone())], 3),
+            Some(vec![Some(bal.clone()), None, None])
+        );
+        assert_eq!(align(Vec::new(), 2), Some(vec![None, None]));
+        assert_eq!(align(vec![Some(bal), None], 1), None);
+    }
+
+    #[test]
+    fn bal_errors_prefer_the_informative_failure() {
+        let no_snap = || NetError::NoPeer {
+            capability: "snap/2",
+        };
+        let no_eth = || NetError::NoPeer {
+            capability: "eth/71",
+        };
+        assert_eq!(
+            both_failed(no_snap(), no_eth()),
+            NetError::NoPeer {
+                capability: BAL_SOURCES
+            }
+        );
+        assert_eq!(both_failed(no_snap(), NetError::Timeout), NetError::Timeout);
+        assert_eq!(
+            both_failed(NetError::Rejected, no_eth()),
+            NetError::Rejected
+        );
+    }
+}
