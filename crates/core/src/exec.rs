@@ -85,9 +85,6 @@ pub struct CallRequest {
     pub max_fee_per_gas: Option<u128>,
     /// EIP-1559 tip cap.
     pub max_priority_fee_per_gas: Option<u128>,
-    /// Ignored: runs use the sender's nonce at the anchor, as reth's `eth_call` and
-    /// `eth_estimateGas` do.
-    pub nonce: Option<u64>,
     /// EIP-2930 access list.
     pub access_list: AccessList,
 }
@@ -715,26 +712,6 @@ mod tests {
             (used..=(used + CALL_STIPEND_GAS) * 64 / 63).contains(&estimate),
             "estimate {estimate} outside reth's bounds for {used} gas used"
         );
-    }
-
-    #[test]
-    fn call_ignores_request_nonce() {
-        let world = world();
-        let env = ChainEnv::new(world.spec());
-        let mut store = Store::new(world.verified(world.head()));
-        let (plain, _) = discover(&world, &mut store, |store| {
-            execute(store, &env, &balance_of())
-        });
-        let stale = execute(
-            &store,
-            &env,
-            &CallRequest {
-                nonce: Some(99),
-                ..balance_of()
-            },
-        )
-        .unwrap();
-        assert_eq!(stale, plain);
     }
 
     #[test]
