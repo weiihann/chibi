@@ -44,7 +44,7 @@ chibi run
 
 On first start chibi needs a weak-subjectivity checkpoint for the light client. Without one in the config, it takes the newest checkpoint from public checkpoint services and logs a warning. Later starts reuse the checkpoint the light client saved.
 
-chibi then waits for a devp2p peer that serves snap/2. On Sepolia this has taken from about one to several minutes, because few peers serve it. chibi remembers the snap/2 peers it reached, so later starts connect faster.
+chibi then waits for a devp2p peer that serves snap/2, logging progress every 30 seconds. On Sepolia this has taken from a few seconds to several minutes, because few peers serve it (on 2026-10-05 only Nethermind nodes did). chibi dials a short list of known snap/2 peers and the outbound snap/2 peers it reached on earlier runs first. The JSON-RPC server opens only after the first verified head.
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
 
@@ -75,12 +75,13 @@ Limits:
 
 - State is served only at the verified head (`latest` and `pending`). Older blocks, `eth_getLogs`, and filters return error `-32004`.
 - Block responses carry header fields and an empty transaction list.
+- If every snap/2 peer disconnects, chibi keeps serving its last verified head as `latest` and logs `step failed` until a peer returns. `eth_syncing` still reports `false`.
 - Receipts and transaction lookups cover only transactions sent through chibi.
 - Blob transactions are rejected.
 
 ## Trust model
 
-A peer that lies can delay chibi but cannot make it serve a wrong value, because every value is checked against a header the light client attested. The light client trusts the sync committee. The beacon API endpoint and the checkpoint services can stall chibi, and on first run a checkpoint service chooses the starting checkpoint unless you set `checkpoint`. Proof requests show peers which accounts and contracts you query.
+A peer that lies can delay chibi but cannot make it serve a wrong value, because every value is checked against a header the light client attested. The light client trusts the sync committee. The beacon API endpoint and the checkpoint services can stall chibi. On first run a checkpoint service chooses the starting checkpoint unless you set `checkpoint`, and later runs continue from the checkpoints that one leads to. Proof requests show peers which accounts and contracts you query.
 
 ## Development
 
@@ -89,6 +90,7 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo run -p chibi-node --example live_probe   # live Sepolia: verified header and snap/2 replies
 cargo run -p chibi-node --example live_node -- 0xAddress   # live Sepolia: a full node start
+scripts/oracle-check.sh 0xAddress   # compare a running chibi with a public RPC at chibi's head
 ```
 
 The workspace has three crates. `chibi-core` holds proof verification, the known-key store, BAL application, and local execution, with no I/O. `chibi-node` holds the light client, devp2p, the head follower, and the request-side node API. `chibi` is the binary and its JSON-RPC server.
