@@ -12,6 +12,7 @@ use chibi_core::exec::{CallRequest, EstimateError, ExecError, ExecutionResult, H
 use chibi_core::state::{Account, StateError};
 use chibi_core::tx::VerifiedReceipt;
 use chibi_core::verify::VerifyError;
+use chibi_core::wire::Transaction;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
