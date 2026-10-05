@@ -19,7 +19,7 @@ Before 2026-10-06 13:53:36 UTC, Sepolia has no block access lists, so every head
 RUN_DIR=$(.agents/skills/verify-chibi/scripts/launch.sh --port 8645 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29 | tail -1)
 ```
 
-- Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi run --rpc-addr 127.0.0.1:<port>` in the background.
+- Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config (tracking USDC) and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi run --rpc-host 127.0.0.1 --rpc-port <port>` in the foreground of a background shell job, so `$RUN_DIR/chibi.pid` is chibi's own pid.
 - Ready when `$RUN_DIR/chibi.log` contains `JSON-RPC on http://127.0.0.1:<port>`. The script waits up to `--timeout` seconds (default 900). Most of that is waiting for a snap/2 peer; the log prints `waiting for a snap/2 peer` every 30 s.
 - `--network mainnet` is accepted but untested and has no pinned snap/2 peers.
 - The addresses above are active Sepolia USDC holders. Use any address; at least one is required.

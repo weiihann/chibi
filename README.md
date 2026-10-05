@@ -8,7 +8,7 @@ chibi is early software. It targets Sepolia first. Mainnet support exists in the
 
 - A sync-committee light client ([helios](https://github.com/a16z/helios)) vouches for execution block hashes. chibi fetches each header over devp2p and checks its hash.
 - Account and storage values come from single-key snap/2 range proofs, checked against the verified header's state root. A key chibi never fetched is never read as zero.
-- chibi stores only the keys you use: your watched accounts, the USDC storage your balances need, and whatever your dapps' calls touch.
+- chibi stores only the keys you use: your watched accounts, the storage of the tokens you picked (balances plus anything a transfer checks, such as pause flags or fees), and whatever your dapps' calls touch.
 - After the Glamsterdam upgrade, each block's access list (EIP-7928) keeps those keys current. Before it, chibi proves the tracked keys again at every new head.
 - `eth_call` and `eth_estimateGas` run in a local EVM. A missing key is fetched with a proof and the call runs again.
 - Signed transactions go straight to devp2p peers. chibi finds them in verified block bodies and checks their receipts against the block's receipts root.
@@ -23,23 +23,33 @@ The design and its tradeoffs are in [docs/DESIGN.md](docs/DESIGN.md). The decisi
 ## Install and set up
 
 ```sh
-git clone <this repository> chibi
+git clone https://github.com/weiihann/chibi
 cd chibi
 ./install.sh
 ```
 
-`install.sh` builds and installs the `chibi` binary with cargo, runs `chibi init`, and then starts `chibi run`.
+`install.sh` builds and installs the `chibi` binary with cargo and runs `chibi init`. It does not start chibi.
 
-`chibi init` asks for the network (Sepolia by default) and for watch-only addresses. Paste as many as you like and leave the line blank to finish. It writes `config.toml` in your OS config directory (`~/Library/Application Support/chibi/` on macOS, `~/.config/chibi/` on Linux). You can pass everything as flags instead:
+`chibi init` asks, in order:
+
+1. The network (Sepolia by default).
+2. Watch-only addresses. Paste as many as you like and press Enter on an empty line to finish.
+3. Which tokens to track, as tick boxes. On Sepolia the choices are USDC, USDT, DAI, WETH, and LINK; mainnet adds WBTC. USDC is ticked by default. ETH is always tracked. Sepolia's USDT and DAI are Aave's test tokens, because Tether and Maker have no Sepolia deployments.
+4. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
+
+It writes `config.toml` in your OS config directory (`~/Library/Application Support/chibi/` on macOS, `~/.config/chibi/` on Linux). In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:
 
 ```sh
-chibi init --network sepolia --address 0xYourAddress --address 0xAnotherAddress
+chibi init --network sepolia --address 0xYourAddress --token USDC --token DAI --rpc-host 127.0.0.1 --rpc-port 8545
 ```
 
 ## Run
 
 ```sh
-chibi run
+chibi run        # in the foreground; Ctrl-C stops it
+chibi run -b     # in the background; logs go to the data directory
+chibi status     # whether it runs, and the balances saved at the last verified head
+chibi stop       # stops a background chibi
 ```
 
 On first start chibi needs a weak-subjectivity checkpoint for the light client. Without one in the config, it takes the newest checkpoint from public checkpoint services and logs a warning. Later starts reuse the checkpoint the light client saved.
@@ -48,7 +58,7 @@ chibi then waits for a devp2p peer that serves snap/2, logging progress every 30
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
 
-`chibi status` prints the balances saved at the last verified head without starting a node. Those values are labeled with their block and are not re-verified.
+`chibi status` reads the snapshot saved at the last verified head, so it works without a running node. Those values are labeled with their block and are not re-verified.
 
 ## Configuration
 
@@ -60,12 +70,14 @@ When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a
 | `addresses` | none | Watch-only addresses to track |
 | `beacon_url` | network default | Beacon API endpoint for the light client |
 | `checkpoint` | none | Finalized beacon block root to start the light client from |
-| `rpc_addr` | `127.0.0.1:8545` | Where JSON-RPC listens |
+| `tokens` | `["USDC"]` | Tokens to track, by symbol, from the network's list |
+| `rpc_host` | `127.0.0.1` | IP address or domain JSON-RPC listens on; also accepted as a `Host` header |
+| `rpc_port` | `8545` | JSON-RPC port |
 | `cors_origins` | `chrome-extension://*`, `moz-extension://*` | Browser origins allowed to call the RPC |
 | `allowed_hosts` | `localhost`, `127.0.0.1`, `[::1]` | Accepted `Host` headers, which blocks DNS rebinding |
 | `p2p_port` | `0` (OS picks) | devp2p listen port |
 
-Data (light-client checkpoint, devp2p key, remembered peers, and the state file) lives in the OS data directory under `chibi/<network>/`. One `chibi run` owns that directory at a time.
+Data (light-client checkpoint, devp2p key, remembered peers, the state file, and `chibi.log` for a background chibi) lives in the OS data directory under `chibi/<network>/`. One `chibi run` owns that directory at a time, and `chibi.lock` holds its process id.
 
 ## JSON-RPC methods
 

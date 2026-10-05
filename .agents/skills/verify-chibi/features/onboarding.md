@@ -1,38 +1,46 @@
 # Onboarding
 
-A new user runs `./install.sh`, which installs the `chibi` binary, asks for the network and watch-only addresses through `chibi init`, writes the config, and starts `chibi run`.
+A new user runs `./install.sh`, which installs the `chibi` binary and runs `chibi init`. Init asks for the network, watch-only addresses, which tokens to track, and the RPC host and port, then writes the config and says how to start. The user then starts chibi in the foreground or in the background, checks it, and stops it.
 
 ## Sub-features
 
-- `onboard-install` builds and installs the binary with cargo.
-- `onboard-init-prompt` asks for the network (Enter keeps `sepolia`) and addresses (blank line finishes), re-prompts on invalid input, and writes the config.
-- `onboard-init-flags` writes the same config from `--network` and repeated `--address` flags without prompting.
-- `onboard-first-run` starts the node after init, which saves a light-client checkpoint for later runs.
+- `onboard-install` builds and installs the binary with cargo, runs init on a terminal, and does not start chibi.
+- `onboard-init-menu` asks through terminal menus: a network list, an address loop (empty line finishes, invalid input re-asks), token tick boxes (USDC ticked by default), the RPC host (IP or domain) and port with defaults.
+- `onboard-init-plain` asks the same questions as plain line prompts when stdin is not a terminal; Enter takes each default.
+- `onboard-init-flags` writes the config from `--network`, `--address`, `--token`, `--rpc-host`, and `--rpc-port` without prompting.
+- `onboard-background` runs chibi with `chibi run -b`, reports it with `chibi status`, and stops it with `chibi stop`.
 
 ## How to get to it (user POV)
 
 - Run `./install.sh` in a terminal from the repo root.
-- Run `chibi init` or `chibi init --network sepolia --address 0x...` directly.
+- Run `chibi init` directly, with or without flags.
+- Run `chibi run -b`, `chibi status`, and `chibi stop`.
 
 ## Driving it with verify-chibi scripts
 
 Preconditions:
 
-- Nothing listens on port 8545: `lsof -nP -iTCP:8545 -sTCP:LISTEN` prints nothing. `install.sh` always ends in `chibi run` on the configured address, which `init` sets to `127.0.0.1:8545`.
-- A scratch directory: `S=$(mktemp -d /tmp/chibi-onboard.XXXX); mkdir -p "$S/evidence"`.
+- A scratch HOME: `S=$(mktemp -d /tmp/chibi-onboard.XXXX); mkdir -p "$S/evidence"`. `E="env HOME=$S XDG_CONFIG_HOME=$S/.config XDG_DATA_HOME=$S/.local/share"`.
+- A free port for the run, for example 8747: `lsof -nP -iTCP:8747 -sTCP:LISTEN` prints nothing.
 
-- **Interactive install.** Start `install.sh` in a tmux pane with an isolated HOME and install root, reusing the real toolchain and build cache. Run `tmux new-session -d -s chibi-onboard -x 200 -y 50 "env HOME=$S XDG_CONFIG_HOME=$S/.config XDG_DATA_HOME=$S/.local/share RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo CARGO_INSTALL_ROOT=$S/install CARGO_TARGET_DIR=$PWD/target ./install.sh 2>&1 | tee $S/evidence/install.txt"`. Poll `tmux capture-pane -p -t chibi-onboard` until it shows `Network [sepolia]:`.
-- **Answer prompts.** Run `tmux send-keys -t chibi-onboard 'goerli' Enter`. The pane shows `unknown network "goerli"; expected sepolia or mainnet` and asks again. Run `tmux send-keys -t chibi-onboard '' Enter`, then `tmux send-keys -t chibi-onboard 'not-an-address' Enter` (re-prompted), then `tmux send-keys -t chibi-onboard '0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29' Enter` and `tmux send-keys -t chibi-onboard '' Enter`. The pane shows `wrote .../chibi/config.toml (sepolia, 1 address, tracking USDC)` and the next steps naming chain id `11155111`.
-- **Config on disk.** Run `cat "$S/Library/Application Support/chibi/config.toml"` on macOS (`$S/.config/chibi/config.toml` on Linux). It has `network = "sepolia"`, the address in checksum form, `rpc_addr = "127.0.0.1:8545"`, and the default `cors_origins` and `allowed_hosts`.
-- **First run.** Keep polling the pane. It shows `light client synced`, then `waiting for a snap/2 peer`, then `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`. Then `ls "$S/Library/Application Support/chibi/sepolia/"` lists `checkpoint` (32 bytes), `devp2p.key`, `chibi.lock`, and `state.json`.
-- **Flags.** Run `env HOME=$S/flags XDG_CONFIG_HOME=$S/flags/.config "$S/install/bin/chibi" init --network sepolia --address 0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29 --address 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6`. Exit code 0 and output `wrote ... (sepolia, 2 addresses, tracking USDC)` with no prompts.
-- **Proof.** Run `tmux capture-pane -p -S - -t chibi-onboard > "$S/evidence/pane.txt"` and copy the config files into `$S/evidence/`.
-- **Cleanup.** Run `tmux kill-session -t chibi-onboard`, then remove `$S` except `$S/evidence`.
+- **Install.** Run `tmux new-session -d -s chibi-onboard -x 160 -y 40 "$E RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo CARGO_INSTALL_ROOT=$S/install CARGO_TARGET_DIR=$PWD/target ./install.sh 2>&1 | tee $S/evidence/install.txt; sleep 600"`. Poll `tmux capture-pane -p -t chibi-onboard` until it shows `? Network`.
+- **Network.** Run `tmux send-keys -t chibi-onboard Enter`. The pane shows `? Network sepolia` and `? Watch-only address`.
+- **Addresses.** Run `tmux send-keys -t chibi-onboard 'not-an-address' Enter`; the pane shows `"not-an-address" is not an address`. Clear the line with 14 `BSpace` keys, then `tmux send-keys -t chibi-onboard '0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6' Enter` and `tmux send-keys -t chibi-onboard Enter`. The pane shows `? Tokens to track` with `[x] USDC` and unticked `USDT`, `DAI`, `WETH`, `LINK`.
+- **Tokens.** Run `tmux send-keys -t chibi-onboard Down Space Down Down Space Enter`. The pane shows `? Tokens to track USDC, USDT, WETH`.
+- **RPC host and port.** Run `tmux send-keys -t chibi-onboard 'bad_host!' Enter`; the pane shows `is not an IP address or host name`. Clear it with 9 `BSpace` keys, then `tmux send-keys -t chibi-onboard Enter` (host `127.0.0.1`) and `tmux send-keys -t chibi-onboard '8747' Enter`. The pane shows `wrote ... (sepolia, 1 address, tracking USDC, USDT, WETH)`, the wallet URL `http://127.0.0.1:8747` with chain id `11155111`, and `chibi run` / `chibi run -b` as next steps. No `light client` line follows: install does not start chibi.
+- **Config on disk.** Run `cat "$S/Library/Application Support/chibi/config.toml"` on macOS (`$S/.config/chibi/config.toml` on Linux). It has `tokens = ["USDC", "USDT", "WETH"]`, `rpc_host = "127.0.0.1"`, `rpc_port = 8747`, the checksummed address, and the default `cors_origins` and `allowed_hosts`.
+- **Background run.** Run `$E "$S/install/bin/chibi" run -b`. It prints the pid, the log path under the data dir, and the RPC URL. `$E "$S/install/bin/chibi" status` prints `running (pid <N>), JSON-RPC http://127.0.0.1:8747`. A second `run -b` is refused with the same pid.
+- **Serving.** Wait until `"$S/Library/Application Support/chibi/sepolia/chibi.log"` contains `JSON-RPC on http://127.0.0.1:8747` (minutes, while it waits for a snap/2 peer). Then `CHIBI=http://127.0.0.1:8747 TOKENS="0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238 0xaA8E23Fb1079EA71e0a56F48a2aA51851D8433D0 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14" scripts/oracle-check.sh 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 | tee "$S/evidence/oracle-check.txt"` reports `0 difference(s)`.
+- **Status and stop.** Run `$E "$S/install/bin/chibi" status`; it shows the running line and one line per address with ETH, USDC, USDT, and WETH. Run `$E "$S/install/bin/chibi" stop`; it reports the process stopped, the log ends with `shutting down on SIGTERM`, and `status` then prints `not running` above the saved snapshot.
+- **Flags.** Run `$E "$S/install/bin/chibi" init --config "$S/flags.toml" --network sepolia --address 0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29 --token dai --rpc-host localhost --rpc-port 8545 </dev/null`. Exit code 0, no prompts, and `$S/flags.toml` has `tokens = ["DAI"]` and `rpc_host = "localhost"`. `--token WBTC` on Sepolia is refused with the list of known tokens.
+- **Proof.** Run `tmux capture-pane -p -S - -t chibi-onboard > "$S/evidence/pane.txt"` and copy the config files and the node log into `$S/evidence/`.
+- **Cleanup.** Run `$E "$S/install/bin/chibi" stop` if it still runs, `tmux kill-session -t chibi-onboard`, then remove `$S` except `$S/evidence`.
 
 ## Gotchas
 
-- `install.sh` runs `chibi init` only when stdin is a terminal. Piping input into `install.sh` skips init and starts `chibi run` with whatever config exists, so drive it in tmux.
+- The menus need a real terminal. Driving `install.sh` or `chibi init` through a pipe gives the plain prompts instead (`Network [sepolia]:`, `Tokens to track, comma-separated or none [USDC]:`, and so on), which is the `onboard-init-plain` path, not `onboard-init-menu`.
+- In the address prompt, a rejected line stays in the input box. Clear it with `BSpace` before typing the next address.
 - On macOS the config lives under `$HOME/Library/Application Support/chibi/`, not `~/.config`. Overriding HOME isolates it; on Linux the XDG variables do.
-- Answering `n` to the overwrite prompt exits 0 and keeps the old config; `install.sh` then runs the old config.
 - Overriding HOME without `RUSTUP_HOME` and `CARGO_HOME` makes cargo look for a toolchain in the scratch directory and fail.
-- The first run trusts public checkpoint services and logs a warning. Later runs in the same data dir start from the saved checkpoint and do not warn.
+- `chibi status` shows the URL from the config file. A `run` started with `--rpc-host` or `--rpc-port` overrides is not reflected there.
+- `chibi run -b` and `chibi stop` find the node through the network's data dir. Pass the same `--network` and `--config` to all three commands.

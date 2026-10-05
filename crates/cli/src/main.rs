@@ -91,20 +91,35 @@ fn config_path(path: Option<PathBuf>) -> eyre::Result<PathBuf> {
 fn status(path: Option<PathBuf>) -> eyre::Result<()> {
     let config = Config::load(&config_path(path)?)?;
     let data_dir = data_dir(config.network)?;
-    let mut output = io::stdout().lock();
-    write_running(&mut output, Disk::running(&data_dir)?, &config)?;
-    match read_snapshot(&data_dir)? {
-        Some(snapshot) => {
-            let spec = config.network.spec();
-            write_status(&mut output, &snapshot, spec.tokens, unix_now())?;
-        }
+    let running = Disk::running(&data_dir)?;
+    let snapshot = read_snapshot(&data_dir)?;
+    let written = write_full_status(
+        &mut io::stdout().lock(),
+        running,
+        snapshot.as_ref(),
+        &config,
+    );
+    match written {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        written => Ok(written?),
+    }
+}
+
+fn write_full_status<W: Write>(
+    output: &mut W,
+    running: Option<u32>,
+    snapshot: Option<&Snapshot>,
+    config: &Config,
+) -> io::Result<()> {
+    write_running(output, running, config)?;
+    match snapshot {
+        Some(snapshot) => write_status(output, snapshot, config.network.spec().tokens, unix_now()),
         None => writeln!(
             output,
             "no snapshot for {} yet; it is saved once `chibi run` verifies its first head",
             config.network
-        )?,
+        ),
     }
-    Ok(())
 }
 
 fn unix_now() -> u64 {

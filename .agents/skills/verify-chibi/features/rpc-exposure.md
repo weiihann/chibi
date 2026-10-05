@@ -32,4 +32,4 @@ Preconditions:
 
 - `curl` sends `Host: 127.0.0.1:<port>` by default, so a plain request passing proves nothing about the filter. Always send the rebound host explicitly.
 - A preflight `OPTIONS` from a refused origin still carries `access-control-allow-methods`; only `access-control-allow-origin` decides what a browser allows.
-- Launching with `--rpc-addr` on port 0 breaks the Host filter, which is built for the configured port. `launch.sh` always passes a fixed port.
+- A custom `rpc_host` domain is added to the allowed `Host` values. Test the filter with a host that is neither the configured `rpc_host` nor in `allowed_hosts`.
