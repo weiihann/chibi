@@ -27,6 +27,12 @@ impl Heads {
     pub fn channel() -> (HeadsSender, Self) {
         let (latest_tx, latest) = watch::channel(None);
         let (finalized_tx, finalized) = watch::channel(None);
-        (HeadsSender { latest: latest_tx, finalized: finalized_tx }, Self { latest, finalized })
+        (
+            HeadsSender {
+                latest: latest_tx,
+                finalized: finalized_tx,
+            },
+            Self { latest, finalized },
+        )
     }
 }
