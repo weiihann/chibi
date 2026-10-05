@@ -93,6 +93,17 @@ pub struct FeeHistory {
     pub reward: Option<Vec<Vec<u128>>>,
 }
 
+/// A transaction chibi submitted, and where it was included once located.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmittedTx {
+    /// The signed transaction as broadcast.
+    pub transaction: Transaction,
+    /// The sender recovered at submission.
+    pub from: Address,
+    /// The including block and the transaction's index in it, once located in a verified body.
+    pub included: Option<(BlockNumHash, u64)>,
+}
+
 /// A verified receipt joined with what chibi recorded at submission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxReceipt {
@@ -272,6 +283,12 @@ impl<P: Peers> Node<P> {
 
     /// The receipt of a chibi-submitted transaction, `None` while pending or unknown.
     pub fn receipt(&self, hash: TxHash) -> Result<Option<TxReceipt>, NodeError> {
+        let _ = hash;
+        todo!()
+    }
+
+    /// A chibi-submitted transaction, `None` if chibi did not submit it.
+    pub fn transaction(&self, hash: TxHash) -> Result<Option<SubmittedTx>, NodeError> {
         let _ = hash;
         todo!()
     }

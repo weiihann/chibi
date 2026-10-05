@@ -14,6 +14,6 @@ pub use heads::{Heads, HeadsSender};
 pub use network::{Network, NetworkSpec, Token};
 pub use node::{
     BlockSel, FeeHistory, Follower, Holding, Node, NodeConfig, NodeError, Snapshot, Status,
-    Stepped, TxReceipt, read_snapshot,
+    Stepped, SubmittedTx, TxReceipt, read_snapshot,
 };
 pub use peers::{NetError, PeerKey, Peers, Reply};
