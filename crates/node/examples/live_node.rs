@@ -10,7 +10,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use chibi_node::{Network, Node, NodeConfig, Ports};
+use chibi_node::{Network, Node, NodeConfig, Ports, Watchlist};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -29,12 +29,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("usage: live_node <address>")?
         .parse()?;
     let data_dir = tempfile::tempdir()?;
+    let network = Network::Sepolia;
     let config = NodeConfig {
-        network: Network::Sepolia,
+        network,
         data_dir: data_dir.path().to_path_buf(),
         beacon_url: None,
         checkpoint: None,
-        watch: vec![watched],
+        watch: Watchlist {
+            addresses: vec![watched],
+            tokens: network.spec().tokens.to_vec(),
+        },
         ports: Ports {
             rlpx: 0,
             discovery: 0,

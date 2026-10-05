@@ -14,7 +14,7 @@ use chibi_core::testing::{
 };
 use chibi_core::wire;
 use chibi_node::fixture::{Fault, Fixture, FixturePeers};
-use chibi_node::{Disk, Follower, Node, Stepped, Token};
+use chibi_node::{Disk, Follower, Node, Stepped, Token, Watchlist};
 use jsonrpsee::server::{MethodsError, RpcModule};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::{Value, json};
@@ -27,6 +27,7 @@ const IMPL: Address = address!("0x0000000000000000000000000000000000001111");
 
 const TOKENS: &[Token] = &[Token {
     symbol: "TKN",
+    name: "Test token",
     address: PROXY,
     decimals: 18,
 }];
@@ -43,7 +44,10 @@ async fn start(
         fixture.peers(),
         fixture.heads(),
         Disk::open(dir).unwrap(),
-        watch,
+        &Watchlist {
+            addresses: watch.to_vec(),
+            tokens: TOKENS.to_vec(),
+        },
     )
     .await
     .unwrap();

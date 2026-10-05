@@ -119,7 +119,7 @@ pub struct NetworkSpec {
     /// Known snap/2 peers, dialed as static peers at start because discovery can take minutes
     /// to find one.
     pub snap_peers: Vec<NodeRecord>,
-    /// Tokens tracked for every watched address.
+    /// Tokens chibi knows on this network. The user picks which of them to track.
     pub tokens: &'static [Token],
     /// A block with a known number and timestamp, for estimating the head from the wall clock.
     pub clock: BlockClock,
@@ -130,13 +130,23 @@ impl NetworkSpec {
     pub fn chain_id(&self) -> u64 {
         self.chain.chain.id()
     }
+
+    /// The known token with this ticker, ignoring case.
+    pub fn token(&self, symbol: &str) -> Option<Token> {
+        self.tokens
+            .iter()
+            .find(|token| token.symbol.eq_ignore_ascii_case(symbol))
+            .copied()
+    }
 }
 
-/// An ERC-20 token chibi tracks for every watched address.
+/// An ERC-20 token chibi knows how to track for watched addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Token {
     /// Ticker shown to the user.
     pub symbol: &'static str,
+    /// Name shown when choosing tokens, including where a testnet deployment comes from.
+    pub name: &'static str,
     /// Contract address.
     pub address: Address,
     /// Decimal places of one whole token.
@@ -160,17 +170,77 @@ impl BlockClock {
     }
 }
 
-const SEPOLIA_TOKENS: &[Token] = &[Token {
-    symbol: "USDC",
-    address: address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
-    decimals: 6,
-}];
+const SEPOLIA_TOKENS: &[Token] = &[
+    Token {
+        symbol: "USDC",
+        name: "USD Coin (Circle)",
+        address: address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+        decimals: 6,
+    },
+    Token {
+        symbol: "USDT",
+        name: "Tether USD (Aave test token; Tether has no Sepolia deployment)",
+        address: address!("0xaA8E23Fb1079EA71e0a56F48a2aA51851D8433D0"),
+        decimals: 6,
+    },
+    Token {
+        symbol: "DAI",
+        name: "Dai (Aave test token; Maker has no Sepolia deployment)",
+        address: address!("0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "WETH",
+        name: "Wrapped Ether",
+        address: address!("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "LINK",
+        name: "Chainlink",
+        address: address!("0x779877A7B0D9E8603169DdbD7836e478b4624789"),
+        decimals: 18,
+    },
+];
 
-const MAINNET_TOKENS: &[Token] = &[Token {
-    symbol: "USDC",
-    address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-    decimals: 6,
-}];
+const MAINNET_TOKENS: &[Token] = &[
+    Token {
+        symbol: "USDC",
+        name: "USD Coin (Circle)",
+        address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        decimals: 6,
+    },
+    Token {
+        symbol: "USDT",
+        name: "Tether USD",
+        address: address!("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
+        decimals: 6,
+    },
+    Token {
+        symbol: "DAI",
+        name: "Dai",
+        address: address!("0x6B175474E89094C44Da98b954EedeAC495271d0F"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "WETH",
+        name: "Wrapped Ether",
+        address: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "LINK",
+        name: "Chainlink",
+        address: address!("0x514910771AF9Ca656af840dff83E8264EcF986CA"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "WBTC",
+        name: "Wrapped Bitcoin",
+        address: address!("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),
+        decimals: 8,
+    },
+];
 
 #[cfg(test)]
 mod tests {

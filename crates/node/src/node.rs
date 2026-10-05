@@ -85,10 +85,19 @@ pub struct NodeConfig {
     pub beacon_url: Option<Url>,
     /// Weak-subjectivity checkpoint override (a finalized beacon block root).
     pub checkpoint: Option<B256>,
-    /// Watch-only addresses whose accounts and token balances are tracked.
-    pub watch: Vec<Address>,
+    /// What to track: watch-only addresses and the tokens followed for each.
+    pub watch: Watchlist,
     /// devp2p listen ports.
     pub ports: Ports,
+}
+
+/// What the user asked chibi to track.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Watchlist {
+    /// Watch-only addresses whose accounts are proven and kept current.
+    pub addresses: Vec<Address>,
+    /// Tokens whose balances are followed for every watched address.
+    pub tokens: Vec<Token>,
 }
 
 /// Which block a request reads. Only verified heads chibi holds can be served.
@@ -234,7 +243,7 @@ pub(crate) struct Shared<P> {
     pub(crate) spec: NetworkSpec,
     pub(crate) env: ChainEnv,
     pub(crate) peers: P,
-    pub(crate) watch: Vec<Address>,
+    pub(crate) watch: Watchlist,
     pub(crate) disk: Disk,
     /// The canonical state. Reached only through [`Shared::read`] and [`Shared::update`],
     /// whose closures cannot await, so no guard crosses an await.
@@ -397,18 +406,18 @@ impl<P: Peers> Node<P> {
         peers: P,
         mut heads: Heads,
         disk: Disk,
-        watch: &[Address],
+        watch: &Watchlist,
     ) -> Result<(Self, Follower<P>), NodeError> {
         let trusted = wait_latest(&mut heads).await?;
         let anchor = fetch::header(&peers, trusted).await?;
-        let mut tracked: Vec<Key> = watch.iter().copied().map(Key::Account).collect();
+        let mut tracked: Vec<Key> = watch.addresses.iter().copied().map(Key::Account).collect();
         tracked.extend(disk.read(|file| file.tracked().collect::<Vec<_>>()));
         let outbox = disk.read(|file| file.outbox().to_vec());
         let shared = Arc::new(Shared {
             env: ChainEnv::new(Arc::clone(&spec.chain)),
             spec,
             peers,
-            watch: watch.to_vec(),
+            watch: watch.clone(),
             disk,
             state: Mutex::new(State::new(anchor.clone(), tracked)),
             fees: Mutex::new(HashMap::new()),
@@ -896,8 +905,8 @@ impl<P: Peers> Shared<P> {
     /// Runs `balanceOf(holder)` for every watched address and token and tracks every key the
     /// runs read, so proxies and nonstandard layouts are covered without per-token code.
     async fn seed(&self) {
-        for holder in &self.watch {
-            for token in self.spec.tokens {
+        for holder in &self.watch.addresses {
+            for token in &self.watch.tokens {
                 let request = balance_of(token, *holder);
                 let store = self.read(State::snapshot);
                 let seeded = self
@@ -921,6 +930,7 @@ impl<P: Peers> Shared<P> {
     pub(crate) fn snapshot(&self, store: &Store) -> Snapshot {
         let holdings = self
             .watch
+            .addresses
             .iter()
             .map(|address| {
                 let account = store.account(*address).ok();
@@ -929,7 +939,7 @@ impl<P: Peers> Shared<P> {
                     balance: account.map(|a| a.map_or(U256::ZERO, |a| a.balance)),
                     nonce: account.map(|a| a.map_or(0, |a| a.nonce)),
                     tokens: self
-                        .spec
+                        .watch
                         .tokens
                         .iter()
                         .map(|token| {

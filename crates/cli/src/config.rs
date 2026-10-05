@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, B256};
 use chibi_node::devp2p::Ports;
-use chibi_node::{Network, NodeConfig};
+use chibi_node::{Network, NodeConfig, Watchlist};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
@@ -112,7 +112,10 @@ impl Config {
             data_dir,
             beacon_url: self.beacon_url.clone(),
             checkpoint: self.checkpoint,
-            watch: self.addresses.clone(),
+            watch: Watchlist {
+                addresses: self.addresses.clone(),
+                tokens: self.network.spec().token("USDC").into_iter().collect(),
+            },
             ports: Ports {
                 rlpx: port,
                 discovery: port,
@@ -313,7 +316,7 @@ mod tests {
                 discovery: 30303
             }
         );
-        assert_eq!(node.watch, vec![ALICE]);
+        assert_eq!(node.watch.addresses, vec![ALICE]);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use chibi_core::wire::Transaction;
 use crate::disk::{Disk, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR};
 use crate::network::Token;
-use crate::node::{BlockSel, Follower, Node, NodeError, Stepped, read_snapshot};
+use crate::node::{BlockSel, Follower, Node, NodeError, Stepped, Watchlist, read_snapshot};
 
 const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
 const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
@@ -29,6 +29,7 @@ const IMPL: Address = address!("0x0000000000000000000000000000000000001111");
 
 const TOKENS: &[Token] = &[Token {
     symbol: "TKN",
+    name: "Test token",
     address: PROXY,
     decimals: 18,
 }];
@@ -44,7 +45,10 @@ async fn start(
         fixture.peers(),
         fixture.heads(),
         Disk::open(dir).unwrap(),
-        watch,
+        &Watchlist {
+            addresses: watch.to_vec(),
+            tokens: tokens.to_vec(),
+        },
     )
     .await
     .unwrap()

@@ -150,7 +150,8 @@ fn run(
 async fn serve(node_config: NodeConfig, rpc_config: RpcConfig) -> eyre::Result<()> {
     info!(
         network = %node_config.network,
-        watched = node_config.watch.len(),
+        watched = node_config.watch.addresses.len(),
+        tokens = node_config.watch.tokens.len(),
         data_dir = %node_config.data_dir.display(),
         "starting"
     );
@@ -292,7 +293,7 @@ fn write_next_steps<W: Write>(output: &mut W, path: &Path, config: &Config) -> i
         path.display(),
         config.network
     )?;
-    for (i, token) in spec.tokens.iter().enumerate() {
+    for (i, token) in spec.token("USDC").iter().enumerate() {
         let lead = if i == 0 { ", tracking " } else { ", " };
         write!(output, "{lead}{}", token.symbol)?;
     }
