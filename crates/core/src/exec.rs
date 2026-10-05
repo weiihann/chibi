@@ -15,8 +15,9 @@ use reth_chainspec::{ChainSpec, EthChainSpec};
 use revm::context::TxEnv;
 use revm::context_interface::Cfg;
 use revm::context_interface::result::{
-    EVMError, ExecutionResult, HaltReason, InvalidHeader, InvalidTransaction, ResultAndState,
+    EVMError, InvalidHeader, InvalidTransaction, ResultAndState,
 };
+pub use revm::context_interface::result::{ExecutionResult, HaltReason, Output};
 use revm::state::{AccountInfo, Bytecode};
 
 use crate::state::{Key, Miss, Store};
