@@ -78,7 +78,7 @@ Dependencies point one way: `cli -> node -> core`. reth-network and helios compi
 
 `Store` is partial state at one verified block, its anchor. It holds `accounts: HashMap<Address, Entry>` with `Entry::Absent | Present { account, slots }`, code by hash, and a window of the anchor plus up to 256 verified ancestors, enough for `BLOCKHASH`. Reads return `Result<_, Miss>`. A slot of an absent account is a known zero without a fetch. Slots live inside their account, so a slot without a proven account cannot be represented. Entries carry no block number of their own: the whole store moves together, so "valid at which block" has one answer. No storage root is held, because BALs would leave it stale. Each slot proof fetches its account proof at the same root, and both requests go out concurrently.
 
-`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts plus every key the token seeding run read. Untracked keys fetched for dapp calls form a cache that a reanchor drops. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
+`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts plus every key the token seeding runs read. Seeding runs two calls per watched address and selected token: `balanceOf(holder)` and a simulated `transfer(holder, 0)` from the holder. Together they cover proxy slots, pause flags, fee parameters, blacklist entries, and the holder's balance, so a send only has to fetch the recipient's slot. Recipient and allowance slots depend on the transaction and stay fetch-on-miss. Untracked keys fetched for dapp calls form a cache that a reanchor drops. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
 
 ### Trust boundary
 
@@ -90,7 +90,7 @@ Values enter a `Store` only through `Store::insert(Proven)` at the anchor, `Stat
 
 `State::plan(&target)` is pure and returns `Current`, `Extend { blocks }`, or `Reanchor`. It returns `Extend` when the gap is at most 32 blocks and every header in it has a `block_access_list_hash`. For `Extend` the follower verifies the header chain down to the anchor, fetches each BAL with snap/2 first and eth/71 with `BalRequirement::Optional` second, checks `keccak(raw)` against the header, and applies the BALs in one `update`. BAL semantics follow reth's `block_access_list_update`: last change wins, unknown addresses are ignored, an account left empty becomes `Absent` with its slots (EIP-161), and new code is stored by hash.
 
-`Reanchor` proves every tracked key at the target into a fresh store while the old store stays published, then swaps. Startup, reopen, headers without BALs, missing BALs, reorgs, and long gaps all take this path. After each reanchor the token seeding run repeats, so an upgraded token contract that moves its balance slot heals itself.
+`Reanchor` proves every tracked key at the target into a fresh store while the old store stays published, then swaps. Startup, reopen, headers without BALs, missing BALs, reorgs, and long gaps all take this path. After each reanchor the token seeding runs repeat, so an upgraded token contract that moves its balance slot heals itself.
 
 ### Requests and misses
 
@@ -110,7 +110,7 @@ The canonical `State` sits behind one `parking_lot::Mutex`, reachable only throu
 
 ### Persistence
 
-The state file is `state.json` in the per-network data directory. Writes go to a temp path, then fsync, rename, and a directory fsync, on a blocking thread. The file holds the tracked keys, a display snapshot of their values with its block number, the outbox, and up to 16 remembered snap/2 peers. Only peers reached through outbound sessions are remembered, because an inbound session's address is an ephemeral port. `chibi status` prints the snapshot labeled with its block. On start the keys feed the first reanchor, and pending outbox transactions are re-broadcast. A crash loses at most one head of merged cache facts. A lock file lets one `chibi run` own the directory.
+The state file is `state.json` in the per-network data directory. Writes go to a temp path, then fsync, rename, and a directory fsync, on a blocking thread. The file holds a display snapshot of the watched values with its block number, the outbox, and up to 16 remembered snap/2 peers. Tracked keys are not saved: they are derived from the watchlist at every start, so a token removed from the config stops being tracked. Only peers reached through outbound sessions are remembered, because an inbound session's address is an ephemeral port. `chibi status` prints the snapshot labeled with its block. On start, pending outbox transactions are re-broadcast. A lock file lets one `chibi run` own the directory, and it holds that process's id for `chibi stop` and `chibi status`.
 
 ### Transactions and fees
 
@@ -122,7 +122,7 @@ The state file is `state.json` in the per-network data directory. Writes go to a
 
 ### Networks
 
-`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, pinned snap/2 peers, and tracked tokens. Sepolia is the default. Its beacon default is `https://ethereum-sepolia-beacon-api.publicnode.com`, which served the light-client endpoints on 2026-10-05. A beacon endpoint can stall chibi but cannot make it accept a wrong header.
+`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, pinned snap/2 peers, and the registry of known tokens. The user picks which registry tokens to track; `NodeConfig.watch` carries the addresses and the picked tokens. On Sepolia, USDC is Circle's deployment and USDT and DAI are Aave's test tokens, because Tether and Maker have no Sepolia deployments. Sepolia is the default. Its beacon default is `https://ethereum-sepolia-beacon-api.publicnode.com`, which served the light-client endpoints on 2026-10-05. A beacon endpoint can stall chibi but cannot make it accept a wrong header.
 
 The light-client checkpoint follows one precedence: a user override, else the checkpoint helios saved in the data directory (a file of exactly 32 bytes), else the newest checkpoint from the community checkpoint services, logged as a warning. chibi never passes helios's shipped default, which is older than helios's 14-day limit. helios saves only checkpoints newer than the one it started from, so after a first-run sync chibi saves that checkpoint itself in helios's file format.
 
@@ -169,7 +169,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - A redb ledger as the shared state. It gives MVCC and atomic commits, but adds a dependency and a schema, and its read transactions would be held across awaits.
 - revm's `WrapDatabaseAsync`. It puts awaits inside the EVM, needs fibers and a multi-thread runtime, and costs one serial round trip per miss.
 - Per-entry block numbers. Every read would need a freshness check, and one run could mix entries of different ages.
-- A per-token storage-layout table. Running `balanceOf` once and tracking the keys it read covers proxies and nonstandard layouts without per-token code.
+- A per-token storage-layout table, or asking users for storage slot keys. Running `balanceOf` and a self-transfer and tracking the keys they read covers proxies, pause flags, fees, and nonstandard layouts without per-token code.
 
 ## Open questions and risks
 
