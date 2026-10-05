@@ -157,6 +157,14 @@ impl Config {
         std::fs::write(path, text).map_err(write_error)
     }
 
+    /// Switches to `network`, tracking the same token symbols at that network's addresses.
+    pub fn set_network(&mut self, network: Network) -> Result<(), UnknownToken> {
+        let symbols: Vec<&str> = self.tokens.iter().map(|token| token.symbol).collect();
+        self.tokens = resolve_tokens(network, &symbols)?;
+        self.network = network;
+        Ok(())
+    }
+
     /// The node settings, with state kept under `data_dir`.
     pub fn node_config(&self, data_dir: PathBuf) -> NodeConfig {
         let port = self.p2p_port.unwrap_or(0);
@@ -615,6 +623,35 @@ mod tests {
         assert!(
             Config::parse("network = \"mainnet\"\ntokens = [\"WBTC\"]").is_ok(),
             "WBTC is in the mainnet registry"
+        );
+    }
+
+    #[test]
+    fn network_switch_tracks_the_same_symbols_on_the_new_network() {
+        let mut config = Config::parse(r#"tokens = ["USDC", "WETH"]"#).unwrap();
+        config.set_network(Network::Mainnet).unwrap();
+        assert_eq!(config.network, Network::Mainnet);
+        assert_eq!(
+            config.node_config(PathBuf::from("/data")).watch.tokens,
+            vec![
+                token(Network::Mainnet, "USDC"),
+                token(Network::Mainnet, "WETH")
+            ]
+        );
+
+        let mut mainnet = Config::parse("network = \"mainnet\"\ntokens = [\"WBTC\"]").unwrap();
+        let error = mainnet
+            .set_network(Network::Sepolia)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "unknown token \"WBTC\" on sepolia; known tokens: USDC, USDT, DAI, WETH, LINK"
+        );
+        assert_eq!(
+            mainnet.network,
+            Network::Mainnet,
+            "a failed switch changes nothing"
         );
     }
 

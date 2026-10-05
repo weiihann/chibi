@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 
 use alloy_consensus::transaction::Recovered;
 use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, TxType};
@@ -19,7 +19,7 @@ use chibi_core::wire;
 use chibi_node::{BlockSel, FeeHistory, Node, NodeError, Peers, SubmittedTx, TxReceipt};
 use http::{HeaderValue, Method, header};
 use jsonrpsee::server::middleware::http::{Authority, AuthorityError, HostFilterLayer, Port};
-use jsonrpsee::server::{RegisterMethodError, RpcModule, Server, ServerConfig};
+use jsonrpsee::server::{RegisterMethodError, RpcModule, Server, ServerConfig, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::types::error::INVALID_PARAMS_CODE;
 use serde::{Deserialize, Serialize};
@@ -223,14 +223,31 @@ pub fn host_filter(
     }))
 }
 
-/// Serves JSON-RPC over HTTP until the server stops.
-pub async fn serve<P: Peers>(node: Node<P>, config: RpcConfig) -> Result<(), ServeError> {
-    if !config.addr.ip().is_loopback() {
-        warn!(addr = %config.addr, "JSON-RPC listens beyond loopback; anyone who can reach it can read tracked balances");
+/// Binds the listen address, so a taken port fails before the node spends minutes starting.
+pub fn bind(addr: SocketAddr) -> Result<TcpListener, ServeError> {
+    if !addr.ip().is_loopback() {
+        warn!(%addr, "JSON-RPC listens beyond loopback; anyone who can reach it can read tracked balances");
     }
+    TcpListener::bind(addr)
+        .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+        .map_err(|source| ServeError::Bind { addr, source })
+}
+
+/// Starts answering JSON-RPC over HTTP on `listener`, a socket from [`bind`]. Must run inside a
+/// tokio runtime; the server runs until the handle stops.
+pub fn start<P: Peers>(
+    node: Node<P>,
+    config: RpcConfig,
+    listener: TcpListener,
+) -> Result<ServerHandle, ServeError> {
+    let bind_error = |source| ServeError::Bind {
+        addr: config.addr,
+        source,
+    };
+    let addr = listener.local_addr().map_err(bind_error)?;
     let chain_id = node.chain_id();
     let module = module(node)?;
-    let hosts = host_filter(&config.allowed_hosts, config.addr.port())?;
+    let hosts = host_filter(&config.allowed_hosts, addr.port())?;
     let server = Server::builder()
         .set_config(ServerConfig::builder().http_only().build())
         .set_http_middleware(
@@ -238,20 +255,11 @@ pub async fn serve<P: Peers>(node: Node<P>, config: RpcConfig) -> Result<(), Ser
                 .layer(hosts)
                 .layer(cors_layer(config.cors_origins)),
         )
-        .build(config.addr)
-        .await
-        .map_err(|source| ServeError::Bind {
-            addr: config.addr,
-            source,
-        })?;
-    let addr = server.local_addr().map_err(|source| ServeError::Bind {
-        addr: config.addr,
-        source,
-    })?;
+        .build_from_tcp(listener)
+        .map_err(bind_error)?;
     let handle = server.start(module);
     info!("JSON-RPC on http://{addr}, chain id {chain_id}");
-    handle.stopped().await;
-    Ok(())
+    Ok(handle)
 }
 
 /// Why the server could not run.
@@ -1214,6 +1222,21 @@ mod tests {
             .body(HttpBody::empty())
             .unwrap();
         service.oneshot(request).await.unwrap().status()
+    }
+
+    #[test]
+    fn binding_a_taken_port_fails_with_the_address() {
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let error = bind(addr).unwrap_err();
+        assert!(
+            matches!(&error, ServeError::Bind { addr: failed, source }
+                if *failed == addr && source.kind() == io::ErrorKind::AddrInUse),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&addr.to_string()), "{error}");
+        drop(taken);
+        assert_eq!(bind(addr).unwrap().local_addr().unwrap(), addr);
     }
 
     #[tokio::test]

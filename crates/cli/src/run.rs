@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, RpcHost, data_dir};
@@ -59,7 +60,8 @@ pub struct RunArgs {
     pub detached: bool,
 }
 
-/// Loads the config at `path` with the command-line overrides applied.
+/// Loads the config at `path` with the command-line overrides applied. A network override
+/// tracks the same token symbols at that network's addresses.
 pub fn load(
     path: &Path,
     network: Option<Network>,
@@ -68,7 +70,7 @@ pub fn load(
 ) -> eyre::Result<Config> {
     let mut config = Config::load(path)?;
     if let Some(network) = network {
-        config.network = network;
+        config.set_network(network)?;
     }
     if let Some(host) = rpc_host {
         config.rpc_host = host;
@@ -93,17 +95,26 @@ pub fn run(args: &RunArgs, path: &Path) -> eyre::Result<()> {
         .with_ansi(!args.detached)
         .init();
     let rpc_config = config.rpc()?;
+    let listener = rpc::bind(rpc_config.addr)?;
+    let served = Served {
+        rpc: rpc_config,
+        listener,
+        url: config.rpc_url(),
+    };
     let runtime = tokio::runtime::Runtime::new()?;
-    let result = runtime.block_on(serve(
-        config.node_config(data_dir),
-        rpc_config,
-        args.detached,
-    ));
+    let result = runtime.block_on(serve(config.node_config(data_dir), served, args.detached));
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
     result
 }
 
-async fn serve(node_config: NodeConfig, rpc_config: RpcConfig, detached: bool) -> eyre::Result<()> {
+/// The JSON-RPC side of a run: its settings, its already bound socket, and the URL wallets use.
+struct Served {
+    rpc: RpcConfig,
+    listener: TcpListener,
+    url: String,
+}
+
+async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre::Result<()> {
     if detached {
         let mut hangup = signal(SignalKind::hangup())?;
         tokio::spawn(async move {
@@ -121,6 +132,7 @@ async fn serve(node_config: NodeConfig, rpc_config: RpcConfig, detached: bool) -
         data_dir = %node_config.data_dir.display(),
         "starting"
     );
+    let data_dir = node_config.data_dir.clone();
     let (node, follower) = tokio::select! {
         started = Node::start(node_config) => started?,
         signal = &mut shutdown => {
@@ -128,9 +140,13 @@ async fn serve(node_config: NodeConfig, rpc_config: RpcConfig, detached: bool) -
             return Ok(());
         }
     };
+    let server = rpc::start(node, served.rpc, served.listener)?;
+    if let Err(err) = Disk::announce(&data_dir, &served.url) {
+        warn!(%err, "cannot record the JSON-RPC URL for `chibi status`");
+    }
     tokio::select! {
         result = follower.run() => result.wrap_err("head follower stopped"),
-        result = rpc::serve(node, rpc_config) => result.wrap_err("JSON-RPC server stopped"),
+        () = server.stopped() => bail!("JSON-RPC server stopped"),
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
             Ok(())
@@ -165,11 +181,25 @@ pub fn detached_args(args: &RunArgs) -> Vec<OsString> {
     argv
 }
 
+/// The `--config` and `--network` a `run` was given, for the `status` and `stop` it suggests.
+fn hint_flags(args: &RunArgs) -> String {
+    let mut flags = String::new();
+    if let Some(path) = &args.config {
+        flags.push_str(&format!(" --config {}", path.display()));
+    }
+    if let Some(network) = args.network {
+        flags.push_str(&format!(" --network {network}"));
+    }
+    flags
+}
+
 fn start_background(args: &RunArgs, config: &Config, data_dir: &Path) -> eyre::Result<()> {
-    if let Some(pid) = Disk::running(data_dir)? {
+    let flags = hint_flags(args);
+    if let Some(holder) = Disk::running(data_dir)? {
         bail!(
-            "chibi is already running on {} (pid {pid}); stop it with `chibi stop`",
-            config.network
+            "chibi is already running on {} (pid {}); stop it with `chibi stop{flags}`",
+            config.network,
+            holder.pid
         );
     }
     fs::create_dir_all(data_dir)
@@ -205,11 +235,6 @@ fn start_background(args: &RunArgs, config: &Config, data_dir: &Path) -> eyre::R
         }
         thread::sleep(POLL_INTERVAL);
     }
-    let flag = args
-        .config
-        .as_ref()
-        .map(|path| format!(" --config {}", path.display()))
-        .unwrap_or_default();
     println!("chibi is running in the background (pid {})", child.id());
     println!("  log:      {}", log_path.display());
     println!(
@@ -217,8 +242,8 @@ fn start_background(args: &RunArgs, config: &Config, data_dir: &Path) -> eyre::R
         config.rpc_url(),
         config.network.spec().chain_id()
     );
-    println!("  status:   chibi status{flag}");
-    println!("  stop:     chibi stop{flag}");
+    println!("  status:   chibi status{flags}");
+    println!("  stop:     chibi stop{flags}");
     Ok(())
 }
 
@@ -235,10 +260,11 @@ fn tail(text: &str, lines: usize) -> &str {
 /// Sends SIGTERM to the chibi running on `network` and waits for it to release its data dir.
 pub fn stop(network: Network) -> eyre::Result<()> {
     let dir = data_dir(network)?;
-    let Some(pid) = Disk::running(&dir)? else {
+    let Some(holder) = Disk::running(&dir)? else {
         println!("chibi is not running on {network}");
         return Ok(());
     };
+    let pid = holder.pid;
     let raw = i32::try_from(pid).wrap_err_with(|| format!("pid {pid} is out of range"))?;
     match kill(Pid::from_raw(raw), Signal::SIGTERM) {
         Ok(()) | Err(Errno::ESRCH) => {}
@@ -339,5 +365,45 @@ mod tests {
         assert_eq!(tail("a\nb\nc\n", 2), "b\nc");
         assert_eq!(tail("a\nb", 5), "a\nb");
         assert_eq!(tail("", 3), "");
+    }
+
+    #[test]
+    fn network_override_tracks_the_tokens_of_the_network_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "tokens = [\"USDC\"]\n").unwrap();
+        let config = load(&path, Some(Network::Mainnet), None, NonZeroU16::new(8745)).unwrap();
+        assert_eq!(config.network, Network::Mainnet);
+        assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
+        let mainnet_usdc = Network::Mainnet.spec().token("USDC").unwrap();
+        assert_eq!(
+            config.node_config(PathBuf::from("/data")).watch.tokens,
+            vec![mainnet_usdc]
+        );
+
+        fs::write(&path, "network = \"mainnet\"\ntokens = [\"WBTC\"]\n").unwrap();
+        let error = load(&path, Some(Network::Sepolia), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown token \"WBTC\" on sepolia"),
+            "{error}"
+        );
+        assert!(error.contains("USDC, USDT, DAI, WETH, LINK"), "{error}");
+    }
+
+    #[test]
+    fn hints_repeat_the_config_and_network_flags() {
+        assert_eq!(hint_flags(&RunArgs::default()), "");
+        let args = RunArgs {
+            network: Some(Network::Mainnet),
+            config: Some(PathBuf::from("/cfg/chibi.toml")),
+            background: true,
+            ..RunArgs::default()
+        };
+        assert_eq!(
+            hint_flags(&args),
+            " --config /cfg/chibi.toml --network mainnet"
+        );
     }
 }

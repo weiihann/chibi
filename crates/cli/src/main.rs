@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::U256;
+use chibi_node::disk::Holder;
 use chibi_node::{Disk, Network, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 
@@ -61,6 +62,9 @@ enum Command {
     },
     /// Show whether chibi runs and the balances saved at the last verified head.
     Status {
+        /// Network to show instead of the configured one.
+        #[arg(long)]
+        network: Option<Network>,
         /// Config file to read instead of the default location.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -77,7 +81,7 @@ fn main() -> eyre::Result<()> {
             let config = Config::load(&config_path(config)?)?;
             run::stop(network.unwrap_or(config.network))
         }
-        Command::Status { config } => status(config),
+        Command::Status { network, config } => status(network, config),
     }
 }
 
@@ -88,16 +92,19 @@ fn config_path(path: Option<PathBuf>) -> eyre::Result<PathBuf> {
     }
 }
 
-fn status(path: Option<PathBuf>) -> eyre::Result<()> {
-    let config = Config::load(&config_path(path)?)?;
-    let data_dir = data_dir(config.network)?;
+fn status(network: Option<Network>, path: Option<PathBuf>) -> eyre::Result<()> {
+    let network = match network {
+        Some(network) => network,
+        None => Config::load(&config_path(path)?)?.network,
+    };
+    let data_dir = data_dir(network)?;
     let running = Disk::running(&data_dir)?;
     let snapshot = read_snapshot(&data_dir)?;
     let written = write_full_status(
         &mut io::stdout().lock(),
-        running,
+        running.as_ref(),
         snapshot.as_ref(),
-        &config,
+        network,
     );
     match written {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -107,17 +114,16 @@ fn status(path: Option<PathBuf>) -> eyre::Result<()> {
 
 fn write_full_status<W: Write>(
     output: &mut W,
-    running: Option<u32>,
+    running: Option<&Holder>,
     snapshot: Option<&Snapshot>,
-    config: &Config,
+    network: Network,
 ) -> io::Result<()> {
-    write_running(output, running, config)?;
+    write_running(output, running)?;
     match snapshot {
-        Some(snapshot) => write_status(output, snapshot, config.network.spec().tokens, unix_now()),
+        Some(snapshot) => write_status(output, snapshot, network.spec().tokens, unix_now()),
         None => writeln!(
             output,
-            "no snapshot for {} yet; it is saved once `chibi run` verifies its first head",
-            config.network
+            "no snapshot for {network} yet; it is saved once `chibi run` verifies its first head"
         ),
     }
 }
@@ -128,9 +134,19 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-fn write_running<W: Write>(output: &mut W, pid: Option<u32>, config: &Config) -> io::Result<()> {
-    match pid {
-        Some(pid) => writeln!(output, "running (pid {pid}), JSON-RPC {}", config.rpc_url()),
+fn write_running<W: Write>(output: &mut W, running: Option<&Holder>) -> io::Result<()> {
+    match running {
+        Some(Holder {
+            pid,
+            endpoint: Some(url),
+        }) => writeln!(output, "running (pid {pid}), JSON-RPC {url}"),
+        Some(Holder {
+            pid,
+            endpoint: None,
+        }) => writeln!(
+            output,
+            "running (pid {pid}), starting; JSON-RPC is served once the first head is verified"
+        ),
         None => writeln!(output, "not running"),
     }
 }
@@ -216,23 +232,27 @@ mod tests {
     const BOB: Address = address!("0x00000000000000000000000000000000000000b0");
 
     #[test]
-    fn status_line_names_the_pid_and_rpc_url() {
-        let mut config = Config::new(Network::Sepolia, vec![ALICE]);
-        let line = |pid, config: &Config| {
+    fn status_line_names_the_pid_and_the_url_the_running_chibi_serves() {
+        let line = |running: Option<Holder>| {
             let mut output = Vec::new();
-            write_running(&mut output, pid, config).unwrap();
+            write_running(&mut output, running.as_ref()).unwrap();
             String::from_utf8(output).unwrap()
         };
         assert_eq!(
-            line(Some(4242), &config),
-            "running (pid 4242), JSON-RPC http://127.0.0.1:8545\n"
+            line(Some(Holder {
+                pid: 4242,
+                endpoint: Some("http://chibi.local:8745".to_owned()),
+            })),
+            "running (pid 4242), JSON-RPC http://chibi.local:8745\n"
         );
-        config.rpc_host = "chibi.local".parse().unwrap();
         assert_eq!(
-            line(Some(7), &config),
-            "running (pid 7), JSON-RPC http://chibi.local:8545\n"
+            line(Some(Holder {
+                pid: 7,
+                endpoint: None,
+            })),
+            "running (pid 7), starting; JSON-RPC is served once the first head is verified\n"
         );
-        assert_eq!(line(None, &config), "not running\n");
+        assert_eq!(line(None), "not running\n");
     }
 
     #[test]

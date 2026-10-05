@@ -6,8 +6,10 @@
 //! values are display-only: nothing read from it enters a `Store`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{ErrorKind, Write as _};
+use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Bytes, hex};
@@ -26,6 +28,35 @@ const KEY_FILE: &str = "devp2p.key";
 
 /// Most snap/2 peers remembered across restarts.
 const REMEMBERED_PEERS: usize = 16;
+
+/// How long lock-file readers and openers retry. [`Disk::running`] briefly holds a shared lock
+/// to probe, and [`Disk::open`] writes the pid just after taking the lock.
+const LOCK_RETRY: Duration = Duration::from_millis(100);
+const LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// The chibi process holding a data directory, as recorded in its lock file: the pid on the
+/// first line and, once announced, the endpoint it serves on the second.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holder {
+    /// The holder's process id.
+    pub pid: u32,
+    /// What the holder serves, recorded by [`Disk::announce`]; `None` until it does.
+    pub endpoint: Option<String>,
+}
+
+impl Holder {
+    /// Parses the lock file; `None` while it holds no complete pid yet.
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        let pid = lines.next()?.trim().parse().ok()?;
+        let endpoint = lines
+            .next()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_owned);
+        Some(Self { pid, endpoint })
+    }
+}
 
 /// A submitted transaction not yet located, and the anchor chibi held when it was submitted.
 /// Inclusion can only be in a later block, so a search for it need not reach further back.
@@ -104,18 +135,25 @@ impl Disk {
             .write(true)
             .open(&lock_path)
             .map_err(|err| io_error(&lock_path, &err))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(NodeError::Disk(format!(
-                    "{} is in use by another chibi process",
-                    dir.display()
-                )));
+        let deadline = Instant::now() + LOCK_RETRY;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(LOCK_POLL);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(NodeError::Disk(format!(
+                        "{} is in use by another chibi process",
+                        dir.display()
+                    )));
+                }
+                Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
             }
-            Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
         }
+        let pid = std::process::id().to_string();
         lock.set_len(0)
-            .and_then(|()| write!(lock, "{}", std::process::id()))
+            .and_then(|()| lock.write_all(pid.as_bytes()))
             .and_then(|()| lock.sync_all())
             .map_err(|err| io_error(&lock_path, &err))?;
         let file = read_state(dir)?.unwrap_or_default();
@@ -126,26 +164,68 @@ impl Disk {
         })
     }
 
-    /// The process id of the chibi that holds `dir`'s lock, or `None` when no chibi runs there.
-    /// Does not take the lock away from anyone.
-    pub fn running(dir: &Path) -> Result<Option<u32>, NodeError> {
+    /// The chibi that holds `dir`'s lock, or `None` when no chibi runs there. Does not take the
+    /// lock away from anyone.
+    pub fn running(dir: &Path) -> Result<Option<Holder>, NodeError> {
         let lock_path = dir.join(LOCK_FILE);
         let lock = match File::open(&lock_path) {
             Ok(lock) => lock,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(io_error(&lock_path, &err)),
         };
-        match lock.try_lock_shared() {
-            Ok(()) => Ok(None),
-            Err(TryLockError::WouldBlock) => {
-                let pid =
-                    fs::read_to_string(&lock_path).map_err(|err| io_error(&lock_path, &err))?;
-                pid.trim().parse().map(Some).map_err(|_| {
-                    NodeError::Disk(format!("{} holds no process id", lock_path.display()))
-                })
+        let deadline = Instant::now() + LOCK_RETRY;
+        loop {
+            match lock.try_lock_shared() {
+                Ok(()) => return Ok(None),
+                Err(TryLockError::WouldBlock) => {
+                    let text =
+                        fs::read_to_string(&lock_path).map_err(|err| io_error(&lock_path, &err))?;
+                    if let Some(holder) = Holder::parse(&text) {
+                        return Ok(Some(holder));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(NodeError::Disk(format!(
+                            "{} holds no process id",
+                            lock_path.display()
+                        )));
+                    }
+                    thread::sleep(LOCK_POLL);
+                }
+                Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
             }
-            Err(TryLockError::Error(err)) => Err(io_error(&lock_path, &err)),
         }
+    }
+
+    /// Records `endpoint` in `dir`'s lock file for [`Disk::running`] to report. Only the
+    /// process holding `dir` may announce; a later announcement replaces an earlier one.
+    pub fn announce(dir: &Path, endpoint: &str) -> Result<(), NodeError> {
+        if endpoint.contains(['\n', '\r']) {
+            return Err(NodeError::Disk(format!(
+                "endpoint {endpoint:?} spans several lines"
+            )));
+        }
+        let lock_path = dir.join(LOCK_FILE);
+        let fail = |err: std::io::Error| io_error(&lock_path, &err);
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(fail)?;
+        let mut text = String::new();
+        lock.read_to_string(&mut text).map_err(fail)?;
+        let pid = text.lines().next().unwrap_or_default();
+        if pid.trim() != std::process::id().to_string() {
+            return Err(NodeError::Disk(format!(
+                "{} is not held by this process",
+                dir.display()
+            )));
+        }
+        let pid_len = u64::try_from(pid.len()).unwrap_or(u64::MAX);
+        lock.set_len(pid_len)
+            .and_then(|()| lock.seek(SeekFrom::End(0)))
+            .and_then(|_| lock.write_all(format!("\n{endpoint}").as_bytes()))
+            .and_then(|()| lock.sync_all())
+            .map_err(fail)
     }
 
     /// The data directory.
@@ -258,6 +338,13 @@ mod tests {
 
     use super::*;
 
+    fn holder(endpoint: Option<&str>) -> Option<Holder> {
+        Some(Holder {
+            pid: std::process::id(),
+            endpoint: endpoint.map(str::to_owned),
+        })
+    }
+
     #[test]
     fn second_open_of_a_locked_dir_fails_until_the_first_closes() {
         let dir = tempfile::tempdir().unwrap();
@@ -266,12 +353,89 @@ mod tests {
         assert!(matches!(Disk::open(dir.path()), Err(NodeError::Disk(_))));
         assert_eq!(
             Disk::running(dir.path()).unwrap(),
-            Some(std::process::id()),
+            holder(None),
             "the holder's pid is readable while it holds the lock"
         );
         drop(first);
         assert_eq!(Disk::running(dir.path()).unwrap(), None);
         assert!(Disk::open(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn announced_endpoint_is_reported_with_the_pid_and_cleared_by_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Disk::open(dir.path()).unwrap();
+        Disk::announce(dir.path(), "http://chibi.local:8745").unwrap();
+        assert_eq!(
+            Disk::running(dir.path()).unwrap(),
+            holder(Some("http://chibi.local:8745"))
+        );
+        Disk::announce(dir.path(), "http://127.0.0.1:8545").unwrap();
+        assert_eq!(
+            Disk::running(dir.path()).unwrap(),
+            holder(Some("http://127.0.0.1:8545"))
+        );
+        assert!(Disk::announce(dir.path(), "a\nb").is_err());
+        drop(first);
+        assert_eq!(Disk::running(dir.path()).unwrap(), None);
+        let _second = Disk::open(dir.path()).unwrap();
+        assert_eq!(Disk::running(dir.path()).unwrap(), holder(None));
+    }
+
+    #[test]
+    fn only_the_holder_announces() {
+        let dir = tempfile::tempdir().unwrap();
+        let _disk = Disk::open(dir.path()).unwrap();
+        let lock_path = dir.path().join(LOCK_FILE);
+        fs::write(&lock_path, "1").unwrap();
+        assert!(matches!(
+            Disk::announce(dir.path(), "http://127.0.0.1:8545"),
+            Err(NodeError::Disk(_))
+        ));
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "1");
+    }
+
+    #[test]
+    fn an_empty_lock_file_under_a_held_lock_is_a_holder_still_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let _disk = Disk::open(dir.path()).unwrap();
+        let lock_path = dir.path().join(LOCK_FILE);
+        fs::write(&lock_path, "").unwrap();
+        let writer = {
+            let lock_path = lock_path.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                fs::write(lock_path, std::process::id().to_string()).unwrap();
+            })
+        };
+        assert_eq!(Disk::running(dir.path()).unwrap(), holder(None));
+        writer.join().unwrap();
+
+        fs::write(&lock_path, "").unwrap();
+        assert!(
+            matches!(Disk::running(dir.path()), Err(NodeError::Disk(_))),
+            "a pid that never appears is an error once the retry runs out"
+        );
+    }
+
+    #[test]
+    fn probing_does_not_make_a_concurrent_open_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let probing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let prober = {
+            let dir = dir.path().to_path_buf();
+            let probing = std::sync::Arc::clone(&probing);
+            thread::spawn(move || {
+                while probing.load(std::sync::atomic::Ordering::Relaxed) {
+                    Disk::running(&dir).unwrap();
+                }
+            })
+        };
+        for _ in 0..200 {
+            drop(Disk::open(dir.path()).unwrap());
+        }
+        probing.store(false, std::sync::atomic::Ordering::Relaxed);
+        prober.join().unwrap();
     }
 
     #[test]
