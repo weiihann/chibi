@@ -812,6 +812,9 @@ impl From<RpcError> for ErrorObjectOwned {
 }
 
 #[cfg(test)]
+mod node_tests;
+
+#[cfg(test)]
 mod tests {
     use std::convert::Infallible;
 

@@ -40,6 +40,9 @@ url = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 chibi-core = { workspace = true, features = ["test-utils"] }
+chibi-node = { workspace = true, features = ["test-utils"] }
+alloy-signer = "2.5"
+alloy-signer-local = "2.5"
 tower = { workspace = true, features = ["util"] }
 tempfile.workspace = true
 revm.workspace = true
