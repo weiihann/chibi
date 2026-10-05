@@ -85,7 +85,8 @@ pub struct CallRequest {
     pub max_fee_per_gas: Option<u128>,
     /// EIP-1559 tip cap.
     pub max_priority_fee_per_gas: Option<u128>,
-    /// Sender nonce; the sender's current nonce when absent.
+    /// Ignored: runs use the sender's nonce at the anchor, as reth's `eth_call` and
+    /// `eth_estimateGas` do.
     pub nonce: Option<u64>,
     /// EIP-2930 access list.
     pub access_list: AccessList,
@@ -205,9 +206,6 @@ pub enum EstimateError {
         /// The capped gas limit.
         gas_limit: u64,
     },
-    /// The sender's balance is below the value sent.
-    #[error("insufficient funds for value transfer")]
-    InsufficientFunds,
     /// The EVM refused the transaction.
     #[error(transparent)]
     Invalid(#[from] ExecError),
@@ -228,11 +226,16 @@ pub fn execute(store: &Store, env: &ChainEnv, req: &CallRequest) -> Result<Execu
     if tx.gas_price == 0 {
         evm_env.block_env.basefee = 0;
     }
-    if req.gas.is_none()
-        && tx.gas_price > 0
-        && let Ok(allowance) = caller_gas_allowance(&mut db, &tx)
-    {
-        tx.gas_limit = tx.gas_limit.min(allowance);
+    if req.gas.is_none() && tx.gas_price > 0 {
+        match caller_gas_allowance(&mut db, &tx) {
+            Ok(allowance) => tx.gas_limit = tx.gas_limit.min(allowance),
+            Err(error) => {
+                return db.finish().map(|read| Executed {
+                    result: Err(error),
+                    read,
+                });
+            }
+        }
     }
     let mut evm = EthEvmFactory::default().create_evm(&mut db, evm_env);
     let result = evm
@@ -268,17 +271,9 @@ fn estimate_with(
         evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
     };
     let mut highest = req.gas.unwrap_or(max_gas_limit).min(max_gas_limit);
-    let request_priced =
-        req.gas.is_some() || req.gas_price.is_some() || req.max_fee_per_gas.is_some();
+    let request_priced = req.gas.is_some() || req.gas_price.is_some();
 
-    let mut tx = tx_env(
-        db,
-        &evm_env,
-        &CallRequest {
-            nonce: None,
-            ..req.clone()
-        },
-    );
+    let mut tx = tx_env(db, &evm_env, req);
     let is_basic_transfer = match (tx.data.is_empty(), tx.kind) {
         (true, TxKind::Call(to)) => db
             .basic_info(to)
@@ -421,15 +416,19 @@ const fn is_gas_too_low(error: &InvalidTransaction) -> bool {
     )
 }
 
-/// `(balance - value) / gas_price`, after alloy-evm's `caller_gas_allowance`.
-fn caller_gas_allowance(db: &mut Db<'_>, tx: &TxEnv) -> Result<u64, EstimateError> {
+/// `(balance - value) / gas_price`, after alloy-evm's `caller_gas_allowance`. A balance below
+/// the value is the same refusal the EVM gives a sender who cannot pay.
+fn caller_gas_allowance(db: &mut Db<'_>, tx: &TxEnv) -> Result<u64, ExecError> {
     let balance = db
         .basic_info(tx.caller)
         .map(|info| info.balance)
         .unwrap_or_default();
-    let spendable = balance
-        .checked_sub(tx.value)
-        .ok_or(EstimateError::InsufficientFunds)?;
+    let spendable = balance.checked_sub(tx.value).ok_or_else(|| {
+        ExecError::Transaction(InvalidTransaction::LackOfFundForMaxFee {
+            fee: Box::new(tx.value),
+            balance: Box::new(balance),
+        })
+    })?;
     Ok(spendable
         .checked_div(U256::from(tx.gas_price))
         .unwrap_or_default()
@@ -438,11 +437,10 @@ fn caller_gas_allowance(db: &mut Db<'_>, tx: &TxEnv) -> Result<u64, EstimateErro
 
 fn tx_env(db: &mut Db<'_>, evm_env: &EvmEnv, req: &CallRequest) -> TxEnv {
     let caller = req.from.unwrap_or_default();
-    let nonce = req.nonce.unwrap_or_else(|| {
-        db.basic_info(caller)
-            .map(|info| info.nonce)
-            .unwrap_or_default()
-    });
+    let nonce = db
+        .basic_info(caller)
+        .map(|info| info.nonce)
+        .unwrap_or_default();
     let (tx_type, gas_priority_fee) = match req.max_fee_per_gas {
         Some(_) => (2, Some(req.max_priority_fee_per_gas.unwrap_or_default())),
         None if req.access_list.is_empty() => (0, None),
@@ -716,6 +714,97 @@ mod tests {
         assert!(
             (used..=(used + CALL_STIPEND_GAS) * 64 / 63).contains(&estimate),
             "estimate {estimate} outside reth's bounds for {used} gas used"
+        );
+    }
+
+    #[test]
+    fn call_ignores_request_nonce() {
+        let world = world();
+        let env = ChainEnv::new(world.spec());
+        let mut store = Store::new(world.verified(world.head()));
+        let (plain, _) = discover(&world, &mut store, |store| {
+            execute(store, &env, &balance_of())
+        });
+        let stale = execute(
+            &store,
+            &env,
+            &CallRequest {
+                nonce: Some(99),
+                ..balance_of()
+            },
+        )
+        .unwrap();
+        assert_eq!(stale, plain);
+    }
+
+    #[test]
+    fn priced_call_beyond_balance_is_refused() {
+        let world = world();
+        let env = ChainEnv::new(world.spec());
+        let mut store = Store::new(world.verified(world.head()));
+        let broke = CallRequest {
+            from: Some(BOB),
+            to: TxKind::Call(ALICE),
+            value: eth(2),
+            gas_price: Some(1),
+            ..CallRequest::default()
+        };
+        let (executed, _) = discover(&world, &mut store, |store| execute(store, &env, &broke));
+        assert_eq!(
+            executed.result,
+            Err(ExecError::Transaction(
+                InvalidTransaction::LackOfFundForMaxFee {
+                    fee: Box::new(eth(2)),
+                    balance: Box::new(eth(1)),
+                }
+            ))
+        );
+    }
+
+    /// Reverts with `0x2a` unless at least 500k gas remains.
+    fn gas_hungry_code() -> Bytes {
+        Bytes::from_static(&[
+            0x62, 0x07, 0xa1, 0x20, 0x5a, 0x10, 0x60, 0x0a, 0x57, 0x00, 0x5b, 0x60, 0x2a, 0x60,
+            0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xfd,
+        ])
+    }
+
+    #[test]
+    fn only_legacy_price_or_gas_retries_a_revert() {
+        const HUNGRY: Address = address!("0x00000000000000000000000000000000000f00d5");
+        let gwei = 1_000_000_000u128;
+        let world = World::genesis([
+            (ALICE, WorldAccount::eoa(U256::from(100_000 * gwei))),
+            (HUNGRY, WorldAccount::contract(gas_hungry_code())),
+        ]);
+        let env = ChainEnv::new(world.spec());
+        let mut store = Store::new(world.verified(world.head()));
+        let call = CallRequest {
+            from: Some(ALICE),
+            to: TxKind::Call(HUNGRY),
+            ..CallRequest::default()
+        };
+        let mut estimate = |req: CallRequest| {
+            discover(&world, &mut store, |store| estimate_gas(store, &env, &req)).0
+        };
+        let revert = Bytes::from(B256::from(U256::from(0x2a)).to_vec());
+
+        let eip1559 = CallRequest {
+            max_fee_per_gas: Some(gwei),
+            ..call.clone()
+        };
+        assert_eq!(
+            estimate(eip1559),
+            Err(EstimateError::Reverted { output: revert })
+        );
+
+        let legacy = CallRequest {
+            gas_price: Some(gwei),
+            ..call
+        };
+        assert_eq!(
+            estimate(legacy),
+            Err(EstimateError::OutOfGas { gas_limit: 100_000 })
         );
     }
 }

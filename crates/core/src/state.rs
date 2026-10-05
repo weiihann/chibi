@@ -19,7 +19,7 @@ use crate::verify::{Fact, Proven, VerifiedBlock, VerifiedHeader};
 /// old roots fall out of what snap peers serve.
 pub const MAX_BAL_GAP: u64 = 32;
 
-/// Verified headers held per store, ending at the anchor.
+/// Ancestor headers held besides the anchor, so `BLOCKHASH` reaches its full 256 blocks.
 pub const HEADER_WINDOW: usize = 256;
 
 /// An account without its storage root. Storage roots are not held because BALs would leave
@@ -121,7 +121,7 @@ pub enum Miss {
 #[derive(Clone, Debug)]
 pub struct Store {
     /// Verified ancestors of the anchor, oldest first, each the parent of the next, the newest
-    /// being the anchor's parent. At most `HEADER_WINDOW - 1` entries.
+    /// being the anchor's parent. At most [`HEADER_WINDOW`] entries.
     ancestors: VecDeque<VerifiedHeader>,
     anchor: VerifiedHeader,
     accounts: HashMap<Address, Entry>,
@@ -279,7 +279,10 @@ impl Store {
     }
 
     /// Prepends verified ancestors, ascending, the newest being the parent of the oldest held
-    /// header. Headers past [`HEADER_WINDOW`] are not kept.
+    /// header.
+    ///
+    /// All or nothing: refuses ancestors that do not link or that would not all fit in the
+    /// window, so a caller fetching for a [`Miss::BlockHash`] learns it cannot be served.
     pub fn insert_ancestors(&mut self, ancestors: Vec<VerifiedHeader>) -> Result<(), StateError> {
         let oldest = self.ancestors.front().unwrap_or(&self.anchor);
         let linked = ancestors
@@ -291,8 +294,14 @@ impl Store {
         if !linked {
             return Err(StateError::Unlinked);
         }
-        let room = (HEADER_WINDOW - 1).saturating_sub(self.ancestors.len());
-        for header in ancestors.into_iter().rev().take(room) {
+        let room = HEADER_WINDOW - self.ancestors.len();
+        if ancestors.len() > room {
+            return Err(StateError::WindowFull {
+                offered: ancestors.len(),
+                room,
+            });
+        }
+        for header in ancestors.into_iter().rev() {
             self.ancestors.push_front(header);
         }
         Ok(())
@@ -302,7 +311,7 @@ impl Store {
     fn push_anchor(&mut self, child: VerifiedHeader) {
         let parent = std::mem::replace(&mut self.anchor, child);
         self.ancestors.push_back(parent);
-        while self.ancestors.len() >= HEADER_WINDOW {
+        while self.ancestors.len() > HEADER_WINDOW {
             self.ancestors.pop_front();
         }
     }
@@ -485,6 +494,7 @@ impl State {
         let (header, bal) = block.into_parts();
         store.apply_bal(&bal);
         store.push_anchor(header);
+        self.txs.revalidate(&self.store);
         Ok(())
     }
 
@@ -528,6 +538,7 @@ impl State {
         }
         self.store = Arc::new(store);
         self.cached.clear();
+        self.txs.revalidate(&self.store);
         Ok(())
     }
 
@@ -571,6 +582,14 @@ pub enum StateError {
     /// Ancestor headers do not link to the oldest held header.
     #[error("ancestor headers do not link to the oldest held header")]
     Unlinked,
+    /// Ancestors were offered past the window. None were inserted.
+    #[error("{offered} ancestors offered but the header window has room for {room}")]
+    WindowFull {
+        /// Number of ancestors offered.
+        offered: usize,
+        /// Free slots in the window.
+        room: usize,
+    },
 }
 
 #[cfg(test)]
@@ -929,5 +948,62 @@ mod tests {
             store.insert_ancestors(vec![world.verified(world.head())]),
             Err(StateError::Unlinked)
         );
+    }
+
+    #[test]
+    fn full_window_serves_blockhash_256_back() {
+        let mut world = world();
+        let mut state = anchored(&world);
+        let genesis = state.anchor().clone();
+        for _ in 0..=HEADER_WINDOW {
+            let block = mine_bal(&mut world, BlockWrites::default());
+            state.advance(block).unwrap();
+        }
+        let store = state.store();
+        let anchor = store.anchor().number();
+        assert_eq!(anchor, genesis.number() + HEADER_WINDOW as u64 + 1);
+        assert_eq!(store.headers().count(), HEADER_WINDOW + 1);
+        let oldest = world.headers_between(genesis.hash(), store.anchor().hash());
+        assert_eq!(
+            store.block_hash(anchor - HEADER_WINDOW as u64),
+            Ok(oldest[HEADER_WINDOW - 1].hash_slow())
+        );
+        assert_eq!(
+            store.block_hash(genesis.number()),
+            Err(Miss::BlockHash(genesis.number()))
+        );
+        let mut store = Store::clone(store);
+        assert_eq!(
+            store.insert_ancestors(vec![genesis]),
+            Err(StateError::WindowFull {
+                offered: 1,
+                room: 0
+            })
+        );
+    }
+
+    #[test]
+    fn ancestors_past_the_window_are_refused_whole() {
+        let mut world = world();
+        let first = world.head();
+        for _ in 0..=HEADER_WINDOW + 1 {
+            world.mine(BlockWrites::default());
+        }
+        let head = world.verified(world.head());
+        let ancestors =
+            verify::ancestors(&head, world.headers_between(first, head.hash())).unwrap();
+        assert_eq!(ancestors.len(), HEADER_WINDOW + 1);
+        let mut store = Store::new(head.clone());
+        assert_eq!(
+            store.insert_ancestors(ancestors.clone()),
+            Err(StateError::WindowFull {
+                offered: HEADER_WINDOW + 1,
+                room: HEADER_WINDOW
+            })
+        );
+        assert_eq!(store.headers().count(), 1);
+        store.insert_ancestors(ancestors[1..].to_vec()).unwrap();
+        let back = head.number() - HEADER_WINDOW as u64;
+        assert_eq!(store.block_hash(back), Ok(ancestors[1].hash()));
     }
 }

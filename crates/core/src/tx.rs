@@ -9,6 +9,7 @@ use alloy_consensus::{Transaction as _, TxReceipt as _};
 use alloy_eips::{BlockNumHash, eip1559::BaseFeeParams};
 use alloy_primitives::{Address, Bloom, Log, TxHash, TxKind};
 
+use crate::state::Store;
 use crate::verify::{VerifiedBody, VerifiedHeader};
 use crate::wire;
 
@@ -51,6 +52,8 @@ pub struct Located {
     pub sender: Address,
     /// Nonce recorded at submission.
     pub nonce: u64,
+    /// The signed transaction, kept so a reorg can return it to pending.
+    pub tx: wire::Transaction,
     /// The verified receipt, once fetched.
     pub receipt: Option<VerifiedReceipt>,
 }
@@ -131,12 +134,47 @@ impl TxBook {
                     index,
                     sender: pending.sender,
                     nonce: pending.nonce,
+                    tx: pending.tx,
                     receipt: None,
                 },
             );
             found.push((hash, index));
         }
         found
+    }
+
+    /// Returns located transactions to pending, dropping their receipts, when `store` no
+    /// longer has their block on its chain: the held header at that number differs, or the
+    /// block is above the anchor. Blocks older than the header window are kept, since the
+    /// store cannot judge them. Returns the revoked hashes.
+    pub fn revalidate(&mut self, store: &Store) -> Vec<TxHash> {
+        let anchor = store.anchor().number();
+        let revoked: Vec<TxHash> = self
+            .located
+            .iter()
+            .filter(|(_, located)| {
+                located.block.number > anchor
+                    || store
+                        .header(located.block.number)
+                        .is_some_and(|held| held.hash() != located.block.hash)
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &revoked {
+            if let Some(located) = self.located.remove(hash) {
+                self.pending.push(PendingTx {
+                    hash: *hash,
+                    sender: located.sender,
+                    nonce: located.nonce,
+                    tx: located.tx,
+                });
+            }
+        }
+        if !revoked.is_empty() {
+            self.located_order
+                .retain(|hash| self.located.contains_key(hash));
+        }
+        revoked
     }
 
     /// Drops pending transactions of `sender` whose nonce the anchor already consumed: another
@@ -403,9 +441,51 @@ mod tests {
                 index: 1,
                 sender: alice,
                 nonce: 1,
+                tx: pending.tx,
                 receipt: Some(receipt),
             }
         );
+    }
+
+    #[test]
+    fn reorged_location_returns_to_pending() {
+        let alice = address!("0x00000000000000000000000000000000000a11ce");
+        let bob = address!("0x0000000000000000000000000000000000000b0b");
+        let mut world = World::genesis([(alice, WorldAccount::eoa(eth(10)))]);
+        let pending = PendingTx::new(legacy_transfer(0, bob, eth(1)), alice);
+        let mut book = TxBook::default();
+        book.submit(pending.clone());
+
+        let first = world.mine(BlockWrites::default().tx(pending.tx.clone(), 21_000, 0));
+        let first_body = verify::body(world.verified(first), world.body(first)).unwrap();
+        assert_eq!(book.locate(&first_body), vec![(pending.hash, 0)]);
+        let receipts = verify::receipts(world.verified(first), world.receipts(first)).unwrap();
+        assert!(book.store_receipt(receipts.receipt(&first_body, 0).unwrap()));
+        assert_eq!(
+            book.revalidate(&Store::new(world.verified(first))),
+            Vec::<TxHash>::new()
+        );
+        assert_eq!(book.pending_nonce(alice, 0), 0);
+
+        let sibling = world.fork_head(BlockWrites::default());
+        assert_eq!(world.header(sibling).number, world.header(first).number);
+        let reorged = Store::new(world.verified(sibling));
+        assert_eq!(book.revalidate(&reorged), vec![pending.hash]);
+        assert_eq!(book.lookup(pending.hash), Lookup::Pending(&pending));
+        assert_eq!(book.pending_nonce(alice, 0), 1);
+
+        let next = world.mine(BlockWrites::default().tx(pending.tx.clone(), 21_000, 0));
+        let header = world.verified(next);
+        let body = verify::body(header.clone(), world.body(next)).unwrap();
+        assert_eq!(book.locate(&body), vec![(pending.hash, 0)]);
+        let Lookup::Located(located) = book.lookup(pending.hash) else {
+            panic!("not located")
+        };
+        assert_eq!(
+            (located.block, located.receipt.as_ref()),
+            (header.num_hash(), None)
+        );
+        assert_eq!(book.revalidate(&Store::new(header)), Vec::<TxHash>::new());
     }
 
     #[test]
