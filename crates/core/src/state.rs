@@ -612,8 +612,8 @@ mod tests {
         U256::from(n)
     }
 
-    fn world() -> World {
-        World::genesis([
+    fn accounts() -> Vec<(Address, WorldAccount)> {
+        vec![
             (ALICE, WorldAccount::eoa(eth(5)).with_nonce(1)),
             (
                 TOKEN,
@@ -626,7 +626,11 @@ mod tests {
                 WorldAccount::eoa(U256::from(1)).with_slot(slot(1), slot(5)),
             ),
             (STRANGER, WorldAccount::eoa(eth(9))),
-        ])
+        ]
+    }
+
+    fn world() -> World {
+        World::genesis(accounts())
     }
 
     fn tracked() -> Vec<Key> {
@@ -681,7 +685,17 @@ mod tests {
 
     #[test]
     fn bal_applies_post_values_to_held_keys() {
-        let mut world = world();
+        assert_bal_applies(world());
+    }
+
+    #[test]
+    fn bal_applies_post_values_under_amsterdam() {
+        let world = World::amsterdam(accounts());
+        assert!(world.header(world.head()).slot_number.is_some());
+        assert_bal_applies(world);
+    }
+
+    fn assert_bal_applies(mut world: World) {
         let mut state = anchored(&world);
         let code = Bytes::from_static(&[0x60, 0x01, 0x00]);
         let block = mine_bal(
@@ -771,7 +785,15 @@ mod tests {
 
     #[test]
     fn plan_extends_short_bal_gaps_and_applies_them() {
-        let mut world = world();
+        assert_extends(world());
+    }
+
+    #[test]
+    fn plan_extends_under_amsterdam() {
+        assert_extends(World::amsterdam(accounts()));
+    }
+
+    fn assert_extends(mut world: World) {
         let mut state = anchored(&world);
         let anchor = state.anchor().clone();
         assert_eq!(state.plan(&anchor), Plan::Current);

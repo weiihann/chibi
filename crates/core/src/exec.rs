@@ -324,6 +324,12 @@ fn estimate_with(
             };
         }
     };
+    if is_basic_transfer {
+        // No bytecode runs and nothing is refunded, so a successful run's gas is exactly what
+        // the transfer needs. Reth bisects here; under EIP-8037 a transfer creating an account
+        // costs far more than 21000 and bisection would overshoot by up to 1.5%.
+        return Ok(res.result.tx_gas_used());
+    }
 
     highest = tx.gas_limit;
     let mut gas_used = res.result.tx_gas_used();
@@ -557,28 +563,43 @@ mod tests {
     use super::*;
     use crate::testing::{
         EIP1967_IMPLEMENTATION_SLOT, World, WorldAccount, balance_of_calldata,
-        delegating_proxy_code, eth, mapping_reader_code, mapping_slot,
+        delegating_proxy_code, eth, mapping_reader_code, mapping_slot, mapping_token_code,
+        transfer_calldata,
     };
     use alloy_primitives::{address, keccak256};
 
     const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
     const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
+    const CAROL: Address = address!("0x00000000000000000000000000000000000ca201");
     const PROXY: Address = address!("0x0000000000000000000000000000000000c0ffee");
     const IMPL: Address = address!("0x00000000000000000000000000000000000001f1");
+    const TOKEN: Address = address!("0x0000000000000000000000000000000000070c3e");
 
-    fn world() -> World {
+    fn accounts() -> Vec<(Address, WorldAccount)> {
         let proxy = WorldAccount::contract(delegating_proxy_code())
             .with_slot(
                 EIP1967_IMPLEMENTATION_SLOT.into(),
                 U256::from_be_slice(IMPL.as_slice()),
             )
             .with_slot(mapping_slot(ALICE), U256::from(1234));
-        World::genesis([
+        let token = WorldAccount::contract(mapping_token_code())
+            .with_slot(mapping_slot(ALICE), U256::from(1000))
+            .with_slot(mapping_slot(BOB), U256::from(1));
+        vec![
             (ALICE, WorldAccount::eoa(eth(5))),
             (BOB, WorldAccount::eoa(eth(1))),
             (PROXY, proxy),
             (IMPL, WorldAccount::contract(mapping_reader_code())),
-        ])
+            (TOKEN, token),
+        ]
+    }
+
+    fn world() -> World {
+        World::genesis(accounts())
+    }
+
+    fn amsterdam() -> World {
+        World::amsterdam(accounts())
     }
 
     fn balance_of() -> CallRequest {
@@ -610,14 +631,12 @@ mod tests {
         panic!("discovery did not converge");
     }
 
-    #[test]
-    fn discovery_converges_to_full_state_result() {
-        let world = world();
+    fn assert_discovery_converges(world: &World) {
         let env = ChainEnv::new(world.spec());
         let head = world.verified(world.head());
 
         let mut discovered = Store::new(head.clone());
-        let (found, rounds) = discover(&world, &mut discovered, |store| {
+        let (found, rounds) = discover(world, &mut discovered, |store| {
             execute(store, &env, &balance_of())
         });
         assert!(
@@ -629,7 +648,11 @@ mod tests {
         for key in world.keys() {
             full.insert(&world.prove(&head, key)).unwrap();
         }
-        for code in [delegating_proxy_code(), mapping_reader_code()] {
+        for code in [
+            delegating_proxy_code(),
+            mapping_reader_code(),
+            mapping_token_code(),
+        ] {
             full.insert(&world.prove_code(keccak256(&code))).unwrap();
         }
         let beneficiary = head.header().beneficiary;
@@ -654,6 +677,123 @@ mod tests {
         ] {
             assert!(found.read.contains(&key), "{key:?} not in {:?}", found.read);
         }
+    }
+
+    #[test]
+    fn discovery_converges_to_full_state_result() {
+        assert_discovery_converges(&world());
+    }
+
+    #[test]
+    fn discovery_converges_under_amsterdam() {
+        let world = amsterdam();
+        let head = world.verified(world.head());
+        assert_eq!(
+            ChainEnv::new(world.spec()).call_env(&head).cfg_env.spec,
+            revm::primitives::hardfork::SpecId::AMSTERDAM
+        );
+        assert_discovery_converges(&world);
+    }
+
+    /// Gas figures of one request after discovery.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Gas {
+        estimate: u64,
+        used: u64,
+        minimum: u64,
+    }
+
+    /// Estimates `req`, executes it without a limit, and finds the exact smallest succeeding
+    /// limit by bisecting real executions. Checks the estimate reproduces the unlimited outcome.
+    fn gas_of(world: &World, req: &CallRequest) -> Gas {
+        let env = ChainEnv::new(world.spec());
+        let mut store = Store::new(world.verified(world.head()));
+        let (estimate, _) = discover(world, &mut store, |store| estimate_gas(store, &env, req));
+        let estimate = estimate.unwrap();
+        let run = |gas| {
+            let req = CallRequest { gas, ..req.clone() };
+            let (executed, _) = discover(world, &mut store.clone(), |store| {
+                execute(store, &env, &req)
+            });
+            executed.result.unwrap()
+        };
+        let unlimited = run(None);
+        assert!(unlimited.is_success(), "{unlimited:?}");
+        let at_estimate = run(Some(estimate));
+        assert_eq!(
+            (at_estimate.is_success(), at_estimate.output()),
+            (true, unlimited.output())
+        );
+        let used = unlimited.tx_gas_used();
+        // A limit below the gas used cannot cover it, refunds only lower the used figure.
+        let (mut failing, mut minimum) = (used - 1, estimate);
+        while failing + 1 < minimum {
+            let mid = midpoint(minimum, failing);
+            if run(Some(mid)).is_success() {
+                minimum = mid;
+            } else {
+                failing = mid;
+            }
+        }
+        Gas {
+            estimate,
+            used,
+            minimum,
+        }
+    }
+
+    fn eth_transfer(to: Address) -> CallRequest {
+        CallRequest {
+            from: Some(ALICE),
+            to: TxKind::Call(to),
+            value: eth(1),
+            ..CallRequest::default()
+        }
+    }
+
+    fn token_transfer(to: Address) -> CallRequest {
+        CallRequest {
+            from: Some(ALICE),
+            to: TxKind::Call(TOKEN),
+            input: transfer_calldata(to, U256::from(10)),
+            ..CallRequest::default()
+        }
+    }
+
+    #[test]
+    fn amsterdam_estimates_match_executed_gas() {
+        let world = amsterdam();
+        for (name, req) in [
+            ("eth to existing", eth_transfer(BOB)),
+            ("eth creating an account", eth_transfer(CAROL)),
+        ] {
+            let gas = gas_of(&world, &req);
+            assert_eq!(gas.estimate, gas.used, "{name}: {gas:?}");
+            assert_eq!(gas.minimum, gas.used, "{name}: {gas:?}");
+        }
+        assert_eq!(gas_of(&world, &eth_transfer(BOB)).used, MIN_TRANSACTION_GAS);
+        assert!(gas_of(&world, &eth_transfer(CAROL)).used > MIN_TRANSACTION_GAS);
+
+        for (name, req) in [
+            ("token to holder", token_transfer(BOB)),
+            ("token to new holder", token_transfer(CAROL)),
+        ] {
+            let gas = gas_of(&world, &req);
+            let slack = (gas.estimate - gas.minimum) as f64 / gas.estimate as f64;
+            assert!(
+                gas.minimum <= gas.estimate && slack < ESTIMATE_GAS_ERROR_RATIO,
+                "{name}: {gas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn amsterdam_charges_state_creation_that_osaka_does_not() {
+        let creating = eth_transfer(CAROL);
+        assert_eq!(gas_of(&world(), &creating).used, MIN_TRANSACTION_GAS);
+        assert!(gas_of(&amsterdam(), &creating).used > MIN_TRANSACTION_GAS);
+        let new_holder = token_transfer(CAROL);
+        assert!(gas_of(&amsterdam(), &new_holder).used > gas_of(&world(), &new_holder).used);
     }
 
     #[test]

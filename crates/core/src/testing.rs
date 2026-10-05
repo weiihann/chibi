@@ -22,7 +22,7 @@ use alloy_primitives::{
     Address, B256, Bloom, Bytes, KECCAK256_EMPTY, Log, Signature, TxKind, U256, keccak256,
 };
 use alloy_trie::{EMPTY_ROOT_HASH, HashBuilder, Nibbles, TrieAccount, proof::ProofRetainer};
-use reth_chainspec::{ChainSpec, MAINNET};
+use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks, MAINNET, SEPOLIA};
 
 use crate::state::{Key, Miss};
 use crate::verify::{
@@ -30,11 +30,14 @@ use crate::verify::{
 };
 use crate::wire::{self, AccountRangeRequest, AccountReply, StorageRangeRequest, StorageReply};
 
-/// Number of the genesis block. Post-merge on mainnet rules.
+/// Number of the genesis block. Post-merge on mainnet and Sepolia rules.
 pub const GENESIS_NUMBER: u64 = 24_000_000;
 
-/// Timestamp of the genesis block. Osaka rules on mainnet.
+/// Timestamp of the genesis block of [`World::genesis`]. Osaka rules on mainnet.
 pub const GENESIS_TIMESTAMP: u64 = 1_790_000_000;
+
+/// Seconds between mined blocks.
+pub const BLOCK_TIME: u64 = 12;
 
 /// Base fee of every mined block.
 pub const BASE_FEE: u64 = 1_000_000_000;
@@ -213,6 +216,8 @@ struct Block {
 /// An in-process chain with full state.
 #[derive(Clone, Debug)]
 pub struct World {
+    spec: Arc<ChainSpec>,
+    genesis_timestamp: u64,
     accounts: BTreeMap<Address, WorldAccount>,
     states: HashMap<B256, BTreeMap<Address, WorldAccount>>,
     codes: HashMap<B256, Bytes>,
@@ -221,9 +226,34 @@ pub struct World {
 }
 
 impl World {
-    /// A chain whose genesis holds `accounts`. Genesis carries a BAL hash.
+    /// A mainnet chain under Osaka rules whose genesis holds `accounts`. Genesis carries a BAL
+    /// hash.
     pub fn genesis(accounts: impl IntoIterator<Item = (Address, WorldAccount)>) -> Self {
+        Self::genesis_on(Arc::clone(&MAINNET), GENESIS_TIMESTAMP, accounts)
+    }
+
+    /// A Sepolia chain under Amsterdam rules (EIP-7928, EIP-8037, EIP-2780), its genesis one
+    /// block past the fork.
+    pub fn amsterdam(accounts: impl IntoIterator<Item = (Address, WorldAccount)>) -> Self {
+        let spec = Arc::clone(&SEPOLIA);
+        let activation = spec.ethereum_fork_activation(EthereumHardfork::Amsterdam);
+        let Some(fork) = activation.as_timestamp() else {
+            panic!("Sepolia schedules Amsterdam by {activation:?}, not by timestamp")
+        };
+        Self::genesis_on(spec, fork + BLOCK_TIME, accounts)
+    }
+
+    /// A chain on `spec` whose genesis, at `timestamp`, holds `accounts`. Every block carries a
+    /// BAL hash unless mined with [`World::mine_without_bal`]; blocks under Amsterdam also
+    /// carry a slot number.
+    pub fn genesis_on(
+        spec: Arc<ChainSpec>,
+        timestamp: u64,
+        accounts: impl IntoIterator<Item = (Address, WorldAccount)>,
+    ) -> Self {
         let mut world = Self {
+            spec,
+            genesis_timestamp: timestamp,
             accounts: accounts.into_iter().collect(),
             states: HashMap::new(),
             codes: HashMap::new(),
@@ -236,7 +266,7 @@ impl World {
 
     /// The chain spec the world's headers follow.
     pub fn spec(&self) -> Arc<ChainSpec> {
-        Arc::clone(&MAINNET)
+        Arc::clone(&self.spec)
     }
 
     /// Hash of the newest block.
@@ -537,6 +567,12 @@ impl World {
             alloy_rlp::encode_list(bal, &mut raw);
             Bytes::from(raw)
         });
+        let timestamp = self.genesis_timestamp + BLOCK_TIME * (number - GENESIS_NUMBER);
+        let block_access_list_hash = bal.map(compute_block_access_list_hash);
+        // Header RLP only carries the slot number after a BAL hash.
+        let slot_number = (block_access_list_hash.is_some()
+            && self.spec.is_amsterdam_active_at_timestamp(timestamp))
+        .then_some(number);
         let header = Header {
             parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -547,14 +583,15 @@ impl World {
             number,
             gas_limit: GAS_LIMIT,
             gas_used: cumulative,
-            timestamp: GENESIS_TIMESTAMP + 12 * (number - GENESIS_NUMBER),
+            timestamp,
             base_fee_per_gas: Some(BASE_FEE),
             withdrawals_root: Some(calculate_withdrawals_root(&[])),
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::ZERO),
             requests_hash: Some(EMPTY_REQUESTS_HASH),
-            block_access_list_hash: bal.map(compute_block_access_list_hash),
+            block_access_list_hash,
+            slot_number,
             ..Header::default()
         };
         let hash = header.hash_slow();
@@ -666,6 +703,35 @@ pub fn mapping_slot(holder: Address) -> U256 {
 pub fn balance_of_calldata(holder: Address) -> Bytes {
     let mut data = vec![0x70, 0xa0, 0x82, 0x31];
     data.extend_from_slice(B256::left_padding_from(holder.as_slice()).as_slice());
+    Bytes::from(data)
+}
+
+/// A minimal token: `transfer(to, amount)` for any selector, moving `amount` between the
+/// caller's and `to`'s entries of a `mapping(address => uint256)` at slot 0 and returning
+/// `true`. Reverts when the caller's balance is short.
+pub fn mapping_token_code() -> Bytes {
+    Bytes::from_static(&[
+        0x33, 0x60, 0x00, 0x52, // mstore(0, caller)
+        0x60, 0x00, 0x60, 0x20, 0x52, // mstore(32, 0)
+        0x60, 0x40, 0x60, 0x00, 0x20, // from = keccak256(0, 64)
+        0x80, 0x54, // balance = sload(from)
+        0x60, 0x24, 0x35, // amount = calldataload(36)
+        0x80, 0x82, 0x10, 0x61, 0x00, 0x3a, 0x57, // if balance < amount goto revert
+        0x80, 0x91, 0x03, 0x82, 0x55, // sstore(from, balance - amount)
+        0x60, 0x04, 0x35, 0x60, 0x00, 0x52, // mstore(0, to)
+        0x60, 0x40, 0x60, 0x00, 0x20, // slot = keccak256(0, 64)
+        0x80, 0x54, 0x82, 0x01, 0x90, 0x55, // sstore(slot, sload(slot) + amount)
+        0x60, 0x01, 0x60, 0x00, 0x52, // mstore(0, 1)
+        0x60, 0x20, 0x60, 0x00, 0xf3, // return(0, 32)
+        0x5b, 0x60, 0x00, 0x60, 0x00, 0xfd, // revert: revert(0, 0)
+    ])
+}
+
+/// ABI calldata for `transfer(to, amount)`.
+pub fn transfer_calldata(to: Address, amount: U256) -> Bytes {
+    let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
+    data.extend_from_slice(B256::left_padding_from(to.as_slice()).as_slice());
+    data.extend_from_slice(&amount.to_be_bytes::<32>());
     Bytes::from(data)
 }
 
