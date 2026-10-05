@@ -1,16 +1,16 @@
 //! The per-network data directory: its lock, the devp2p identity, and the state file.
 //!
-//! The state file holds tracked keys, a display snapshot, the outbox of pending raw
-//! transactions, and snap/2 peers worth dialing first. It is replaced atomically (temp file,
-//! fsync, rename). Its values are display-only: nothing read from it enters a `Store`.
+//! The state file holds a display snapshot, the outbox of pending raw transactions, and
+//! snap/2 peers worth dialing first. Tracked keys are not saved: they follow from the
+//! watchlist at each start. The file is replaced atomically (temp file, fsync, rename). Its
+//! values are display-only: nothing read from it enters a `Store`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, Bytes, U256, hex};
-use chibi_core::state::Key;
+use alloy_primitives::{Bytes, hex};
 use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
 use serde::{Deserialize, Serialize};
@@ -27,32 +27,6 @@ const KEY_FILE: &str = "devp2p.key";
 /// Most snap/2 peers remembered across restarts.
 const REMEMBERED_PEERS: usize = 16;
 
-/// A key as the state file stores it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-enum SavedKey {
-    Account { address: Address },
-    Slot { address: Address, slot: U256 },
-}
-
-impl From<Key> for SavedKey {
-    fn from(key: Key) -> Self {
-        match key {
-            Key::Account(address) => Self::Account { address },
-            Key::Slot(address, slot) => Self::Slot { address, slot },
-        }
-    }
-}
-
-impl From<SavedKey> for Key {
-    fn from(key: SavedKey) -> Self {
-        match key {
-            SavedKey::Account { address } => Self::Account(address),
-            SavedKey::Slot { address, slot } => Self::Slot(address, slot),
-        }
-    }
-}
-
 /// A submitted transaction not yet located, and the anchor chibi held when it was submitted.
 /// Inclusion can only be in a later block, so a search for it need not reach further back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,23 +40,12 @@ pub(crate) struct OutboxTx {
 /// The state file's contents.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StateFile {
-    tracked: Vec<SavedKey>,
     snapshot: Option<Snapshot>,
     outbox: Vec<OutboxTx>,
     peers: Vec<String>,
 }
 
 impl StateFile {
-    /// Keys to prove at the first anchor.
-    pub(crate) fn tracked(&self) -> impl Iterator<Item = Key> + '_ {
-        self.tracked.iter().copied().map(Key::from)
-    }
-
-    pub(crate) fn set_tracked(&mut self, keys: impl IntoIterator<Item = Key>) {
-        self.tracked = keys.into_iter().map(SavedKey::from).collect();
-        self.tracked.sort_unstable_by_key(|key| Key::from(*key));
-    }
-
     pub(crate) const fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
@@ -291,7 +254,7 @@ fn io_error(path: &Path, err: &std::io::Error) -> NodeError {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{B256, address};
+    use alloy_primitives::B256;
 
     use super::*;
 
@@ -336,13 +299,10 @@ mod tests {
     #[test]
     fn saved_state_round_trips_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
-        let alice = address!("0x00000000000000000000000000000000000a11ce");
-        let keys = [Key::Slot(alice, U256::from(7)), Key::Account(alice)];
         let outbox = vec![queued(1, 9), queued(2, 11)];
         {
             let disk = Disk::open(dir.path()).unwrap();
             disk.save(|file| {
-                file.set_tracked(keys);
                 file.set_outbox(outbox.clone());
                 file.remember_peers(&[record(1, 30303)]);
             })
@@ -351,10 +311,6 @@ mod tests {
         assert!(!dir.path().join(STATE_TEMP).exists());
         let disk = Disk::open(dir.path()).unwrap();
         disk.read(|file| {
-            assert_eq!(
-                file.tracked().collect::<Vec<_>>(),
-                vec![Key::Account(alice), Key::Slot(alice, U256::from(7))]
-            );
             assert_eq!(file.outbox(), outbox.as_slice());
             assert_eq!(file.peers(), vec![record(1, 30303)]);
         });

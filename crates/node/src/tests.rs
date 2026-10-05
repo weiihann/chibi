@@ -4,15 +4,15 @@ use std::path::Path;
 use alloy_consensus::{SignableTransaction as _, TxEip4844, TxLegacy};
 use alloy_eips::eip1559::BaseFeeParams;
 use alloy_eips::eip2718::Encodable2718 as _;
-use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, keccak256};
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use chibi_core::exec::{CallRequest, ExecutionResult};
 use chibi_core::state::{HEADER_WINDOW, Key};
 use chibi_core::testing::{
-    BASE_FEE, BlockWrites, EIP1967_IMPLEMENTATION_SLOT, GAS_PRICE, WorldAccount,
+    BASE_FEE, BlockWrites, EIP1967_IMPLEMENTATION_SLOT, GAS_PRICE, PAUSED_SLOT, WorldAccount,
     balance_of_calldata, delegating_proxy_code, eth, legacy_transfer, mapping_reader_code,
-    mapping_slot,
+    mapping_slot, pausable_token_code, transfer_calldata,
 };
 use chibi_core::verify::VerifyError;
 use chibi_core::wire::Transaction;
@@ -26,13 +26,27 @@ const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
 const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
 const PROXY: Address = address!("0x00000000000000000000000000000000000070c3");
 const IMPL: Address = address!("0x0000000000000000000000000000000000001111");
+const CAROL: Address = address!("0x00000000000000000000000000000000000ca201");
+const PAUSABLE: Address = address!("0x0000000000000000000000000000000000009a05");
+const PAUSABLE_IMPL: Address = address!("0x0000000000000000000000000000000000002222");
 
-const TOKENS: &[Token] = &[Token {
+const TKN: Token = Token {
     symbol: "TKN",
     name: "Test token",
     address: PROXY,
     decimals: 18,
-}];
+};
+
+const PSE: Token = Token {
+    symbol: "PSE",
+    name: "Pausable test token",
+    address: PAUSABLE,
+    decimals: 6,
+};
+
+const TOKENS: &[Token] = &[TKN];
+
+const BOTH: &[Token] = &[TKN, PSE];
 
 async fn start(
     fixture: &Fixture,
@@ -40,8 +54,19 @@ async fn start(
     watch: &[Address],
     tokens: &'static [Token],
 ) -> (Node<FixturePeers>, Follower<FixturePeers>) {
+    start_watching(fixture, dir, watch, tokens, tokens).await
+}
+
+/// Starts on a chain whose registry is `registry`, following only `tokens` of it.
+async fn start_watching(
+    fixture: &Fixture,
+    dir: &Path,
+    watch: &[Address],
+    registry: &'static [Token],
+    tokens: &[Token],
+) -> (Node<FixturePeers>, Follower<FixturePeers>) {
     Node::with_parts(
-        Fixture::spec(tokens),
+        Fixture::spec(registry),
         fixture.peers(),
         fixture.heads(),
         Disk::open(dir).unwrap(),
@@ -59,7 +84,11 @@ fn impl_slot() -> U256 {
 }
 
 fn token_world(balance: u64) -> Fixture {
-    Fixture::genesis([
+    Fixture::genesis(token_accounts(balance))
+}
+
+fn token_accounts(balance: u64) -> Vec<(Address, WorldAccount)> {
+    vec![
         (ALICE, WorldAccount::eoa(eth(2))),
         (
             PROXY,
@@ -68,7 +97,39 @@ fn token_world(balance: u64) -> Fixture {
                 .with_slot(mapping_slot(ALICE), U256::from(balance)),
         ),
         (IMPL, WorldAccount::contract(mapping_reader_code())),
+    ]
+}
+
+/// [`token_world`] plus a proxied token whose transfer reads a pause flag, holding
+/// `pausable` for ALICE.
+fn two_token_world(balance: u64, pausable: u64) -> Fixture {
+    let mut accounts = token_accounts(balance);
+    accounts.extend([
+        (
+            PAUSABLE,
+            WorldAccount::contract(delegating_proxy_code())
+                .with_slot(impl_slot(), U256::from_be_slice(PAUSABLE_IMPL.as_slice()))
+                .with_slot(mapping_slot(ALICE), U256::from(pausable)),
+        ),
+        (PAUSABLE_IMPL, WorldAccount::contract(pausable_token_code())),
+    ]);
+    Fixture::genesis(accounts)
+}
+
+fn pausable_keys() -> BTreeSet<Key> {
+    BTreeSet::from([
+        Key::Account(PAUSABLE),
+        Key::Account(PAUSABLE_IMPL),
+        Key::Slot(PAUSABLE, impl_slot()),
+        Key::Slot(PAUSABLE, PAUSED_SLOT),
+        Key::Slot(PAUSABLE, mapping_slot(ALICE)),
     ])
+}
+
+fn holds_key_of(tracked: &BTreeSet<Key>, address: Address) -> bool {
+    tracked.iter().any(|key| match key {
+        Key::Account(at) | Key::Slot(at, _) => *at == address,
+    })
 }
 
 async fn balance(node: &Node<FixturePeers>, address: Address) -> Option<U256> {
@@ -233,6 +294,96 @@ async fn token_seeding_tracks_proxy_keys_and_follows_bal_writes() {
         node.status().snapshot.holdings[0].tokens,
         vec![("TKN".to_owned(), Some(U256::from(300)))]
     );
+}
+
+#[tokio::test]
+async fn seeding_tracks_the_pause_flag_so_a_transfer_fetches_only_the_recipient() {
+    let fixture = two_token_world(250, 40);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[PSE]).await;
+
+    let tracked = node.tracked();
+    assert!(tracked.contains(&Key::Slot(PAUSABLE, PAUSED_SLOT)));
+    assert!(tracked.contains(&Key::Slot(PAUSABLE, mapping_slot(ALICE))));
+    assert_eq!(
+        node.status().snapshot.holdings[0].tokens,
+        vec![("PSE".to_owned(), Some(U256::from(40)))]
+    );
+
+    let before = fixture.log();
+    let transfer = CallRequest {
+        from: Some(ALICE),
+        to: TxKind::Call(PAUSABLE),
+        input: transfer_calldata(CAROL, U256::from(1)),
+        ..CallRequest::default()
+    };
+    match node.call(transfer, BlockSel::Latest).await.unwrap() {
+        ExecutionResult::Success { output, .. } => {
+            assert_eq!(U256::from_be_slice(output.data()), U256::from(1));
+        }
+        other @ (ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. }) => {
+            panic!("transfer failed: {other:?}")
+        }
+    }
+    let after = fixture.log();
+    assert_eq!(
+        after.slots[before.slots.len()..],
+        [(
+            keccak256(PAUSABLE),
+            keccak256(B256::from(mapping_slot(CAROL)))
+        )],
+        "only the recipient's balance slot is fetched"
+    );
+    assert_eq!(
+        after.proofs - before.proofs,
+        2,
+        "one slot proof: the account range it is proven under and its storage range"
+    );
+    assert!(
+        !node
+            .tracked()
+            .contains(&Key::Slot(PAUSABLE, mapping_slot(CAROL)))
+    );
+}
+
+#[tokio::test]
+async fn a_registry_token_that_is_not_watched_is_never_seeded_or_reported() {
+    let fixture = two_token_world(250, 40);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[TKN]).await;
+
+    assert!(!holds_key_of(&node.tracked(), PAUSABLE));
+    assert!(!holds_key_of(&node.tracked(), PAUSABLE_IMPL));
+    assert_eq!(
+        node.status().snapshot.holdings[0].tokens,
+        vec![("TKN".to_owned(), Some(U256::from(250)))]
+    );
+}
+
+#[tokio::test]
+async fn a_restart_without_a_token_stops_tracking_it() {
+    let fixture = two_token_world(250, 40);
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (node, _follower) = start(&fixture, dir.path(), &[ALICE], BOTH).await;
+        assert!(node.tracked().is_superset(&pausable_keys()));
+    }
+
+    fixture.mine_without_bal(BlockWrites::default().slot(
+        PROXY,
+        mapping_slot(ALICE),
+        U256::from(999),
+    ));
+    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[TKN]).await;
+    assert!(!holds_key_of(&node.tracked(), PAUSABLE));
+    assert!(!holds_key_of(&node.tracked(), PAUSABLE_IMPL));
+    assert_eq!(
+        node.status().snapshot.holdings[0].tokens,
+        vec![("TKN".to_owned(), Some(U256::from(999)))]
+    );
+    let proofs = fixture.log().proofs;
+    assert_eq!(token_balance(&node, ALICE).await, U256::from(999));
+    assert_eq!(fixture.log().proofs, proofs);
 }
 
 #[tokio::test]
@@ -530,7 +681,7 @@ async fn submit_rejects_wrong_chain_ids_blob_transactions_and_garbage() {
 }
 
 #[tokio::test]
-async fn a_restart_shows_the_saved_snapshot_but_reproves_every_saved_key() {
+async fn a_restart_shows_the_saved_snapshot_and_rederives_the_tracked_keys() {
     let fixture = token_world(250);
     let dir = tempfile::tempdir().unwrap();
     let tracked = {
@@ -551,17 +702,18 @@ async fn a_restart_shows_the_saved_snapshot_but_reproves_every_saved_key() {
         mapping_slot(ALICE),
         U256::from(999),
     ));
-    let (node, _follower) = start(&fixture, dir.path(), &[], TOKENS).await;
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE], TOKENS).await;
     assert_eq!(node.tracked(), tracked);
     let proofs = fixture.log().proofs;
     assert_eq!(balance(&node, ALICE).await, Some(eth(7)));
-    assert_eq!(
-        node.storage(PROXY, mapping_slot(ALICE), BlockSel::Latest)
-            .await
-            .unwrap(),
-        U256::from(999)
-    );
+    assert_eq!(token_balance(&node, ALICE).await, U256::from(999));
     assert_eq!(fixture.log().proofs, proofs);
+    let saved = read_snapshot(dir.path()).unwrap().unwrap();
+    assert_eq!(saved.holdings[0].balance, Some(eth(7)));
+    assert_eq!(
+        saved.holdings[0].tokens,
+        vec![("TKN".to_owned(), Some(U256::from(999)))]
+    );
 }
 
 #[tokio::test]
