@@ -7,8 +7,18 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, BlockNumber, address};
 use reth_chainspec::{ChainSpec, MAINNET, SEPOLIA, mainnet, sepolia};
-use reth_network_peers::{NodeRecord, mainnet_nodes, sepolia_nodes};
+use reth_network_peers::{NodeRecord, mainnet_nodes, parse_nodes, sepolia_nodes};
 use serde::{Deserialize, Serialize};
+
+/// Sepolia peers seen serving snap/2 by a 12-minute census on 2026-10-05 (all Nethermind,
+/// outbound sessions). Few Sepolia peers serve snap/2, so discovery alone can take minutes.
+const SEPOLIA_SNAP_PEERS: [&str; 5] = [
+    "enode://362709518ae0c4b870216dfd29d1034b4992212f0688c8ceabb1e6aa7619e3db116b9d1f9160c3c187d1b6763bd519dd3c79314cf489bc6aa12af53597d813aa@34.73.25.56:30303",
+    "enode://4a4f8312ca02a1869d2634272ff557a12a183fa909c0824892cae43db95f84a8be8ffb7ba8cf2825e5bad37e3599b40cb955343a680b90c9607f241419c4ca68@104.196.102.71:30303",
+    "enode://e78580877dcd5f35b2ff2c511c22eaf819c40c034b3f729b4324ece852e6ed2404e0c1f75a304df84a5fd03a0d8dbe339de139294416b44fccb897e9a7e73ffc@34.26.190.129:30303",
+    "enode://f94e4fb5e306d643b0be79cc5fb46d82b975277810a119d82df29767a04b4e9547d52ab36cd1d8b8969a63e41861cc1c25459c9ce3890559d6f1100d1796757a@35.231.59.139:30303",
+    "enode://36953ec1da442f36cea66e899095537b28a507b591c46dfb55e45ded47cbcc707ae4541347ff47de874d8eab449119abd4859277a934690ee112db4d8425d5fe@184.18.17.100:20159",
+];
 
 /// Seconds per slot on every supported network.
 const SLOT_SECONDS: u64 = 12;
@@ -45,7 +55,7 @@ impl Network {
                 helios: helios_ethereum::config::networks::Network::Sepolia,
                 default_beacon: "https://ethereum-sepolia-beacon-api.publicnode.com",
                 boot_nodes: sepolia_nodes(),
-                snap_peers: Vec::new(),
+                snap_peers: parse_nodes(SEPOLIA_SNAP_PEERS),
                 tokens: SEPOLIA_TOKENS,
                 clock: BlockClock {
                     number: sepolia::SEPOLIA_OSAKA_BLOCK,

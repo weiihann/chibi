@@ -273,6 +273,9 @@ impl Node<Devp2p> {
             heads_tx,
         )?;
         beacon.wait_synced().await?;
+        if let Some(checkpoint) = checkpoint {
+            remember_checkpoint(&config.data_dir, checkpoint).await?;
+        }
         let trusted = wait_latest(&mut heads).await?;
         info!(target: "chibi::node", network = %spec.network, hash = %trusted.hash(), "light client synced");
 
@@ -355,6 +358,25 @@ async fn has_saved_checkpoint(data_dir: &Path) -> bool {
     tokio::fs::metadata(data_dir.join(HELIOS_CHECKPOINT))
         .await
         .is_ok_and(|meta| meta.len() == CHECKPOINT_BYTES)
+}
+
+/// Saves a checkpoint the light client just synced from, in helios's own file format, unless
+/// helios already saved one. helios writes only checkpoints newer than the one it started
+/// from, so without this a run shorter than a finality update would leave no saved
+/// checkpoint and every start would fall back to the community services.
+async fn remember_checkpoint(data_dir: &Path, checkpoint: B256) -> Result<(), NodeError> {
+    if has_saved_checkpoint(data_dir).await {
+        return Ok(());
+    }
+    let path = data_dir.join(HELIOS_CHECKPOINT);
+    let temp = path.with_extension("tmp");
+    let saved = async {
+        tokio::fs::write(&temp, checkpoint.as_slice()).await?;
+        tokio::fs::rename(&temp, &path).await
+    };
+    saved
+        .await
+        .map_err(|err| NodeError::Disk(format!("saving the light-client checkpoint: {err}")))
 }
 
 async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeError> {
@@ -1238,6 +1260,28 @@ mod tests {
                 .await
                 .unwrap(),
             Some(user)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_synced_first_run_checkpoint_is_saved_once_for_later_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = B256::repeat_byte(1);
+        remember_checkpoint(dir.path(), first).await.unwrap();
+        assert_eq!(
+            checkpoint(&Network::Sepolia.spec(), None, dir.path())
+                .await
+                .unwrap(),
+            None,
+            "a saved checkpoint means helios loads it and no override is passed"
+        );
+        remember_checkpoint(dir.path(), B256::repeat_byte(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(HELIOS_CHECKPOINT)).unwrap(),
+            first.to_vec(),
+            "a checkpoint helios saved is never replaced"
         );
     }
 }
