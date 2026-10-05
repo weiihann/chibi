@@ -129,13 +129,15 @@ pub struct Disk {
 }
 
 impl Disk {
-    /// Creates `dir` if needed, takes its exclusive lock, and loads the state file.
+    /// Creates `dir` if needed, takes its exclusive lock, records this process id in the lock
+    /// file, and loads the state file.
     pub fn open(dir: &Path) -> Result<Self, NodeError> {
         fs::create_dir_all(dir).map_err(|err| io_error(dir, &err))?;
         let lock_path = dir.join(LOCK_FILE);
-        let lock = OpenOptions::new()
+        let mut lock = OpenOptions::new()
             .create(true)
             .truncate(false)
+            .read(true)
             .write(true)
             .open(&lock_path)
             .map_err(|err| io_error(&lock_path, &err))?;
@@ -149,12 +151,38 @@ impl Disk {
             }
             Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
         }
+        lock.set_len(0)
+            .and_then(|()| write!(lock, "{}", std::process::id()))
+            .and_then(|()| lock.sync_all())
+            .map_err(|err| io_error(&lock_path, &err))?;
         let file = read_state(dir)?.unwrap_or_default();
         Ok(Self {
             dir: dir.to_path_buf(),
             _lock: lock,
             file: Mutex::new(file),
         })
+    }
+
+    /// The process id of the chibi that holds `dir`'s lock, or `None` when no chibi runs there.
+    /// Does not take the lock away from anyone.
+    pub fn running(dir: &Path) -> Result<Option<u32>, NodeError> {
+        let lock_path = dir.join(LOCK_FILE);
+        let lock = match File::open(&lock_path) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error(&lock_path, &err)),
+        };
+        match lock.try_lock_shared() {
+            Ok(()) => Ok(None),
+            Err(TryLockError::WouldBlock) => {
+                let pid =
+                    fs::read_to_string(&lock_path).map_err(|err| io_error(&lock_path, &err))?;
+                pid.trim().parse().map(Some).map_err(|_| {
+                    NodeError::Disk(format!("{} holds no process id", lock_path.display()))
+                })
+            }
+            Err(TryLockError::Error(err)) => Err(io_error(&lock_path, &err)),
+        }
     }
 
     /// The data directory.
@@ -270,9 +298,16 @@ mod tests {
     #[test]
     fn second_open_of_a_locked_dir_fails_until_the_first_closes() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Disk::running(dir.path()).unwrap(), None, "no lock file yet");
         let first = Disk::open(dir.path()).unwrap();
         assert!(matches!(Disk::open(dir.path()), Err(NodeError::Disk(_))));
+        assert_eq!(
+            Disk::running(dir.path()).unwrap(),
+            Some(std::process::id()),
+            "the holder's pid is readable while it holds the lock"
+        );
         drop(first);
+        assert_eq!(Disk::running(dir.path()).unwrap(), None);
         assert!(Disk::open(dir.path()).is_ok());
     }
 
