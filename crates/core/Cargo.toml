@@ -1,0 +1,29 @@
+[package]
+name = "chibi-core"
+description = "Pure domain logic for chibi: proof verification, the known-key store, BAL application, and local execution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+test-utils = []
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
+alloy-eip7928.workspace = true
+alloy-evm.workspace = true
+revm.workspace = true
+reth-chainspec.workspace = true
+reth-trie-common.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

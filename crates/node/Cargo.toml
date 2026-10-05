@@ -1,0 +1,47 @@
+[package]
+name = "chibi-node"
+description = "chibi's async shell: light client, devp2p, the head follower, and the request-side node API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chibi-core.workspace = true
+
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
+
+helios-ethereum.workspace = true
+helios-core.workspace = true
+helios-consensus-core.workspace = true
+
+reth-chainspec.workspace = true
+reth-eth-wire-types.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-network.workspace = true
+reth-network-api.workspace = true
+reth-network-p2p.workspace = true
+reth-network-peers.workspace = true
+reth-storage-api.workspace = true
+reth-tasks.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+chibi-core = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true
