@@ -399,8 +399,8 @@ async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeE
 
 impl<P: Peers> Node<P> {
     /// Builds a node from its parts and anchors it at the light client's latest head: every
-    /// watched account and every key in the state file is proven, token seeding runs, and
-    /// pending outbox transactions are re-broadcast.
+    /// watched account is proven, token seeding runs, and pending outbox transactions are
+    /// re-broadcast.
     pub async fn with_parts(
         spec: NetworkSpec,
         peers: P,
@@ -410,8 +410,7 @@ impl<P: Peers> Node<P> {
     ) -> Result<(Self, Follower<P>), NodeError> {
         let trusted = wait_latest(&mut heads).await?;
         let anchor = fetch::header(&peers, trusted).await?;
-        let mut tracked: Vec<Key> = watch.addresses.iter().copied().map(Key::Account).collect();
-        tracked.extend(disk.read(|file| file.tracked().collect::<Vec<_>>()));
+        let tracked: Vec<Key> = watch.addresses.iter().copied().map(Key::Account).collect();
         let outbox = disk.read(|file| file.outbox().to_vec());
         let shared = Arc::new(Shared {
             env: ChainEnv::new(Arc::clone(&spec.chain)),
@@ -902,25 +901,28 @@ impl<P: Peers> Shared<P> {
         Ok(())
     }
 
-    /// Runs `balanceOf(holder)` for every watched address and token and tracks every key the
-    /// runs read, so proxies and nonstandard layouts are covered without per-token code.
+    /// Runs `balanceOf(holder)` and a zero `transfer` to the holder from the holder for every
+    /// watched address and token, and tracks every key either run read, whether or not the
+    /// transfer succeeds. That covers proxies, pause flags, fee parameters, blacklists, and
+    /// nonstandard layouts without per-token code.
     async fn seed(&self) {
         for holder in &self.watch.addresses {
             for token in &self.watch.tokens {
-                let request = balance_of(token, *holder);
-                let store = self.read(State::snapshot);
-                let seeded = self
-                    .resolve(store, |s| {
-                        exec::execute(s, &self.env, &request).map_err(misses)
-                    })
-                    .await;
-                match seeded {
-                    Ok(executed) => self.update(|s| s.track(executed.read)),
-                    Err(err) => warn!(
-                        target: "chibi::node",
-                        token = token.symbol, %holder, %err,
-                        "token seeding failed; its balance stays unknown until the next head",
-                    ),
+                for request in [balance_of(token, *holder), transfer_to_self(token, *holder)] {
+                    let store = self.read(State::snapshot);
+                    let seeded = self
+                        .resolve(store, |s| {
+                            exec::execute(s, &self.env, &request).map_err(misses)
+                        })
+                        .await;
+                    match seeded {
+                        Ok(executed) => self.update(|s| s.track(executed.read)),
+                        Err(err) => warn!(
+                            target: "chibi::node",
+                            token = token.symbol, %holder, %err,
+                            "token seeding failed; its keys are fetched on demand until the next head",
+                        ),
+                    }
                 }
             }
         }
@@ -960,20 +962,13 @@ impl<P: Peers> Shared<P> {
         }
     }
 
-    /// Writes tracked keys, the snapshot, the outbox, and snap/2 peers to the state file.
+    /// Writes the snapshot, the outbox, and snap/2 peers to the state file.
     pub(crate) async fn persist(self: &Arc<Self>) -> Result<(), NodeError> {
         let shared = Arc::clone(self);
         blocking(move || {
             let census = shared.peers.census();
             shared.disk.save(|file| {
-                let (tracked, outbox, store) = shared.read(|s| {
-                    (
-                        s.tracked().collect::<Vec<_>>(),
-                        outbox(s.txs().pending()),
-                        s.snapshot(),
-                    )
-                });
-                file.set_tracked(tracked);
+                let (outbox, store) = shared.read(|s| (outbox(s.txs().pending()), s.snapshot()));
                 file.set_outbox(outbox);
                 file.set_snapshot(shared.snapshot(&store));
                 file.remember_peers(&census.snap_records);
@@ -1168,6 +1163,20 @@ fn balance_of(token: &Token, holder: Address) -> CallRequest {
     let mut input = Vec::with_capacity(36);
     input.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
     input.extend_from_slice(B256::left_padding_from(holder.as_slice()).as_slice());
+    token_call(token, holder, input)
+}
+
+/// `transfer(holder, 0)` sent by the holder: the checks a real transfer makes, on the
+/// holder's keys only.
+fn transfer_to_self(token: &Token, holder: Address) -> CallRequest {
+    let mut input = Vec::with_capacity(68);
+    input.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
+    input.extend_from_slice(B256::left_padding_from(holder.as_slice()).as_slice());
+    input.extend_from_slice(&[0; 32]);
+    token_call(token, holder, input)
+}
+
+fn token_call(token: &Token, holder: Address, input: Vec<u8>) -> CallRequest {
     CallRequest {
         from: Some(holder),
         to: TxKind::Call(token.address),

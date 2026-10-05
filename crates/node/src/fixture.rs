@@ -58,6 +58,8 @@ pub struct Log {
     pub penalized: Vec<PeerKey>,
     /// Account, storage, and code requests served.
     pub proofs: usize,
+    /// `(keccak256(address), keccak256(slot))` of every storage request served, in order.
+    pub slots: Vec<(B256, B256)>,
     /// Block bodies served.
     pub bodies: usize,
     /// Broadcasts, in order.
@@ -274,6 +276,11 @@ impl Peers for FixturePeers {
         request: StorageRangeRequest,
     ) -> Result<Reply<StorageReply>, NetError> {
         self.proof_served();
+        self.inner
+            .log
+            .lock()
+            .slots
+            .push((request.account, request.slot));
         if self
             .inner
             .faults
