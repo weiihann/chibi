@@ -1,25 +1,74 @@
 //! The request-side node API. Every method pins one verified head for its whole run.
 //!
-//! This file is the contract between the node implementation and the JSON-RPC layer. Bodies
-//! marked `todo!()` are filled in by the node work; signatures change only with the lead.
+//! This file is the contract between the node implementation and the JSON-RPC layer.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy_consensus::Transaction as _;
+use alloy_consensus::transaction::SignerRecoverable as _;
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, U256};
+use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
+use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, TxKind, U256};
 use chibi_core::VerifiedHeader;
-use chibi_core::exec::{CallRequest, EstimateError, ExecError, ExecutionResult, HaltReason};
-use chibi_core::state::{Account, StateError};
-use chibi_core::tx::VerifiedReceipt;
-use chibi_core::verify::VerifyError;
+use chibi_core::exec::{
+    self, CallRequest, ChainEnv, EstimateError, ExecError, ExecutionResult, HaltReason, Misses,
+};
+use chibi_core::state::{Account, Key, Miss, State, StateError, Store};
+use chibi_core::tx::{self, FeeSample, Lookup, PendingTx, TxBook, VerifiedReceipt};
+use chibi_core::verify::{VerifiedBody, VerifyError};
 use chibi_core::wire::Transaction;
+use parking_lot::Mutex;
+use reth_chainspec::EthChainSpec as _;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::beacon::BeaconError;
-use crate::devp2p::{Devp2p, Devp2pError, Ports};
-use crate::network::{Network, NetworkSpec};
+use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
+use crate::devp2p::{Devp2p, Devp2pError, HeadHint, Ports};
+use crate::disk::{Disk, StateFile};
+use crate::fetch::{self, Fetched};
+use crate::heads::Heads;
+use crate::network::{Network, NetworkSpec, Token};
 use crate::peers::{NetError, Peers};
+
+/// Fetch rounds one request may need before it gives up.
+const MISS_ROUNDS: u32 = 8;
+
+/// Recent blocks sampled for the suggested tip, as reth's gas price oracle does.
+const FEE_BLOCKS: usize = 20;
+
+/// Lowest tips taken from each sampled block, as reth's oracle does.
+const TIPS_PER_BLOCK: usize = 3;
+
+/// Percentile of the sampled tips suggested.
+const TIP_PERCENTILE: usize = 60;
+
+/// Suggested tip when the sampled blocks carry no transactions; reth's oracle default.
+const DEFAULT_TIP: u128 = 1_000_000_000;
+
+/// Highest tip ever suggested; reth's oracle cap.
+const MAX_TIP: u128 = 500_000_000_000;
+
+/// Fee samples kept before the oldest are dropped.
+const FEE_CACHE: usize = 512;
+
+/// Most blocks `eth_feeHistory` covers, as in reth.
+const MAX_FEE_HISTORY: u64 = 1024;
+
+/// Seconds between blocks, for the next block's fee parameters.
+const SLOT_SECONDS: u64 = 12;
+
+/// Tries at fetching a community checkpoint on the first run.
+const CHECKPOINT_ATTEMPTS: u32 = 4;
+
+/// helios's checkpoint file inside the data directory.
+const HELIOS_CHECKPOINT: &str = "checkpoint";
+
+/// How long `start` waits for discovery to find a snap/2 peer.
+const SNAP_PEER_WAIT: Duration = Duration::from_secs(300);
 
 /// Everything `Node::start` needs. The CLI builds it from the config file and flags.
 #[derive(Clone, Debug)]
@@ -59,13 +108,13 @@ pub enum BlockSel {
 /// Handle to a running node. Cheap to clone; every clone shares one state.
 #[derive(Debug)]
 pub struct Node<P: Peers = Devp2p> {
-    _peers: std::marker::PhantomData<P>,
+    shared: Arc<Shared<P>>,
 }
 
 impl<P: Peers> Clone for Node<P> {
     fn clone(&self) -> Self {
         Self {
-            _peers: std::marker::PhantomData,
+            shared: Arc::clone(&self.shared),
         }
     }
 }
@@ -74,7 +123,13 @@ impl<P: Peers> Clone for Node<P> {
 /// Not `Clone`: exactly one exists per node.
 #[derive(Debug)]
 pub struct Follower<P: Peers = Devp2p> {
-    _peers: std::marker::PhantomData<P>,
+    pub(crate) shared: Arc<Shared<P>>,
+    pub(crate) heads: Heads,
+    pub(crate) beacon: Option<Beacon>,
+    /// Heads moved past since start, for pacing rebroadcasts.
+    pub(crate) moves: u64,
+    /// Blocks holding located transactions whose receipts are not yet verified.
+    pub(crate) unreceipted: Vec<VerifiedBody>,
 }
 
 /// Fee data for `eth_feeHistory`, oldest block first.
@@ -167,35 +222,203 @@ pub enum Stepped {
     Reanchored(BlockNumHash),
 }
 
+/// State every [`Node`] clone and the [`Follower`] share.
+#[derive(Debug)]
+pub(crate) struct Shared<P> {
+    pub(crate) spec: NetworkSpec,
+    pub(crate) env: ChainEnv,
+    pub(crate) peers: P,
+    pub(crate) watch: Vec<Address>,
+    pub(crate) disk: Disk,
+    /// The canonical state. Reached only through [`Shared::read`] and [`Shared::update`],
+    /// whose closures cannot await, so no guard crosses an await.
+    state: Mutex<State>,
+    fees: Mutex<HashMap<B256, FeeSample>>,
+}
+
 impl Node<Devp2p> {
     /// Opens the data dir (taking its lock), starts the light client and devp2p, and returns
     /// once the state is anchored at a fresh verified head with every tracked key proven.
     pub async fn start(config: NodeConfig) -> Result<(Self, Follower<Devp2p>), NodeError> {
-        let _ = config;
-        todo!()
+        let spec = config.network.spec();
+        let disk = Disk::open(&config.data_dir)?;
+        let secret_key = disk.secret_key()?;
+        let known_peers = disk.read(StateFile::peers);
+        let checkpoint = checkpoint(&spec, config.checkpoint, &config.data_dir).await?;
+        let url = match config.beacon_url {
+            Some(url) => url,
+            None => Url::parse(spec.default_beacon)
+                .map_err(|err| BeaconError::Start(format!("default beacon url: {err}")))?,
+        };
+
+        let (heads_tx, mut heads) = Heads::channel();
+        let beacon = Beacon::start(
+            &spec,
+            BeaconConfig {
+                url,
+                data_dir: config.data_dir.clone(),
+                checkpoint,
+            },
+            heads_tx,
+        )?;
+        beacon.wait_synced().await?;
+        let trusted = wait_latest(&mut heads).await?;
+        info!(target: "chibi::node", network = %spec.network, hash = %trusted.hash(), "light client synced");
+
+        let net =
+            Devp2p::start(&spec, secret_key, config.ports, HeadHint::Attested(trusted)).await?;
+        net.add_peers(&known_peers);
+        info!(
+            target: "chibi::node",
+            remembered = known_peers.len(),
+            "waiting for a snap/2 peer",
+        );
+        let mut sessions = net.sessions();
+        let found = tokio::time::timeout(
+            SNAP_PEER_WAIT,
+            sessions.wait_for(|sessions| sessions.values().any(|session| session.snap)),
+        )
+        .await
+        .is_ok_and(|seen| seen.is_ok());
+        if !found {
+            return Err(NodeError::Net(NetError::NoPeer {
+                capability: "snap/2",
+            }));
+        }
+
+        let (node, mut follower) = Node::with_parts(spec, net, heads, disk, &config.watch).await?;
+        follower.beacon = Some(beacon);
+        Ok((node, follower))
     }
 }
 
+/// The light-client checkpoint to pass to helios. A user override wins; otherwise helios's
+/// own saved checkpoint (passing none lets helios load it); otherwise, on a first run, the
+/// community checkpoint services.
+async fn checkpoint(
+    spec: &NetworkSpec,
+    user: Option<B256>,
+    data_dir: &Path,
+) -> Result<Option<B256>, NodeError> {
+    if let Some(checkpoint) = user {
+        return Ok(Some(checkpoint));
+    }
+    if data_dir.join(HELIOS_CHECKPOINT).exists() {
+        return Ok(None);
+    }
+    let mut attempt = 1;
+    loop {
+        match beacon::community_checkpoint(spec).await {
+            Ok(checkpoint) => {
+                warn!(
+                    target: "chibi::node",
+                    %checkpoint,
+                    "no saved light-client checkpoint; trusting the community checkpoint services for this first run",
+                );
+                return Ok(Some(checkpoint));
+            }
+            Err(err) if attempt < CHECKPOINT_ATTEMPTS => {
+                warn!(target: "chibi::node", attempt, %err, "community checkpoint failed; retrying");
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeError> {
+    let latest = *heads
+        .latest
+        .wait_for(Option::is_some)
+        .await
+        .map_err(|_| NodeError::Stopped)?;
+    latest.ok_or(NodeError::NotReady)
+}
+
 impl<P: Peers> Node<P> {
+    /// Builds a node from its parts and anchors it at the light client's latest head: every
+    /// watched account and every key in the state file is proven, token seeding runs, and
+    /// pending outbox transactions are re-broadcast.
+    pub async fn with_parts(
+        spec: NetworkSpec,
+        peers: P,
+        mut heads: Heads,
+        disk: Disk,
+        watch: &[Address],
+    ) -> Result<(Self, Follower<P>), NodeError> {
+        let trusted = wait_latest(&mut heads).await?;
+        let anchor = fetch::header(&peers, trusted).await?;
+        let mut tracked: Vec<Key> = watch.iter().copied().map(Key::Account).collect();
+        tracked.extend(disk.read(|file| file.tracked().collect::<Vec<_>>()));
+        let outbox = disk.read(|file| file.outbox().to_vec());
+        let shared = Arc::new(Shared {
+            env: ChainEnv::new(Arc::clone(&spec.chain)),
+            spec,
+            peers,
+            watch: watch.to_vec(),
+            disk,
+            state: Mutex::new(State::new(anchor.clone(), tracked)),
+            fees: Mutex::new(HashMap::new()),
+        });
+        shared.reanchor(anchor).await?;
+        shared.restore_outbox(&outbox).await;
+        shared.persist()?;
+        let (number, keys) = shared.read(|s| (s.anchor().number(), s.tracked().count()));
+        info!(target: "chibi::node", head = number, keys, "anchored");
+        Ok((
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            Follower {
+                shared,
+                heads,
+                beacon: None,
+                moves: 0,
+                unreceipted: Vec::new(),
+            },
+        ))
+    }
+
     /// The chain id served by `eth_chainId`.
     pub fn chain_id(&self) -> u64 {
-        todo!()
+        self.shared.spec.chain_id()
     }
 
     /// The registry entry for the followed chain.
     pub fn network(&self) -> &NetworkSpec {
-        todo!()
+        &self.shared.spec
     }
 
     /// The anchor header.
     pub fn head(&self) -> VerifiedHeader {
-        todo!()
+        self.shared.read(|s| s.anchor().clone())
     }
 
     /// A held header. `Safe` and `Finalized` give the finalized header.
     pub fn header(&self, block: BlockSel) -> Result<VerifiedHeader, NodeError> {
-        let _ = block;
-        todo!()
+        self.shared.read(|s| {
+            let store = s.store();
+            let head = store.anchor().number();
+            let held = match block {
+                BlockSel::Latest | BlockSel::Pending => Some(store.anchor()),
+                BlockSel::Safe | BlockSel::Finalized => {
+                    return s.finalized().cloned().ok_or(NodeError::NotReady);
+                }
+                BlockSel::Number(number) => store
+                    .header(number)
+                    .or_else(|| s.finalized().filter(|f| f.number() == number)),
+                BlockSel::Hash(hash) => store
+                    .headers()
+                    .rev()
+                    .find(|header| header.hash() == hash)
+                    .or_else(|| s.finalized().filter(|f| f.hash() == hash)),
+            };
+            held.cloned().ok_or(NodeError::Unsupported {
+                what: "blocks outside the held header window",
+                head,
+            })
+        })
     }
 
     /// The account at `block`, `None` if proven absent. Fetches and proves it on a miss.
@@ -204,8 +427,14 @@ impl<P: Peers> Node<P> {
         address: Address,
         block: BlockSel,
     ) -> Result<Option<Account>, NodeError> {
-        let _ = (address, block);
-        todo!()
+        let store = self.shared.pin(block)?;
+        self.shared
+            .resolve(store, |s| {
+                s.account(address)
+                    .map(Option::<&Account>::copied)
+                    .map_err(|miss| vec![miss])
+            })
+            .await
     }
 
     /// A storage slot at `block`. Fetches and proves it on a miss.
@@ -215,14 +444,33 @@ impl<P: Peers> Node<P> {
         slot: U256,
         block: BlockSel,
     ) -> Result<U256, NodeError> {
-        let _ = (address, slot, block);
-        todo!()
+        let store = self.shared.pin(block)?;
+        self.shared
+            .resolve(store, |s| {
+                s.slot(address, slot).map_err(|miss| {
+                    // One storage proof carries its account proof.
+                    vec![match miss {
+                        Miss::Account(address) => Miss::Storage(address, slot),
+                        other @ (Miss::Storage(..) | Miss::Code(_) | Miss::BlockHash(_)) => other,
+                    }]
+                })
+            })
+            .await
     }
 
     /// The account's code at `block`, empty for accounts without code.
     pub async fn code(&self, address: Address, block: BlockSel) -> Result<Bytes, NodeError> {
-        let _ = (address, block);
-        todo!()
+        let store = self.shared.pin(block)?;
+        self.shared
+            .resolve(store, |s| {
+                let Some(account) = s.account(address).map_err(|miss| vec![miss])? else {
+                    return Ok(Bytes::new());
+                };
+                s.code(account.code_hash)
+                    .map(|code| code.original_bytes())
+                    .map_err(|miss| vec![miss])
+            })
+            .await
     }
 
     /// The account nonce. `Pending` adds chibi-submitted transactions not yet included.
@@ -231,8 +479,18 @@ impl<P: Peers> Node<P> {
         address: Address,
         block: BlockSel,
     ) -> Result<u64, NodeError> {
-        let _ = (address, block);
-        todo!()
+        let nonce = self
+            .account(address, block)
+            .await?
+            .map_or(0, |account| account.nonce);
+        Ok(match block {
+            BlockSel::Pending => self.shared.read(|s| s.txs().pending_nonce(address, nonce)),
+            BlockSel::Latest
+            | BlockSel::Safe
+            | BlockSel::Finalized
+            | BlockSel::Number(_)
+            | BlockSel::Hash(_) => nonce,
+        })
     }
 
     /// Runs `request` locally without committing anything.
@@ -241,8 +499,17 @@ impl<P: Peers> Node<P> {
         request: CallRequest,
         block: BlockSel,
     ) -> Result<ExecutionResult<HaltReason>, NodeError> {
-        let _ = (request, block);
-        todo!()
+        let store = self.shared.pin(block)?;
+        let env = &self.shared.env;
+        let result = self
+            .shared
+            .resolve(store, |s| {
+                exec::execute(s, env, &request)
+                    .map(|executed| executed.result)
+                    .map_err(misses)
+            })
+            .await?;
+        result.map_err(NodeError::Exec)
     }
 
     /// Estimates gas for `request` with reth's bisection.
@@ -251,18 +518,42 @@ impl<P: Peers> Node<P> {
         request: CallRequest,
         block: BlockSel,
     ) -> Result<u64, NodeError> {
-        let _ = (request, block);
-        todo!()
+        let store = self.shared.pin(block)?;
+        let env = &self.shared.env;
+        let estimate = self
+            .shared
+            .resolve(store, |s| {
+                exec::estimate_gas(s, env, &request).map_err(misses)
+            })
+            .await?;
+        estimate.map_err(NodeError::Estimate)
     }
 
     /// Suggested legacy gas price: next base fee plus the suggested priority fee.
     pub async fn gas_price(&self) -> Result<u128, NodeError> {
-        todo!()
+        let tip = self.max_priority_fee().await?;
+        let anchor = self.head();
+        let params = self
+            .shared
+            .spec
+            .chain
+            .base_fee_params_at_timestamp(anchor.header().timestamp + SLOT_SECONDS);
+        let base_fee = tx::next_base_fee(&anchor, params).unwrap_or_default();
+        Ok(u128::from(base_fee) + tip)
     }
 
     /// Suggested priority fee from tips in recent verified bodies.
     pub async fn max_priority_fee(&self) -> Result<u128, NodeError> {
-        todo!()
+        let headers: Vec<VerifiedHeader> = self.shared.read(|s| {
+            s.store()
+                .headers()
+                .rev()
+                .take(FEE_BLOCKS)
+                .cloned()
+                .collect()
+        });
+        let samples = self.shared.samples(&headers).await?;
+        Ok(suggest_tip(&samples))
     }
 
     /// Fee history over up to `blocks` held headers ending at `newest`.
@@ -272,50 +563,512 @@ impl<P: Peers> Node<P> {
         newest: BlockSel,
         percentiles: &[f64],
     ) -> Result<FeeHistory, NodeError> {
-        let _ = (blocks, newest, percentiles);
-        todo!()
+        if blocks == 0 {
+            return Ok(FeeHistory {
+                oldest_block: 0,
+                base_fee_per_gas: Vec::new(),
+                gas_used_ratio: Vec::new(),
+                base_fee_per_blob_gas: Vec::new(),
+                blob_gas_used_ratio: Vec::new(),
+                reward: None,
+            });
+        }
+        let newest = self.header(newest)?;
+        let headers: Vec<VerifiedHeader> = self.shared.read(|s| {
+            let store = s.store();
+            if store
+                .header(newest.number())
+                .is_none_or(|held| held.hash() != newest.hash())
+            {
+                return Err(NodeError::Unsupported {
+                    what: "fee history outside the held header window",
+                    head: store.anchor().number(),
+                });
+            }
+            let oldest = newest
+                .number()
+                .saturating_sub(blocks.min(MAX_FEE_HISTORY) - 1);
+            Ok((oldest..=newest.number())
+                .filter_map(|number| store.header(number).cloned())
+                .collect())
+        })?;
+        let chain = &self.shared.spec.chain;
+        let mut history = FeeHistory {
+            oldest_block: headers
+                .first()
+                .map_or(newest.number(), VerifiedHeader::number),
+            base_fee_per_gas: Vec::with_capacity(headers.len() + 1),
+            gas_used_ratio: Vec::with_capacity(headers.len()),
+            base_fee_per_blob_gas: Vec::with_capacity(headers.len() + 1),
+            blob_gas_used_ratio: Vec::with_capacity(headers.len()),
+            reward: None,
+        };
+        for verified in &headers {
+            let header = verified.header();
+            let blob_params = chain.blob_params_at_timestamp(header.timestamp);
+            history
+                .base_fee_per_gas
+                .push(header.base_fee_per_gas.map_or(0, u128::from));
+            history
+                .gas_used_ratio
+                .push(ratio(header.gas_used, header.gas_limit));
+            history.base_fee_per_blob_gas.push(
+                blob_params
+                    .and_then(|params| header.blob_fee(params))
+                    .unwrap_or_default(),
+            );
+            history
+                .blob_gas_used_ratio
+                .push(blob_params.map_or(0.0, |params| {
+                    ratio(
+                        header.blob_gas_used.unwrap_or_default(),
+                        params.max_blob_gas_per_block(),
+                    )
+                }));
+        }
+        let last = newest.header();
+        let next_timestamp = last.timestamp + SLOT_SECONDS;
+        history.base_fee_per_gas.push(
+            last.next_block_base_fee(chain.base_fee_params_at_timestamp(next_timestamp))
+                .map_or(0, u128::from),
+        );
+        history.base_fee_per_blob_gas.push(
+            chain
+                .blob_params_at_timestamp(next_timestamp)
+                .and_then(|params| last.next_block_blob_fee(params))
+                .unwrap_or_default(),
+        );
+        if !percentiles.is_empty() {
+            let samples = self.shared.samples(&headers).await?;
+            history.reward = Some(
+                samples
+                    .iter()
+                    .map(|sample| {
+                        percentiles
+                            .iter()
+                            .map(|p| tx::tip_percentile([sample], *p).unwrap_or_default())
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        Ok(history)
     }
 
     /// Decodes an EIP-2718 transaction, checks its chain id, records it, and broadcasts it.
+    ///
+    /// The outbox is persisted before the broadcast, and the hash is returned even when no
+    /// peer received the transaction; the follower re-broadcasts it.
     pub async fn submit(&self, raw: &[u8]) -> Result<TxHash, NodeError> {
-        let _ = raw;
-        todo!()
+        let transaction = Transaction::decode_2718_exact(raw)
+            .map_err(|_| NodeError::InvalidTransaction("malformed EIP-2718 transaction"))?;
+        let pending = self.shared.accept(transaction)?;
+        let hash = pending.hash;
+        let transaction = pending.tx.clone();
+        self.shared.update(|s| s.txs_mut().submit(pending));
+        self.shared.persist_outbox()?;
+        self.shared.broadcast(transaction).await;
+        Ok(hash)
     }
 
     /// The receipt of a chibi-submitted transaction, `None` while pending or unknown.
     pub fn receipt(&self, hash: TxHash) -> Result<Option<TxReceipt>, NodeError> {
-        let _ = hash;
-        todo!()
+        Ok(self.shared.read(|s| match s.txs().lookup(hash) {
+            Lookup::Located(located) => located.receipt.as_ref().map(|receipt| TxReceipt {
+                receipt: receipt.clone(),
+                from: located.sender,
+                to: receipt.kind().to().copied(),
+                contract_address: receipt.contract_address(located.sender, located.nonce),
+            }),
+            Lookup::Pending(_) | Lookup::Unknown => None,
+        }))
     }
 
     /// A chibi-submitted transaction, `None` if chibi did not submit it.
     pub fn transaction(&self, hash: TxHash) -> Result<Option<SubmittedTx>, NodeError> {
-        let _ = hash;
-        todo!()
+        Ok(self.shared.read(|s| match s.txs().lookup(hash) {
+            Lookup::Located(located) => Some(SubmittedTx {
+                transaction: located.tx.clone(),
+                from: located.sender,
+                included: Some((located.block, located.index)),
+            }),
+            Lookup::Pending(pending) => Some(SubmittedTx {
+                transaction: pending.tx.clone(),
+                from: pending.sender,
+                included: None,
+            }),
+            Lookup::Unknown => None,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> std::collections::BTreeSet<Key> {
+        self.shared.read(|s| s.tracked().collect())
     }
 
     /// Current status.
     pub fn status(&self) -> Status {
-        todo!()
+        let store = self.shared.read(State::snapshot);
+        let census = self.shared.peers.census();
+        Status {
+            snapshot: self.shared.snapshot(&store),
+            peers: census.peers,
+            snap_peers: census.snap_peers,
+        }
     }
 }
 
 impl<P: Peers> Follower<P> {
     /// Follows the light client until the node shuts down.
-    pub async fn run(self) -> Result<(), NodeError> {
-        todo!()
+    pub async fn run(mut self) -> Result<(), NodeError> {
+        loop {
+            match self.step().await {
+                Ok(stepped) => debug!(target: "chibi::follow", ?stepped, "step"),
+                Err(err @ (NodeError::Stopped | NodeError::Net(NetError::Stopped))) => {
+                    return Err(err);
+                }
+                Err(err) => {
+                    warn!(target: "chibi::follow", %err, "step failed; retrying at the next head");
+                }
+            }
+            self.heads
+                .latest
+                .changed()
+                .await
+                .map_err(|_| NodeError::Stopped)?;
+        }
     }
 
     /// Moves to the newest attested head once, then persists the state file.
     pub async fn step(&mut self) -> Result<Stepped, NodeError> {
-        todo!()
+        self.follow().await
     }
 }
 
 /// Reads the last saved snapshot without starting a node or taking the data-dir lock.
 pub fn read_snapshot(data_dir: &Path) -> Result<Option<Snapshot>, NodeError> {
-    let _ = data_dir;
-    todo!()
+    Ok(crate::disk::read_state(data_dir)?.and_then(|file| file.snapshot().cloned()))
+}
+
+impl<P: Peers> Shared<P> {
+    pub(crate) fn read<R>(&self, f: impl FnOnce(&State) -> R) -> R {
+        f(&self.state.lock())
+    }
+
+    pub(crate) fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        f(&mut self.state.lock())
+    }
+
+    /// The store a state query at `block` reads. Only the anchor serves state.
+    fn pin(&self, block: BlockSel) -> Result<Arc<Store>, NodeError> {
+        let store = self.read(State::snapshot);
+        let anchor = store.anchor();
+        let serves = match block {
+            BlockSel::Latest | BlockSel::Pending => true,
+            BlockSel::Number(number) => number == anchor.number(),
+            BlockSel::Hash(hash) => hash == anchor.hash(),
+            BlockSel::Safe | BlockSel::Finalized => false,
+        };
+        if serves {
+            Ok(store)
+        } else {
+            Err(NodeError::Unsupported {
+                what: "state at blocks other than the verified head",
+                head: anchor.number(),
+            })
+        }
+    }
+
+    /// Runs `step` on `store`, proving its misses at the same anchor between runs, then folds
+    /// the new facts into the canonical state unless the anchor moved meanwhile.
+    pub(crate) async fn resolve<T>(
+        &self,
+        mut store: Arc<Store>,
+        step: impl Fn(&Store) -> Result<T, Vec<Miss>>,
+    ) -> Result<T, NodeError> {
+        let anchor = store.anchor().hash();
+        let mut facts = Vec::new();
+        let mut round = 0;
+        let outcome = loop {
+            let misses = match step(&store) {
+                Ok(value) => break Ok(value),
+                Err(misses) => misses,
+            };
+            if round == MISS_ROUNDS {
+                break Err(NodeError::TooManyMissRounds {
+                    rounds: MISS_ROUNDS,
+                });
+            }
+            round += 1;
+            let fetched = match fetch::misses(&self.peers, &store, misses).await {
+                Ok(fetched) => fetched,
+                Err(err) => break Err(err),
+            };
+            let held = Arc::make_mut(&mut store);
+            for fetched in fetched {
+                match fetched {
+                    Fetched::Proven(proven) => {
+                        held.insert(&proven)?;
+                        facts.push(proven);
+                    }
+                    Fetched::Ancestors(headers) => held.insert_ancestors(headers)?,
+                }
+            }
+        };
+        if !facts.is_empty() {
+            self.update(|s| s.merge(anchor, &facts));
+        }
+        outcome
+    }
+
+    /// Proves every tracked key at `target` into a fresh store while the old one stays
+    /// published, swaps, and reruns token seeding.
+    pub(crate) async fn reanchor(&self, target: VerifiedHeader) -> Result<(), NodeError> {
+        let keys: Vec<Key> = self.read(|s| s.tracked().collect());
+        let facts = fetch::keys(&self.peers, &target, keys).await?;
+        self.update(|s| s.reanchor(target, &facts))?;
+        self.seed().await;
+        Ok(())
+    }
+
+    /// Runs `balanceOf(holder)` for every watched address and token and tracks every key the
+    /// runs read, so proxies and nonstandard layouts are covered without per-token code.
+    async fn seed(&self) {
+        for holder in &self.watch {
+            for token in self.spec.tokens {
+                let request = balance_of(token, *holder);
+                let store = self.read(State::snapshot);
+                let seeded = self
+                    .resolve(store, |s| {
+                        exec::execute(s, &self.env, &request).map_err(misses)
+                    })
+                    .await;
+                match seeded {
+                    Ok(executed) => self.update(|s| s.track(executed.read)),
+                    Err(err) => warn!(
+                        target: "chibi::node",
+                        token = token.symbol, %holder, %err,
+                        "token seeding failed; its balance stays unknown until the next head",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The display snapshot at `store`, computed locally without fetching.
+    pub(crate) fn snapshot(&self, store: &Store) -> Snapshot {
+        let holdings = self
+            .watch
+            .iter()
+            .map(|address| {
+                let account = store.account(*address).ok();
+                Holding {
+                    address: *address,
+                    balance: account.map(|a| a.map_or(U256::ZERO, |a| a.balance)),
+                    nonce: account.map(|a| a.map_or(0, |a| a.nonce)),
+                    tokens: self
+                        .spec
+                        .tokens
+                        .iter()
+                        .map(|token| {
+                            (
+                                token.symbol.to_owned(),
+                                token_balance(store, &self.env, token, *address),
+                            )
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        Snapshot {
+            network: self.spec.network,
+            block: store.anchor().num_hash(),
+            saved_at: unix_now(),
+            holdings,
+        }
+    }
+
+    /// Writes tracked keys, the snapshot, the outbox, and snap/2 peers to the state file.
+    pub(crate) fn persist(&self) -> Result<(), NodeError> {
+        let census = self.peers.census();
+        self.disk.save(|file| {
+            let (tracked, outbox, store) = self.read(|s| {
+                (
+                    s.tracked().collect::<Vec<_>>(),
+                    outbox(s.txs()),
+                    s.snapshot(),
+                )
+            });
+            file.set_tracked(tracked);
+            file.set_outbox(outbox);
+            file.set_snapshot(self.snapshot(&store));
+            file.set_peers(&census.snap_records);
+        })
+    }
+
+    fn persist_outbox(&self) -> Result<(), NodeError> {
+        self.disk
+            .save(|file| file.set_outbox(self.read(|s| outbox(s.txs()))))
+    }
+
+    /// Checks a submitted transaction and recovers its sender.
+    fn accept(&self, transaction: Transaction) -> Result<PendingTx, NodeError> {
+        if matches!(transaction, Transaction::Eip4844(_)) {
+            return Err(NodeError::InvalidTransaction(
+                "blob transactions are not supported",
+            ));
+        }
+        match transaction.chain_id() {
+            None => {
+                return Err(NodeError::InvalidTransaction(
+                    "transaction has no chain id (pre-EIP-155)",
+                ));
+            }
+            Some(id) if id != self.spec.chain_id() => {
+                return Err(NodeError::InvalidTransaction(
+                    "transaction is for another chain",
+                ));
+            }
+            Some(_) => {}
+        }
+        let sender = transaction
+            .recover_signer()
+            .map_err(|_| NodeError::InvalidTransaction("invalid signature"))?;
+        Ok(PendingTx::new(transaction, sender))
+    }
+
+    /// Sends `transaction` to peers. Failure is logged: the follower re-broadcasts.
+    pub(crate) async fn broadcast(&self, transaction: Transaction) {
+        let hash = *transaction.tx_hash();
+        match tokio::time::timeout(fetch::REQUEST_TIMEOUT, self.peers.broadcast(transaction)).await
+        {
+            Ok(Ok(sent)) => debug!(target: "chibi::node", %hash, sent, "broadcast"),
+            Ok(Err(err)) => {
+                warn!(target: "chibi::node", %hash, %err, "broadcast reached no peer; will retry");
+            }
+            Err(_) => warn!(target: "chibi::node", %hash, "broadcast timed out; will retry"),
+        }
+    }
+
+    /// Records and re-broadcasts outbox transactions saved by an earlier run.
+    async fn restore_outbox(&self, outbox: &[Bytes]) {
+        for raw in outbox {
+            let accepted = Transaction::decode_2718_exact(raw)
+                .map_err(|_| NodeError::InvalidTransaction("malformed EIP-2718 transaction"))
+                .and_then(|transaction| self.accept(transaction));
+            match accepted {
+                Ok(pending) => {
+                    let transaction = pending.tx.clone();
+                    self.update(|s| s.txs_mut().submit(pending));
+                    self.broadcast(transaction).await;
+                }
+                Err(err) => warn!(target: "chibi::node", %err, "dropping a saved outbox entry"),
+            }
+        }
+    }
+
+    /// Fee samples for `headers`, fetching and verifying the bodies not cached yet.
+    async fn samples(&self, headers: &[VerifiedHeader]) -> Result<Vec<FeeSample>, NodeError> {
+        let missing: Vec<VerifiedHeader> = {
+            let cache = self.fees.lock();
+            headers
+                .iter()
+                .filter(|header| !cache.contains_key(&header.hash()))
+                .cloned()
+                .collect()
+        };
+        if !missing.is_empty() {
+            let bodies = fetch::bodies(&self.peers, &missing).await?;
+            self.cache_samples(&bodies);
+        }
+        let cache = self.fees.lock();
+        headers
+            .iter()
+            .map(|header| {
+                cache
+                    .get(&header.hash())
+                    .cloned()
+                    .ok_or(NodeError::Net(NetError::Rejected))
+            })
+            .collect()
+    }
+
+    pub(crate) fn cache_samples(&self, bodies: &[VerifiedBody]) {
+        let mut cache = self.fees.lock();
+        for body in bodies {
+            cache.insert(body.header().hash(), tx::sample(body));
+        }
+        if cache.len() > FEE_CACHE {
+            let newest = cache
+                .values()
+                .map(|s| s.block.number)
+                .max()
+                .unwrap_or_default();
+            let keep = newest.saturating_sub(FEE_CACHE as u64 / 2);
+            cache.retain(|_, sample| sample.block.number > keep);
+        }
+    }
+}
+
+/// reth's oracle: the lowest few tips of each block, then a percentile across them.
+fn suggest_tip(samples: &[FeeSample]) -> u128 {
+    let mut tips: Vec<u128> = samples
+        .iter()
+        .flat_map(|sample| sample.tips.iter().take(TIPS_PER_BLOCK).copied())
+        .collect();
+    if tips.is_empty() {
+        return DEFAULT_TIP;
+    }
+    tips.sort_unstable();
+    tips[(tips.len() - 1) * TIP_PERCENTILE / 100].min(MAX_TIP)
+}
+
+fn ratio(used: u64, limit: u64) -> f64 {
+    if limit == 0 {
+        0.0
+    } else {
+        used as f64 / limit as f64
+    }
+}
+
+fn misses(misses: Misses) -> Vec<Miss> {
+    misses.into_iter().collect()
+}
+
+fn outbox(txs: &TxBook) -> Vec<Bytes> {
+    txs.pending()
+        .iter()
+        .map(|pending| Bytes::from(pending.tx.encoded_2718()))
+        .collect()
+}
+
+/// `balanceOf(holder)` sent by the holder, so the run reads no account besides those it needs.
+fn balance_of(token: &Token, holder: Address) -> CallRequest {
+    let mut input = Vec::with_capacity(36);
+    input.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+    input.extend_from_slice(B256::left_padding_from(holder.as_slice()).as_slice());
+    CallRequest {
+        from: Some(holder),
+        to: TxKind::Call(token.address),
+        input: Bytes::from(input),
+        ..CallRequest::default()
+    }
+}
+
+/// `balanceOf` run locally over held keys only; `None` if a key is missing or the call fails.
+fn token_balance(store: &Store, env: &ChainEnv, token: &Token, holder: Address) -> Option<U256> {
+    let executed = exec::execute(store, env, &balance_of(token, holder)).ok()?;
+    if let Ok(ExecutionResult::Success { output, .. }) = executed.result {
+        let data = output.data();
+        return (data.len() == 32).then(|| U256::from_be_slice(data));
+    }
+    None
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Why a node operation failed.
@@ -368,4 +1121,30 @@ pub enum NodeError {
     /// The light client has not produced a head yet.
     #[error("no verified head yet")]
     NotReady,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(tips: &[u128]) -> FeeSample {
+        FeeSample {
+            block: BlockNumHash::default(),
+            base_fee: 0,
+            gas_used_ratio: 0.0,
+            tips: tips.to_vec(),
+        }
+    }
+
+    #[test]
+    fn tip_uses_the_lowest_tips_of_each_block() {
+        let samples = [sample(&[1, 2, 3, 1_000]), sample(&[4, 5, 6, 2_000])];
+        assert_eq!(suggest_tip(&samples), 4);
+    }
+
+    #[test]
+    fn tip_without_transactions_is_reths_default_and_is_capped() {
+        assert_eq!(suggest_tip(&[sample(&[])]), DEFAULT_TIP);
+        assert_eq!(suggest_tip(&[sample(&[u128::MAX])]), MAX_TIP);
+    }
 }

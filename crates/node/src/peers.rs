@@ -9,6 +9,7 @@ use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
     Transaction,
 };
+use reth_network_peers::NodeRecord;
 
 /// Identifies the peer that sent a reply, so a failed verification can penalize it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,6 +22,18 @@ pub struct Reply<T> {
     pub peer: PeerKey,
     /// The untrusted payload.
     pub value: T,
+}
+
+/// The connected sessions at one moment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Census {
+    /// Connected sessions.
+    pub peers: usize,
+    /// Connected sessions that negotiated snap/2.
+    pub snap_peers: usize,
+    /// Addresses of the connected snap/2 peers, dialed first on the next start because
+    /// discovery takes minutes to find one.
+    pub snap_records: Vec<NodeRecord>,
 }
 
 /// Untrusted access to the peer-to-peer network.
@@ -83,6 +96,9 @@ pub trait Peers: Send + Sync + 'static {
 
     /// Advertises `head` as chibi's latest block in its status, keeping the fork id current.
     fn announce(&self, head: &VerifiedHeader);
+
+    /// The sessions connected now.
+    fn census(&self) -> Census;
 }
 
 /// A request could not be completed. None of these say anything about chain state.

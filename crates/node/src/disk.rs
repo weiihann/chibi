@@ -1,0 +1,284 @@
+//! The per-network data directory: its lock, the devp2p identity, and the state file.
+//!
+//! The state file holds tracked keys, a display snapshot, the outbox of pending raw
+//! transactions, and snap/2 peers worth dialing first. It is replaced atomically (temp file,
+//! fsync, rename). Its values are display-only: nothing read from it enters a `Store`.
+
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{ErrorKind, Write as _};
+use std::path::{Path, PathBuf};
+
+use alloy_primitives::{Address, Bytes, U256, hex};
+use chibi_core::state::Key;
+use parking_lot::Mutex;
+use reth_network_peers::NodeRecord;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::devp2p::{SecretKey, rng_secret_key};
+use crate::node::{NodeError, Snapshot};
+
+const LOCK_FILE: &str = "chibi.lock";
+const STATE_FILE: &str = "state.json";
+const STATE_TEMP: &str = "state.json.tmp";
+const KEY_FILE: &str = "devp2p.key";
+
+/// A key as the state file stores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum SavedKey {
+    Account { address: Address },
+    Slot { address: Address, slot: U256 },
+}
+
+impl From<Key> for SavedKey {
+    fn from(key: Key) -> Self {
+        match key {
+            Key::Account(address) => Self::Account { address },
+            Key::Slot(address, slot) => Self::Slot { address, slot },
+        }
+    }
+}
+
+impl From<SavedKey> for Key {
+    fn from(key: SavedKey) -> Self {
+        match key {
+            SavedKey::Account { address } => Self::Account(address),
+            SavedKey::Slot { address, slot } => Self::Slot(address, slot),
+        }
+    }
+}
+
+/// The state file's contents.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StateFile {
+    tracked: Vec<SavedKey>,
+    snapshot: Option<Snapshot>,
+    outbox: Vec<Bytes>,
+    peers: Vec<String>,
+}
+
+impl StateFile {
+    /// Keys to prove at the first anchor.
+    pub(crate) fn tracked(&self) -> impl Iterator<Item = Key> + '_ {
+        self.tracked.iter().copied().map(Key::from)
+    }
+
+    pub(crate) fn set_tracked(&mut self, keys: impl IntoIterator<Item = Key>) {
+        self.tracked = keys.into_iter().map(SavedKey::from).collect();
+        self.tracked.sort_unstable_by_key(|key| Key::from(*key));
+    }
+
+    pub(crate) const fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    pub(crate) fn set_snapshot(&mut self, snapshot: Snapshot) {
+        self.snapshot = Some(snapshot);
+    }
+
+    /// Raw EIP-2718 transactions submitted and not yet located.
+    pub(crate) fn outbox(&self) -> &[Bytes] {
+        &self.outbox
+    }
+
+    pub(crate) fn set_outbox(&mut self, outbox: Vec<Bytes>) {
+        self.outbox = outbox;
+    }
+
+    /// Remembered snap/2 peers. Unparseable records are skipped.
+    pub(crate) fn peers(&self) -> Vec<NodeRecord> {
+        self.peers
+            .iter()
+            .filter_map(|record| record.parse().ok())
+            .collect()
+    }
+
+    /// Remembers `records`, keeping earlier ones when no snap/2 peer is connected now.
+    pub(crate) fn set_peers(&mut self, records: &[NodeRecord]) {
+        if !records.is_empty() {
+            self.peers = records.iter().map(NodeRecord::to_string).collect();
+        }
+    }
+}
+
+/// An open, locked data directory. Dropping it releases the lock.
+#[derive(Debug)]
+pub struct Disk {
+    dir: PathBuf,
+    _lock: File,
+    file: Mutex<StateFile>,
+}
+
+impl Disk {
+    /// Creates `dir` if needed, takes its exclusive lock, and loads the state file.
+    pub fn open(dir: &Path) -> Result<Self, NodeError> {
+        fs::create_dir_all(dir).map_err(|err| io_error(dir, &err))?;
+        let lock_path = dir.join(LOCK_FILE);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|err| io_error(&lock_path, &err))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(NodeError::Disk(format!(
+                    "{} is in use by another chibi process",
+                    dir.display()
+                )));
+            }
+            Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
+        }
+        let file = read_state(dir)?.unwrap_or_default();
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            _lock: lock,
+            file: Mutex::new(file),
+        })
+    }
+
+    /// The data directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Reads the loaded state file.
+    pub(crate) fn read<R>(&self, f: impl FnOnce(&StateFile) -> R) -> R {
+        f(&self.file.lock())
+    }
+
+    /// Edits the state file and writes it out before releasing it, so concurrent writers
+    /// cannot reorder their writes.
+    pub(crate) fn save(&self, edit: impl FnOnce(&mut StateFile)) -> Result<(), NodeError> {
+        let mut file = self.file.lock();
+        edit(&mut file);
+        let json = serde_json::to_vec_pretty(&*file)
+            .map_err(|err| NodeError::Disk(format!("encoding the state file: {err}")))?;
+        write_atomic(&self.dir, &json)
+    }
+
+    /// The devp2p secret key, created on first use so the node keeps one identity.
+    pub(crate) fn secret_key(&self) -> Result<SecretKey, NodeError> {
+        let path = self.dir.join(KEY_FILE);
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                let bytes = hex::decode(text.trim())
+                    .map_err(|err| NodeError::Disk(format!("{}: {err}", path.display())))?;
+                SecretKey::from_slice(&bytes)
+                    .map_err(|err| NodeError::Disk(format!("{}: {err}", path.display())))
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                let key = rng_secret_key();
+                let mut file = private_file(&path).map_err(|err| io_error(&path, &err))?;
+                file.write_all(hex::encode(key.secret_bytes()).as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|err| io_error(&path, &err))?;
+                Ok(key)
+            }
+            Err(err) => Err(io_error(&path, &err)),
+        }
+    }
+}
+
+/// Reads the state file in `dir` without taking the lock. `None` if there is none yet.
+pub(crate) fn read_state(dir: &Path) -> Result<Option<StateFile>, NodeError> {
+    let path = dir.join(STATE_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io_error(&path, &err)),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|err| NodeError::Disk(format!("{}: {err}", path.display())))
+}
+
+fn write_atomic(dir: &Path, bytes: &[u8]) -> Result<(), NodeError> {
+    let temp = dir.join(STATE_TEMP);
+    let path = dir.join(STATE_FILE);
+    let mut file = File::create(&temp).map_err(|err| io_error(&temp, &err))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| io_error(&temp, &err))?;
+    fs::rename(&temp, &path).map_err(|err| io_error(&path, &err))?;
+    // The rename is durable only once the directory entry is synced.
+    if let Err(err) = File::open(dir).and_then(|dir| dir.sync_all()) {
+        warn!(target: "chibi::disk", dir = %dir.display(), %err, "could not sync the data directory");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn private_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn private_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+fn io_error(path: &Path, err: &std::io::Error) -> NodeError {
+    NodeError::Disk(format!("{}: {err}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::address;
+
+    use super::*;
+
+    #[test]
+    fn second_open_of_a_locked_dir_fails_until_the_first_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Disk::open(dir.path()).unwrap();
+        assert!(matches!(Disk::open(dir.path()), Err(NodeError::Disk(_))));
+        drop(first);
+        assert!(Disk::open(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn secret_key_is_stable_across_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = Disk::open(dir.path()).unwrap().secret_key().unwrap();
+        let again = Disk::open(dir.path()).unwrap().secret_key().unwrap();
+        assert_eq!(key, again);
+    }
+
+    #[test]
+    fn saved_state_round_trips_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = address!("0x00000000000000000000000000000000000a11ce");
+        let keys = [Key::Slot(alice, U256::from(7)), Key::Account(alice)];
+        let record: NodeRecord = "enode://6f8a80d14311c39f35f516fa664deaaaa13e85b2f7493f37f6144d86991ec012937307647bd3b9a82abe2974e1407241d54947bbb39763a4cac9f77166ad92a0@10.3.58.6:30303"
+            .parse()
+            .unwrap();
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            disk.save(|file| {
+                file.set_tracked(keys);
+                file.set_outbox(vec![Bytes::from_static(&[1, 2, 3])]);
+                file.set_peers(&[record]);
+            })
+            .unwrap();
+            disk.save(|file| file.set_peers(&[])).unwrap();
+        }
+        assert!(!dir.path().join(STATE_TEMP).exists());
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.read(|file| {
+            assert_eq!(
+                file.tracked().collect::<Vec<_>>(),
+                vec![Key::Account(alice), Key::Slot(alice, U256::from(7))]
+            );
+            assert_eq!(file.outbox(), &[Bytes::from_static(&[1, 2, 3])]);
+            assert_eq!(file.peers(), vec![record]);
+        });
+    }
+}

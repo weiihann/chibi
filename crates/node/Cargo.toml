@@ -9,6 +9,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-utils = ["chibi-core/test-utils"]
+
 [dependencies]
 chibi-core.workspace = true
 
@@ -45,3 +48,5 @@ url.workspace = true
 chibi-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+alloy-signer = "2.5"
+alloy-signer-local = "2.5"

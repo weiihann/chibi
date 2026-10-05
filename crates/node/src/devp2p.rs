@@ -6,6 +6,7 @@
 //! unanswered.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +33,7 @@ use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
 use reth_network::{
     FetchClient, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkHandle, NetworkManager,
 };
+use reth_network_api::Peers as _;
 use reth_network_p2p::block_access_lists::client::{BalRequirement, BlockAccessListsClient};
 use reth_network_p2p::bodies::client::BodiesClient;
 use reth_network_p2p::download::DownloadClient;
@@ -39,7 +41,7 @@ use reth_network_p2p::error::RequestError;
 use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
 use reth_network_p2p::receipts::client::ReceiptsClient;
 use reth_network_p2p::snap::client::{SnapClient, SnapResponse};
-use reth_network_peers::PeerId;
+use reth_network_peers::{NodeRecord, PeerId};
 use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
@@ -49,7 +51,7 @@ use tracing::{debug, info, trace};
 pub use reth_network::config::{SecretKey, rng_secret_key};
 
 use crate::network::NetworkSpec;
-use crate::peers::{NetError, PeerKey, Peers, Reply};
+use crate::peers::{Census, NetError, PeerKey, Peers, Reply};
 
 /// Soft cap on snap/2 response sizes, matching reth's own snap downloaders.
 const RESPONSE_BYTES: u64 = 512 * 1024;
@@ -96,6 +98,8 @@ pub struct Session {
     pub eth: u8,
     /// Whether the peer announced snap/2.
     pub snap: bool,
+    /// The remote socket address of the session.
+    pub addr: SocketAddr,
 }
 
 /// Established sessions by peer.
@@ -200,6 +204,13 @@ impl Devp2p {
     /// The established sessions, updated as peers connect and disconnect.
     pub fn sessions(&self) -> watch::Receiver<Sessions> {
         self.sessions.clone()
+    }
+
+    /// Asks the network to dial `records`, as for peers remembered from an earlier run.
+    pub fn add_peers(&self, records: &[NodeRecord]) {
+        for record in records {
+            self.handle.add_peer(record.id, record.tcp_addr());
+        }
     }
 
     /// Disconnects every session and stops the network tasks.
@@ -445,6 +456,20 @@ impl Peers for Devp2p {
     fn announce(&self, head: &VerifiedHeader) {
         self.handle.update_status(status_head(&self.chain, head));
     }
+
+    fn census(&self) -> Census {
+        let sessions = self.sessions.borrow();
+        let snap_records: Vec<NodeRecord> = sessions
+            .iter()
+            .filter(|(_, session)| session.snap)
+            .map(|(peer, session)| NodeRecord::new(session.addr, peer.0))
+            .collect();
+        Census {
+            peers: sessions.len(),
+            snap_peers: snap_records.len(),
+            snap_records,
+        }
+    }
 }
 /// The status head for a verified header.
 fn status_head(chain: &ChainSpec, header: &VerifiedHeader) -> Head {
@@ -532,6 +557,7 @@ fn session(info: &SessionInfo) -> (PeerId, Session) {
         client: Arc::clone(&info.client_version),
         eth: info.version as u8,
         snap: info.capabilities.capabilities().contains(&SNAP_2),
+        addr: info.remote_addr,
     };
     (info.peer_id, session)
 }

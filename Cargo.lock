@@ -1804,6 +1804,8 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-signer",
+ "alloy-signer-local",
  "alloy-trie",
  "chibi-core",
  "futures",
