@@ -14,26 +14,27 @@ These constraints shape the design:
 - Sepolia has no BALs until 2026-10-06 13:53:36 UTC, and mainnet has none until its own Glamsterdam fork. Advancing without BALs is a first-class path.
 - Wallets send concurrent requests.
 - Peers drop clients that never answer, so chibi answers every inbound request with an empty response.
-- On 2026-10-05 a Nethermind peer was the only Sepolia peer seen serving snap/2.
+- A census on 2026-10-05 found five Sepolia peers serving snap/2 in 12 minutes, all Nethermind. Discovery alone took from about one to several minutes to reach one.
 
 ## Usage
 
 ```text
 $ ./install.sh
-installed ~/.cargo/bin/chibi
 Network [sepolia]:
-Watch-only address (blank to finish): 0x8f3C...a1
+Watch-only address (blank to finish): 0x3D76...5ce6
 Watch-only address (blank to finish):
-wrote ~/.config/chibi/config.toml (sepolia, 1 address, tracking USDC)
+wrote ~/Library/Application Support/chibi/config.toml (sepolia, 1 address, tracking USDC)
 
 $ chibi run
-light client synced (sepolia)
-head 9318004 verified; tracking 1 account + USDC (5 keys)
-JSON-RPC on http://127.0.0.1:8545, chain id 11155111
+INFO chibi::node: light client synced network=sepolia
+INFO chibi::node: waiting for a snap/2 peer peers=0 snap_peers=0 dialed=6 elapsed_s=0
+INFO chibi::node: anchored head=11848650 keys=8
+INFO chibi::rpc: JSON-RPC on http://127.0.0.1:8545, chain id 11155111
+INFO chibi::follow: head verified head=11848651 stepped=Reanchored(..)
 
 $ chibi status
-sepolia head 9318211 (saved 8s ago, not re-verified)
-0x8f3C...a1   1.2034 ETH   250.00 USDC
+sepolia head 11848656 (saved 7s ago, not re-verified)
+0x3D767Bf85779E2b550aB5Fcd7E3bE39FB77A5ce6   0.000710619962413892 ETH   226.00 USDC
 ```
 
 The user adds `http://127.0.0.1:8545` as a custom network in the wallet. Balances arrive through `eth_getBalance`, USDC through `eth_call(balanceOf)`, and sends through `eth_estimateGas`, `eth_feeHistory`, `eth_sendRawTransaction`, and `eth_getTransactionReceipt`.
@@ -41,22 +42,24 @@ The user adds `http://127.0.0.1:8545` as a custom network in the wallet. Balance
 `chibi run` in the binary:
 
 ```rust
-let (node, follower) = Node::start(&config).await?; // returns at a freshly verified head
+let (node, follower) = Node::start(node_config).await?; // returns at a freshly verified head
 tokio::select! {
-    r = follower.run() => r,
-    r = rpc::serve(node, config.rpc) => r,
-    _ = tokio::signal::ctrl_c() => Ok(()),
+    result = follower.run() => result.wrap_err("head follower stopped"),
+    result = rpc::serve(node, rpc_config) => result.wrap_err("JSON-RPC server stopped"),
+    result = tokio::signal::ctrl_c() => { result?; Ok(()) }
 }
 ```
 
-An offline test drives the production verifier against real in-process tries:
+An offline test drives the production verifier against real in-process tries (`crates/node/src/tests.rs`):
 
 ```rust
-let chain = Fixture::genesis([(alice, eth(2))]);
-let (node, mut follower) = Node::with_parts(Network::Sepolia.spec(), chain.peers(), chain.heads(), Disk::temp()?, &[alice]).await?;
-chain.mine(BlockWrites::balance(alice, eth(1)));
-follower.step().await?;
-assert_eq!(node.account(alice, BlockSel::Latest).await?.map(|a| a.balance), Some(eth(1)));
+let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+fixture.fault(Fault::WithholdBals);
+let hash = fixture.mine(BlockWrites::default().balance(ALICE, eth(4)));
+let head = fixture.world(|w| w.verified(hash)).num_hash();
+assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
+assert_eq!(balance(&node, ALICE).await, Some(eth(4)));
 ```
 
 ## Shape
@@ -65,7 +68,7 @@ assert_eq!(node.account(alice, BlockSel::Latest).await?.map(|a| a.balance), Some
 chibi/
   install.sh
   crates/core   chibi-core, no tokio: verify.rs state.rs exec.rs tx.rs
-  crates/node   chibi-node: node.rs follow.rs fetch.rs peers.rs devp2p.rs beacon.rs disk.rs network.rs fixture.rs
+  crates/node   chibi-node: node.rs follow.rs fetch.rs disk.rs peers.rs heads.rs devp2p.rs beacon.rs network.rs fixture.rs
   crates/cli    chibi (bin): main.rs (init, run, status), config.rs, rpc.rs
 ```
 
@@ -73,9 +76,9 @@ Dependencies point one way: `cli -> node -> core`. reth-network and helios compi
 
 ### Data
 
-`Store` is partial state at one verified block, its anchor. It holds `accounts: HashMap<Address, Entry>` with `Entry::Absent | Present { account, slots }`, code by hash, and a window of up to 256 verified headers ending at the anchor. Reads return `Result<_, Miss>`. A slot of an absent account is a known zero without a fetch. Slots live inside their account, so a slot without a proven account cannot be represented. Entries carry no block number of their own: the whole store moves together, so "valid at which block" has one answer. No storage root is held, because BALs would leave it stale. Each slot proof fetches its account proof at the same root, and both requests go out concurrently.
+`Store` is partial state at one verified block, its anchor. It holds `accounts: HashMap<Address, Entry>` with `Entry::Absent | Present { account, slots }`, code by hash, and a window of the anchor plus up to 256 verified ancestors, enough for `BLOCKHASH`. Reads return `Result<_, Miss>`. A slot of an absent account is a known zero without a fetch. Slots live inside their account, so a slot without a proven account cannot be represented. Entries carry no block number of their own: the whole store moves together, so "valid at which block" has one answer. No storage root is held, because BALs would leave it stale. Each slot proof fetches its account proof at the same root, and both requests go out concurrently.
 
-`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts plus every key the token seeding run read. Untracked keys fetched for dapp calls form a cache that a reanchor drops.
+`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts plus every key the token seeding run read. Untracked keys fetched for dapp calls form a cache that a reanchor drops. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
 
 ### Trust boundary
 
@@ -101,17 +104,17 @@ Values enter a `Store` only through `Store::insert(Proven)` at the anchor, `Stat
 | Follower advance and a request's merge | Serialized by the mutex. A merge for an old anchor is dropped. |
 | Two requests missing the same key | Both fetch. The second merge re-inserts an equal value. |
 | Reanchor and RPC reads | Reads use the old store until the swap. |
-| Submit and follower | The tx is written to the outbox and persisted before broadcast. Inclusion is found by a later step. |
+| Submit and follower | Both write the state file through `Disk`, always taking the disk lock before the state lock. Submit writes the outbox first and records the tx only if that write succeeded, then broadcasts. Inclusion is found by a later step. |
 
-The canonical `State` sits behind one `parking_lot::Mutex`, reachable only through `read` and `update`, which take synchronous closures. A closure cannot await, so no guard crosses an await. Exactly one `Follower` exists. It is not `Clone`, and it is the only code that advances, reanchors, or writes the state file. helios's block channel feeds a latest-only `watch`, so a slow follower never blocks the light client.
+The canonical `State` sits behind one `parking_lot::Mutex`, reachable only through `read` and `update`, which take synchronous closures. A closure cannot await, so no guard crosses an await. Exactly one `Follower` exists. It is not `Clone`, and it is the only code that advances or reanchors the store. helios's block channel feeds a latest-only `watch`, so a slow follower never blocks the light client.
 
 ### Persistence
 
-After each head the follower writes the state file to a temp path, fsyncs, and renames it. The file holds the tracked keys, a display snapshot of their values with its block number, and the outbox. `chibi status` prints the snapshot labeled with its block. On start the keys feed the first reanchor, and pending outbox transactions are re-broadcast. A crash loses at most one head of merged cache facts.
+The state file is `state.json` in the per-network data directory. Writes go to a temp path, then fsync, rename, and a directory fsync, on a blocking thread. The file holds the tracked keys, a display snapshot of their values with its block number, the outbox, and up to 16 remembered snap/2 peers. Only peers reached through outbound sessions are remembered, because an inbound session's address is an ephemeral port. `chibi status` prints the snapshot labeled with its block. On start the keys feed the first reanchor, and pending outbox transactions are re-broadcast. A crash loses at most one head of merged cache facts. A lock file lets one `chibi run` own the directory.
 
 ### Transactions and fees
 
-`rpc.rs` decodes EIP-2718 bytes and rejects blob transactions. `Node::submit` checks the chain id, recovers the sender, records the transaction, and broadcasts it to up to 8 peers with snap or eth sessions. While anything is pending, the follower fetches the body of every verified header it passes, including gap headers, verifies it against `transactions_root`, and matches hashes. On a match it verifies the block's receipts against `receipts_root` and stores the receipt. This works with and without BALs. `eth_getTransactionCount(pending)` adds pending outbox transactions to the anchor nonce. Fees use the verified base fee and tips sampled from verified bodies, fetched on demand and cached per block.
+`rpc.rs` decodes EIP-2718 bytes and rejects blob transactions. `Node::submit` checks the chain id, recovers the sender, persists the outbox, records the transaction, and broadcasts it to up to 8 connected peers. While anything is pending, the follower walks back from the anchor through every block it has not searched yet, fetches and verifies those bodies against `transactions_root`, and matches hashes. On a match it verifies the block's receipts against `receipts_root` and stores the receipt, including for blocks a reanchor skipped. Pending transactions whose nonce was used are pruned only after every passed block was searched, so a failed body fetch cannot drop a mined transaction. This works with and without BALs. `eth_getTransactionCount(pending)` adds pending outbox transactions to the anchor nonce. Fees use the verified base fee and tips sampled from verified bodies, fetched on demand and cached per block.
 
 ### Block tags and unsupported methods
 
@@ -119,7 +122,11 @@ After each head the follower writes the state file to a temp path, fsyncs, and r
 
 ### Networks
 
-`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, and tracked tokens. Sepolia is the default. Its beacon default is `https://ethereum-sepolia-beacon-api.publicnode.com`, which served the light-client endpoints on 2026-10-05. A beacon endpoint can stall chibi but cannot make it accept a wrong header. chibi sets helios's `checkpoint` only from a user override, so helios's saved checkpoint is used on later runs.
+`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, pinned snap/2 peers, and tracked tokens. Sepolia is the default. Its beacon default is `https://ethereum-sepolia-beacon-api.publicnode.com`, which served the light-client endpoints on 2026-10-05. A beacon endpoint can stall chibi but cannot make it accept a wrong header.
+
+The light-client checkpoint follows one precedence: a user override, else the checkpoint helios saved in the data directory (a file of exactly 32 bytes), else the newest checkpoint from the community checkpoint services, logged as a warning. chibi never passes helios's shipped default, which is older than helios's 14-day limit. helios saves only checkpoints newer than the one it started from, so after a first-run sync chibi saves that checkpoint itself in helios's file format.
+
+At start chibi dials the pinned and remembered snap/2 peers as static peers and waits, with a progress log every 30 seconds, until one snap/2 session is up. It does not give up, because discovery of these rare peers has taken from under a minute to several minutes.
 
 ### Inbound requests
 
@@ -127,11 +134,11 @@ The node installs an `EthRequestHandler` channel and answers every `IncomingEthR
 
 ### Errors
 
-Core has `VerifyError` (lying or garbled peer), `StateError` (stale proof, non-child block, unlinked ancestors), and `ExecError`. `NodeError` adds light-client failure, checkpoint expiry, `Unprovable` after three peers, `TooManyMissRounds`, `Unsupported`, and `StoreLocked`. `cli::rpc` holds the only mapping from errors to JSON-RPC codes.
+Core has `VerifyError` (lying or garbled peer), `StateError` (stale proof, non-child block, unlinked ancestors, full header window), `ExecError`, and `EstimateError`. `NodeError` adds light-client and devp2p failures, disk errors (including a data directory held by another process), `Unprovable` after three attempts, `TooManyMissRounds`, `Unsupported`, and `InvalidTransaction`. `cli::rpc` holds the only mapping from errors to JSON-RPC codes.
 
 ### RPC exposure
 
-The server binds to loopback. Cross-origin browser requests are allowed only from `chrome-extension://` and `moz-extension://` origins by default, so an ordinary website cannot read tracked balances. The allowlist is configurable.
+The server binds to loopback. A `Host` header filter admits only `localhost`, `127.0.0.1`, and `[::1]` by default, which blocks DNS rebinding. Cross-origin browser requests are allowed only from `chrome-extension://` and `moz-extension://` origins by default, so an ordinary website cannot read tracked balances. Both lists are configurable.
 
 ## Synthesis decision
 
@@ -168,10 +175,11 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 
 - Some wallets send state queries tagged `finalized`. Should those serve the anchor instead of an error?
 - Should the RPC fail closed when the anchor falls behind the light client because no snap peer is reachable?
-- Will Nethermind peers serve BALs over snap/2 after the fork, and will reth peers enable snap? Should the registry pin known snap/2 peers?
-- Before the first header is verified, the devp2p status uses a wall-clock fork id. The 2026-10-05 probe shows peers accept it.
+- Will Nethermind peers serve BALs over snap/2 after the fork, and will geth and reth peers enable snap/2? Today only Nethermind does on Sepolia, and the five pinned peers are a single point of slowness.
+- One failed tracked-key proof aborts a whole reanchor, which keeps the old head published until the next step. Is that acceptable with one or two snap/2 peers?
+- The first run trusts the community checkpoint services for weak subjectivity unless the user sets `checkpoint`. Should a release ship a recent checkpoint instead?
 - Does MetaMask's background page send an `Origin` header to a custom RPC? If it does not, the CORS allowlist never applies to it.
 
 ## Next implementation step
 
-Build `chibi-core::verify` and `State::{insert, advance, plan}` against `fixture`'s real tries, with tests for a present key, an absent key, a forged proof, a BAL update, and a missing BAL falling back to reanchor.
+After Sepolia's Glamsterdam fork on 2026-10-06 13:53:36 UTC, run `chibi run` and confirm heads log `Stepped::Extended` with BALs, then send a funded transaction from a wallet pointed at chibi and confirm its receipt.
