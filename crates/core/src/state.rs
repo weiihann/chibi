@@ -479,7 +479,8 @@ impl State {
         }
     }
 
-    /// Moves the anchor to its child and applies the child's BAL to held keys.
+    /// Moves the anchor to its child and applies the child's BAL to held keys. Located
+    /// transactions whose block is no longer on the held chain return to pending.
     ///
     /// All or nothing: the parent check runs before any mutation.
     pub fn advance(&mut self, block: VerifiedBlock) -> Result<(), StateError> {
@@ -500,7 +501,8 @@ impl State {
 
     /// Replaces the store with one anchored at `target` holding `facts`. Cached keys are
     /// dropped; code carries over because it is content-addressed. The header window carries
-    /// over when `target` is the anchor's child.
+    /// over when `target` is the anchor's child. Located transactions whose block is no
+    /// longer on the held chain return to pending.
     ///
     /// All or nothing: every fact's block is checked before the store is replaced.
     pub fn reanchor(&mut self, target: VerifiedHeader, facts: &[Proven]) -> Result<(), StateError> {
