@@ -201,6 +201,16 @@ impl Ask for Screens {
         let chosen = MultiSelect::new("Tokens to track", choices)
             .with_default(&defaults)
             .with_help_message("space ticks, enter confirms; ETH is always tracked")
+            .with_formatter(&|picked| {
+                if picked.is_empty() {
+                    return "none".to_owned();
+                }
+                picked
+                    .iter()
+                    .map(|choice| choice.value.0.symbol)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .prompt()?;
         Ok(chosen.into_iter().map(|choice| choice.0).collect())
     }
