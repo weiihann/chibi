@@ -53,7 +53,7 @@ impl Network {
                 network: self,
                 chain: Arc::clone(&SEPOLIA),
                 helios: helios_ethereum::config::networks::Network::Sepolia,
-                default_beacon: "https://ethereum-sepolia-beacon-api.publicnode.com",
+                default_beacon: "https://beacon.sepolia.ethpandaops.io",
                 boot_nodes: sepolia_nodes(),
                 snap_peers: parse_nodes(SEPOLIA_SNAP_PEERS),
                 tokens: SEPOLIA_TOKENS,

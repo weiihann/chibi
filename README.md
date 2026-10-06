@@ -18,7 +18,7 @@ The design and its tradeoffs are in [docs/DESIGN.md](docs/DESIGN.md). The decisi
 ## Requirements
 
 - Rust (the toolchain is pinned in `rust-toolchain.toml` and installed by rustup on first build).
-- Outbound access to devp2p peers (TCP and UDP) and to a beacon API endpoint. The Sepolia default is `https://ethereum-sepolia-beacon-api.publicnode.com`.
+- Outbound access to devp2p peers (TCP and UDP) and to a beacon API endpoint. The Sepolia default is `https://beacon.sepolia.ethpandaops.io`.
 
 ## Install and set up
 
