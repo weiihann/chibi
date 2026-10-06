@@ -29,7 +29,6 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-dirs.workspace = true
 eyre.workspace = true
 clap.workspace = true
 jsonrpsee.workspace = true

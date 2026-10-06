@@ -8,7 +8,7 @@ chibi is early software. It targets Sepolia first. Mainnet support exists in the
 
 - A sync-committee light client ([helios](https://github.com/a16z/helios)) vouches for execution block hashes. chibi fetches each header over devp2p and checks its hash.
 - Account and storage values come from single-key snap/2 range proofs, checked against the verified header's state root. A key chibi never fetched is never read as zero.
-- chibi stores only the keys you use: your watched accounts, the storage of the tokens you picked (balances plus anything a transfer checks, such as pause flags or fees), and whatever your dapps' calls touch.
+- chibi stores only the keys you use: your watched accounts, the storage of the tokens you picked (balances plus anything a transfer checks, such as pause flags or fees), any contracts and storage slots you list in the config, and whatever your dapps' calls touch.
 - After the Glamsterdam upgrade, each block's access list (EIP-7928) keeps those keys current. Before it, chibi proves the tracked keys again at every new head.
 - `eth_call` and `eth_estimateGas` run in a local EVM. A missing key is fetched with a proof and the call runs again.
 - Signed transactions go straight to devp2p peers. chibi finds them in verified block bodies and checks their receipts against the block's receipts root.
@@ -37,10 +37,20 @@ cd chibi
 3. Which tokens to track, as tick boxes. On Sepolia the choices are USDC, USDT, DAI, WETH, and LINK; mainnet adds WBTC. USDC is ticked by default. ETH is always tracked. Sepolia's USDC is Circle's own deployment. Sepolia's USDT and DAI are test tokens from Aave's Sepolia faucet, not tokens issued by Tether or Maker; anyone can mint them, so their balances carry no value.
 4. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
 
-It writes `config.toml` in your OS config directory (`~/Library/Application Support/chibi/` on macOS, `~/.config/chibi/` on Linux). In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:
+It writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is set to an absolute path, otherwise to `~/.config/chibi/`, on macOS and Linux alike. In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:
 
 ```sh
 chibi init --network sepolia --address 0xYourAddress --token USDC --token DAI --rpc-host 127.0.0.1 --rpc-port 8545
+```
+
+`--data-dir PATH` writes a `data_dir` into the config (see below).
+
+Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent:
+
+```sh
+chibi --config ~/chibi-test.toml init
+CHIBI_CONFIG=~/chibi-test.toml chibi run -b
+chibi status --config ~/chibi-test.toml
 ```
 
 ## Run
@@ -76,8 +86,25 @@ When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a
 | `cors_origins` | `chrome-extension://*`, `moz-extension://*` | Browser origins allowed to call the RPC |
 | `allowed_hosts` | `localhost`, `127.0.0.1`, `[::1]` | Accepted `Host` headers, which blocks DNS rebinding |
 | `p2p_port` | `0` (OS picks) | devp2p listen port |
+| `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
+| `contracts` | none | Contract accounts and storage slots to track, see below |
 
-Data (light-client checkpoint, devp2p key, remembered peers, the state file, and `chibi.log` for a background chibi) lives in the OS data directory under `chibi/<network>/`. One `chibi run` owns that directory at a time, and `chibi.lock` holds its process id.
+Data (light-client checkpoint, devp2p key, remembered peers, the state file, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
+
+### Tracking contracts and storage slots
+
+Each `[[contracts]]` table tracks a contract account (balance, nonce, and code) and, optionally, raw storage slots. chibi proves them at every new head, or keeps them current from block access lists, so `eth_getBalance`, `eth_getCode`, and `eth_getStorageAt` for them answer without a fetch. `chibi status` prints each slot's value at the saved head.
+
+```toml
+[[contracts]]
+address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+slots = ["0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3", "0x1"]
+
+[[contracts]]
+address = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"   # account only
+```
+
+A slot is the storage key exactly as `eth_getStorageAt` takes it: `0x` and up to 64 hex digits, so `0x1` is slot 1. It is not hashed again. For a mapping entry, derive the key with `cast index <key type> <key> <slot>`, for example `cast index address 0xYourAddress <balances slot>`. Entries with the same address are merged.
 
 ## JSON-RPC methods
 

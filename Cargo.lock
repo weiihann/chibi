@@ -1762,7 +1762,6 @@ dependencies = [
  "chibi-core",
  "chibi-node",
  "clap",
- "dirs",
  "eyre",
  "http 1.5.0",
  "inquire",

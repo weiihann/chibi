@@ -20,7 +20,10 @@ use chibi_core::wire::Transaction;
 use crate::disk::{Disk, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR};
 use crate::network::Token;
-use crate::node::{BlockSel, Follower, Node, NodeError, Stepped, Watchlist, read_snapshot};
+use crate::node::{
+    BlockSel, ContractSnapshot, Follower, Node, NodeError, Stepped, TrackedContract, Watchlist,
+    read_snapshot,
+};
 
 const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
 const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
@@ -73,6 +76,7 @@ async fn start_watching(
         &Watchlist {
             addresses: watch.to_vec(),
             tokens: tokens.to_vec(),
+            contracts: Vec::new(),
         },
     )
     .await
@@ -293,6 +297,69 @@ async fn token_seeding_tracks_proxy_keys_and_follows_bal_writes() {
     assert_eq!(
         node.status().snapshot.holdings[0].tokens,
         vec![("TKN".to_owned(), Some(U256::from(300)))]
+    );
+}
+
+#[tokio::test]
+async fn a_configured_contract_slot_is_tracked_from_start_and_follows_bal_writes() {
+    let (set, unset) = (U256::from(7), U256::from(8));
+    let fixture = Fixture::genesis([
+        (ALICE, WorldAccount::eoa(eth(2))),
+        (
+            IMPL,
+            WorldAccount::contract(mapping_reader_code()).with_slot(set, U256::from(42)),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let watch = Watchlist {
+        addresses: vec![ALICE],
+        tokens: Vec::new(),
+        contracts: vec![TrackedContract {
+            address: IMPL,
+            slots: vec![set, unset],
+        }],
+    };
+    let (node, mut follower) = Node::with_parts(
+        Fixture::spec(&[]),
+        fixture.peers(),
+        fixture.heads(),
+        Disk::open(dir.path()).unwrap(),
+        &watch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        node.tracked(),
+        BTreeSet::from([
+            Key::Account(ALICE),
+            Key::Account(IMPL),
+            Key::Slot(IMPL, set),
+            Key::Slot(IMPL, unset),
+        ])
+    );
+
+    let proofs = fixture.log().proofs;
+    let storage = |slot| node.storage(IMPL, slot, BlockSel::Latest);
+    assert_eq!(storage(set).await.unwrap(), U256::from(42));
+    assert_eq!(storage(unset).await.unwrap(), U256::ZERO);
+    assert_eq!(fixture.log().proofs, proofs);
+
+    fixture.mine(BlockWrites::default().slot(IMPL, set, U256::from(99)));
+    assert!(matches!(
+        follower.step().await.unwrap(),
+        Stepped::Extended(_)
+    ));
+    assert_eq!(storage(set).await.unwrap(), U256::from(99));
+    assert_eq!(fixture.log().proofs, proofs);
+
+    let expected = vec![ContractSnapshot {
+        address: IMPL,
+        slots: vec![(set, Some(U256::from(99))), (unset, Some(U256::ZERO))],
+    }];
+    assert_eq!(node.status().snapshot.contracts, expected);
+    assert_eq!(
+        read_snapshot(dir.path()).unwrap().unwrap().contracts,
+        expected
     );
 }
 

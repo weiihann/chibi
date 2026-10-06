@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         watch: Watchlist {
             addresses: vec![watched],
             tokens: network.spec().tokens.to_vec(),
+            contracts: Vec::new(),
         },
         ports: Ports {
             rlpx: 0,

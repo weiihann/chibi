@@ -98,6 +98,17 @@ pub struct Watchlist {
     pub addresses: Vec<Address>,
     /// Tokens whose balances are followed for every watched address.
     pub tokens: Vec<Token>,
+    /// Contract accounts and raw storage slots proven and kept current.
+    pub contracts: Vec<TrackedContract>,
+}
+
+/// A contract account tracked with some of its storage slots.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackedContract {
+    /// The account, tracked for balance, nonce, and code.
+    pub address: Address,
+    /// Storage keys as `eth_getStorageAt` takes them, not hashed.
+    pub slots: Vec<U256>,
 }
 
 /// Which block a request reads. Only verified heads chibi holds can be served.
@@ -213,6 +224,17 @@ pub struct Snapshot {
     pub saved_at: u64,
     /// One entry per watched address.
     pub holdings: Vec<Holding>,
+    /// One entry per tracked contract.
+    pub contracts: Vec<ContractSnapshot>,
+}
+
+/// A tracked contract's slot values at one block.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractSnapshot {
+    /// The contract.
+    pub address: Address,
+    /// Each tracked slot with its value, `None` if not yet proven.
+    pub slots: Vec<(U256, Option<U256>)>,
 }
 
 /// Live node status for `chibi status` and logs.
@@ -410,7 +432,21 @@ impl<P: Peers> Node<P> {
     ) -> Result<(Self, Follower<P>), NodeError> {
         let trusted = wait_latest(&mut heads).await?;
         let anchor = fetch::header(&peers, trusted).await?;
-        let tracked: Vec<Key> = watch.addresses.iter().copied().map(Key::Account).collect();
+        let tracked: Vec<Key> = watch
+            .addresses
+            .iter()
+            .copied()
+            .map(Key::Account)
+            .chain(watch.contracts.iter().flat_map(|contract| {
+                let address = contract.address;
+                std::iter::once(Key::Account(address)).chain(
+                    contract
+                        .slots
+                        .iter()
+                        .map(move |slot| Key::Slot(address, *slot)),
+                )
+            }))
+            .collect();
         let outbox = disk.read(|file| file.outbox().to_vec());
         let shared = Arc::new(Shared {
             env: ChainEnv::new(Arc::clone(&spec.chain)),
@@ -954,11 +990,25 @@ impl<P: Peers> Shared<P> {
                 }
             })
             .collect();
+        let contracts = self
+            .watch
+            .contracts
+            .iter()
+            .map(|contract| ContractSnapshot {
+                address: contract.address,
+                slots: contract
+                    .slots
+                    .iter()
+                    .map(|slot| (*slot, store.slot(contract.address, *slot).ok()))
+                    .collect(),
+            })
+            .collect();
         Snapshot {
             network: self.spec.network,
             block: store.anchor().num_hash(),
             saved_at: unix_now(),
             holdings,
+            contracts,
         }
     }
 

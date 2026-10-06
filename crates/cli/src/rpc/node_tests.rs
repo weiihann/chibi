@@ -47,6 +47,7 @@ async fn start(
         &Watchlist {
             addresses: watch.to_vec(),
             tokens: TOKENS.to_vec(),
+            contracts: Vec::new(),
         },
     )
     .await

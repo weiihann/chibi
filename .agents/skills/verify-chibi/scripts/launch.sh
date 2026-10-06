@@ -41,7 +41,7 @@ DIRTY=$(git -C "$repo" status --porcelain | wc -l | tr -d ' ')
 REPO=$repo
 EOF
 
-# dirs::config_dir and dirs::data_dir follow HOME on macOS and the XDG variables on Linux.
+# chibi reads its config from $XDG_CONFIG_HOME/chibi and its data from $XDG_DATA_HOME/chibi.
 export HOME="$run_dir/home"
 export XDG_CONFIG_HOME="$run_dir/home/.config"
 export XDG_DATA_HOME="$run_dir/home/.local/share"

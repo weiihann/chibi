@@ -23,7 +23,7 @@ RUN_DIR=$(.agents/skills/verify-chibi/scripts/launch.sh --port 8645 0x3d767bf857
 - Ready when `$RUN_DIR/chibi.log` contains `JSON-RPC on http://127.0.0.1:<port>`. The script waits up to `--timeout` seconds (default 900). Most of that is waiting for a snap/2 peer; the log prints `waiting for a snap/2 peer` every 30 s.
 - `--network mainnet` is accepted but untested and has no pinned snap/2 peers.
 - The addresses above are active Sepolia USDC holders. Use any address; at least one is required.
-- Each launch is isolated by run dir and port, so several can run side by side. Never drive a chibi you did not start: the user's own instance (default port 8545, data in `~/Library/Application Support/chibi`) is off limits.
+- Each launch is isolated by run dir and port, so several can run side by side. Never drive a chibi you did not start: the user's own instance (default port 8545, data in `~/.local/share/chibi`, or `~/Library/Application Support/chibi` from before the XDG switch) is off limits.
 
 ## Doctor
 

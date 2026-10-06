@@ -6,7 +6,7 @@ use std::io;
 use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, RpcHost, data_dir};
+use crate::config::{Config, RpcHost, process_env};
 use crate::rpc::{self, RpcConfig};
 
 /// The background chibi's log, in its data directory.
@@ -49,9 +49,6 @@ pub struct RunArgs {
     /// JSON-RPC port instead of the configured one.
     #[arg(long)]
     pub rpc_port: Option<NonZeroU16>,
-    /// Config file to read instead of the default location.
-    #[arg(long)]
-    pub config: Option<PathBuf>,
     /// Run in the background, logging to chibi.log in the data directory.
     #[arg(short = 'b', long)]
     pub background: bool,
@@ -82,11 +79,12 @@ pub fn load(
 }
 
 /// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`.
-pub fn run(args: &RunArgs, path: &Path) -> eyre::Result<()> {
+/// `path` is absolute; `config_flag` is the config the user named, repeated in hints.
+pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
     let config = load(path, args.network, args.rpc_host.clone(), args.rpc_port)?;
-    let data_dir = data_dir(config.network)?;
+    let data_dir = config.network_dir(config.network, process_env)?;
     if args.background {
-        return start_background(args, &config, &data_dir);
+        return start_background(args, &config, &data_dir, path, config_flag);
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -129,6 +127,7 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
         network = %node_config.network,
         watched = node_config.watch.addresses.len(),
         tokens = node_config.watch.tokens.len(),
+        contracts = node_config.watch.contracts.len(),
         data_dir = %node_config.data_dir.display(),
         "starting"
     );
@@ -163,12 +162,15 @@ async fn shutdown_signal() -> io::Result<&'static str> {
     }
 }
 
-/// The arguments for the detached child: the same `run` flags plus `--detached`.
-pub fn detached_args(args: &RunArgs) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec!["run".into(), "--detached".into()];
-    if let Some(config) = &args.config {
-        argv.extend(["--config".into(), config.clone().into_os_string()]);
-    }
+/// The arguments for the detached child: the config at its absolute `path`, so the child reads
+/// the same file whatever its working directory, and the same `run` flags plus `--detached`.
+pub fn detached_args(args: &RunArgs, path: &Path) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![
+        "--config".into(),
+        path.as_os_str().to_owned(),
+        "run".into(),
+        "--detached".into(),
+    ];
     if let Some(network) = args.network {
         argv.extend(["--network".into(), network.name().into()]);
     }
@@ -182,9 +184,9 @@ pub fn detached_args(args: &RunArgs) -> Vec<OsString> {
 }
 
 /// The `--config` and `--network` a `run` was given, for the `status` and `stop` it suggests.
-fn hint_flags(args: &RunArgs) -> String {
+fn hint_flags(args: &RunArgs, config_flag: Option<&Path>) -> String {
     let mut flags = String::new();
-    if let Some(path) = &args.config {
+    if let Some(path) = config_flag {
         flags.push_str(&format!(" --config {}", path.display()));
     }
     if let Some(network) = args.network {
@@ -193,8 +195,14 @@ fn hint_flags(args: &RunArgs) -> String {
     flags
 }
 
-fn start_background(args: &RunArgs, config: &Config, data_dir: &Path) -> eyre::Result<()> {
-    let flags = hint_flags(args);
+fn start_background(
+    args: &RunArgs,
+    config: &Config,
+    data_dir: &Path,
+    path: &Path,
+    config_flag: Option<&Path>,
+) -> eyre::Result<()> {
+    let flags = hint_flags(args, config_flag);
     if let Some(holder) = Disk::running(data_dir)? {
         bail!(
             "chibi is already running on {} (pid {}); stop it with `chibi stop{flags}`",
@@ -213,7 +221,7 @@ fn start_background(args: &RunArgs, config: &Config, data_dir: &Path) -> eyre::R
     let start = log.metadata()?.len();
     let exe = std::env::current_exe().wrap_err("cannot locate the chibi executable")?;
     let mut child = Command::new(exe)
-        .args(detached_args(args))
+        .args(detached_args(args, path))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -257,10 +265,9 @@ fn tail(text: &str, lines: usize) -> &str {
     &text[start..]
 }
 
-/// Sends SIGTERM to the chibi running on `network` and waits for it to release its data dir.
-pub fn stop(network: Network) -> eyre::Result<()> {
-    let dir = data_dir(network)?;
-    let Some(holder) = Disk::running(&dir)? else {
+/// Sends SIGTERM to the chibi running on `network` from `dir` and waits for it to release it.
+pub fn stop(network: Network, dir: &Path) -> eyre::Result<()> {
+    let Some(holder) = Disk::running(dir)? else {
         println!("chibi is not running on {network}");
         return Ok(());
     };
@@ -272,7 +279,7 @@ pub fn stop(network: Network) -> eyre::Result<()> {
     }
     println!("stopping chibi (pid {pid})...");
     let deadline = Instant::now() + STOP_TIMEOUT;
-    while Disk::running(&dir)?.is_some() {
+    while Disk::running(dir)?.is_some() {
         if Instant::now() >= deadline {
             bail!(
                 "chibi (pid {pid}) is still running after {} s; see {}",
@@ -288,6 +295,8 @@ pub fn stop(network: Network) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn strings(argv: Vec<OsString>) -> Vec<String> {
@@ -297,29 +306,32 @@ mod tests {
     }
 
     #[test]
-    fn detached_child_repeats_the_run_flags() {
+    fn detached_child_gets_the_absolute_config_and_repeats_the_run_flags() {
+        let path = Path::new("/cfg/chibi.toml");
         assert_eq!(
-            strings(detached_args(&RunArgs {
-                background: true,
-                ..RunArgs::default()
-            })),
-            ["run", "--detached"]
+            strings(detached_args(
+                &RunArgs {
+                    background: true,
+                    ..RunArgs::default()
+                },
+                path
+            )),
+            ["--config", "/cfg/chibi.toml", "run", "--detached"]
         );
         let args = RunArgs {
             network: Some(Network::Mainnet),
             rpc_host: Some("chibi.local".parse().unwrap()),
             rpc_port: NonZeroU16::new(8745),
-            config: Some(PathBuf::from("/cfg/chibi.toml")),
             background: true,
             detached: false,
         };
         assert_eq!(
-            strings(detached_args(&args)),
+            strings(detached_args(&args, path)),
             [
-                "run",
-                "--detached",
                 "--config",
                 "/cfg/chibi.toml",
+                "run",
+                "--detached",
                 "--network",
                 "mainnet",
                 "--rpc-host",
@@ -334,26 +346,20 @@ mod tests {
     fn detached_args_parse_back_to_the_same_run() {
         use clap::Parser;
 
-        #[derive(Parser)]
-        struct Wrapper {
-            #[command(subcommand)]
-            command: Sub,
-        }
-        #[derive(clap::Subcommand)]
-        enum Sub {
-            Run(RunArgs),
-        }
-
         let args = RunArgs {
             network: Some(Network::Sepolia),
             rpc_host: Some("::1".parse().unwrap()),
             rpc_port: NonZeroU16::new(9545),
-            config: None,
             background: true,
             detached: false,
         };
-        let argv = std::iter::once(OsString::from("chibi")).chain(detached_args(&args));
-        let Sub::Run(parsed) = Wrapper::try_parse_from(argv).unwrap().command;
+        let path = Path::new("/cfg/chibi.toml");
+        let argv = std::iter::once(OsString::from("chibi")).chain(detached_args(&args, path));
+        let cli = crate::Cli::try_parse_from(argv).unwrap();
+        assert_eq!(cli.config.as_deref(), Some(path));
+        let crate::Command::Run(parsed) = cli.command else {
+            panic!("detached args parse to a command other than run");
+        };
         assert!(parsed.detached && !parsed.background);
         assert_eq!(parsed.network, args.network);
         assert_eq!(parsed.rpc_host, args.rpc_host);
@@ -394,15 +400,14 @@ mod tests {
 
     #[test]
     fn hints_repeat_the_config_and_network_flags() {
-        assert_eq!(hint_flags(&RunArgs::default()), "");
+        assert_eq!(hint_flags(&RunArgs::default(), None), "");
         let args = RunArgs {
             network: Some(Network::Mainnet),
-            config: Some(PathBuf::from("/cfg/chibi.toml")),
             background: true,
             ..RunArgs::default()
         };
         assert_eq!(
-            hint_flags(&args),
+            hint_flags(&args, Some(Path::new("/cfg/chibi.toml"))),
             " --config /cfg/chibi.toml --network mainnet"
         );
     }

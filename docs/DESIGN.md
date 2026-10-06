@@ -23,7 +23,7 @@ $ ./install.sh
 Network [sepolia]:
 Watch-only address (blank to finish): 0x3D76...5ce6
 Watch-only address (blank to finish):
-wrote ~/Library/Application Support/chibi/config.toml (sepolia, 1 address, tracking USDC)
+wrote ~/.config/chibi/config.toml (sepolia, 1 address, tracking USDC)
 
 $ chibi run
 INFO chibi::node: light client synced network=sepolia
@@ -78,7 +78,7 @@ Dependencies point one way: `cli -> node -> core`. reth-network and helios compi
 
 `Store` is partial state at one verified block, its anchor. It holds `accounts: HashMap<Address, Entry>` with `Entry::Absent | Present { account, slots }`, code by hash, and a window of the anchor plus up to 256 verified ancestors, enough for `BLOCKHASH`. Reads return `Result<_, Miss>`. A slot of an absent account is a known zero without a fetch. Slots live inside their account, so a slot without a proven account cannot be represented. Entries carry no block number of their own: the whole store moves together, so "valid at which block" has one answer. No storage root is held, because BALs would leave it stale. Each slot proof fetches its account proof at the same root, and both requests go out concurrently.
 
-`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts plus every key the token seeding runs read. Seeding runs two calls per watched address and selected token: `balanceOf(holder)` and a simulated `transfer(holder, 0)` from the holder. Together they cover proxy slots, pause flags, fee parameters, blacklist entries, and the holder's balance, so a send only has to fetch the recipient's slot. Recipient and allowance slots depend on the transaction and stay fetch-on-miss. Untracked keys fetched for dapp calls form a cache that a reanchor drops. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
+`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts, each configured `[[contracts]]` account with its listed raw storage slots, plus every key the token seeding runs read. Seeding runs two calls per watched address and selected token: `balanceOf(holder)` and a simulated `transfer(holder, 0)` from the holder. Together they cover proxy slots, pause flags, fee parameters, blacklist entries, and the holder's balance, so a send only has to fetch the recipient's slot. Recipient and allowance slots depend on the transaction and stay fetch-on-miss. Untracked keys fetched for dapp calls form a cache that a reanchor drops. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
 
 ### Trust boundary
 
@@ -169,7 +169,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - A redb ledger as the shared state. It gives MVCC and atomic commits, but adds a dependency and a schema, and its read transactions would be held across awaits.
 - revm's `WrapDatabaseAsync`. It puts awaits inside the EVM, needs fibers and a multi-thread runtime, and costs one serial round trip per miss.
 - Per-entry block numbers. Every read would need a freshness check, and one run could mix entries of different ages.
-- A per-token storage-layout table, or asking users for storage slot keys. Running `balanceOf` and a self-transfer and tracking the keys they read covers proxies, pause flags, fees, and nonstandard layouts without per-token code.
+- A per-token storage-layout table, or asking users for storage slot keys. Running `balanceOf` and a self-transfer and tracking the keys they read covers proxies, pause flags, fees, and nonstandard layouts without per-token code. Raw slot keys stay available as an opt-in in `config.toml` (`[[contracts]]`) for contracts outside the token registry; `chibi init` never asks for them.
 
 ## Open questions and risks
 

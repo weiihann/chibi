@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::TcpStream;
 use std::num::NonZeroU16;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -40,6 +40,14 @@ pub struct InitArgs {
     /// JSON-RPC port.
     #[arg(long)]
     pub rpc_port: Option<NonZeroU16>,
+    /// Directory to keep per-network data in instead of $XDG_DATA_HOME/chibi.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    pub data_dir: Option<PathBuf>,
+}
+
+/// `text` as an absolute path, resolved against the working directory.
+fn absolute_path(text: &str) -> Result<PathBuf, String> {
+    std::path::absolute(text).map_err(|err| format!("cannot resolve {text:?}: {err}"))
 }
 
 /// Why `chibi init` wrote nothing.
@@ -136,6 +144,7 @@ fn collect<A: Ask>(ask: &mut A, args: InitArgs, path: &Path) -> Result<Option<Co
     config.tokens = tokens;
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
+    config.data_dir = args.data_dir;
     Ok(Some(config))
 }
 
@@ -751,6 +760,41 @@ mod tests {
     #[test]
     fn flag_addresses_are_deduplicated_in_order() {
         assert_eq!(unique(vec![BOB, ALICE, BOB, ALICE]), vec![BOB, ALICE]);
+    }
+
+    #[test]
+    fn data_dir_is_written_only_when_given_and_made_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let answered = |data_dir: Option<PathBuf>| {
+            let mut lines = Lines {
+                input: Cursor::new(&b""[..]),
+                output: Vec::new(),
+            };
+            let args = InitArgs {
+                network: Some(Network::Sepolia),
+                addresses: vec![ALICE],
+                tokens: vec!["USDC".to_owned()],
+                rpc_host: Some(RpcHost::default()),
+                rpc_port: Some(port(8545)),
+                data_dir,
+            };
+            collect(&mut lines, args, &path).unwrap().unwrap()
+        };
+
+        let plain = answered(None);
+        plain.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("data_dir"), "{text}");
+        std::fs::remove_file(&path).unwrap();
+
+        let custom = answered(Some(dir.path().join("data")));
+        assert_eq!(custom.data_dir, Some(dir.path().join("data")));
+        custom.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), custom);
+
+        let relative = absolute_path("data").unwrap();
+        assert!(relative.is_absolute() && relative.ends_with("data"));
     }
 
     #[test]

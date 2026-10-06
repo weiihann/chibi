@@ -1,5 +1,6 @@
 //! `config.toml`: parsed into typed values at load, so everything downstream trusts it.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -7,9 +8,9 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use chibi_node::devp2p::Ports;
-use chibi_node::{Network, NodeConfig, Token, Watchlist};
+use chibi_node::{Network, NodeConfig, Token, TrackedContract, Watchlist};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
@@ -57,6 +58,15 @@ pub struct Config {
     /// devp2p listen port for both RLPx and discovery; the OS picks one when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_port: Option<u16>,
+    /// Absolute root of the per-network data directories; the user data directory when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
+    /// Contract accounts tracked with raw storage slots, one entry per address.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_contracts"
+    )]
+    pub contracts: Vec<TrackedContract>,
 }
 
 /// `config.toml` as written, before token symbols are resolved against the network.
@@ -83,14 +93,31 @@ struct ConfigFile {
     allowed_hosts: Vec<AllowedHost>,
     #[serde(default)]
     p2p_port: Option<u16>,
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
+    #[serde(default)]
+    contracts: Vec<ContractEntry>,
+}
+
+/// One `[[contracts]]` table as written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContractEntry {
+    address: String,
+    #[serde(default)]
+    slots: Vec<String>,
 }
 
 impl TryFrom<ConfigFile> for Config {
-    type Error = UnknownToken;
+    type Error = InvalidConfig;
 
-    fn try_from(file: ConfigFile) -> Result<Self, UnknownToken> {
+    fn try_from(file: ConfigFile) -> Result<Self, InvalidConfig> {
+        if let Some(dir) = file.data_dir.as_ref().filter(|dir| !dir.is_absolute()) {
+            return Err(InvalidConfig::RelativeDataDir(dir.clone()));
+        }
         Ok(Self {
             tokens: resolve_tokens(file.network, &file.tokens)?,
+            contracts: parse_contracts(&file.contracts)?,
             network: file.network,
             addresses: file.addresses,
             beacon_url: file.beacon_url,
@@ -100,6 +127,7 @@ impl TryFrom<ConfigFile> for Config {
             cors_origins: file.cors_origins,
             allowed_hosts: file.allowed_hosts,
             p2p_port: file.p2p_port,
+            data_dir: file.data_dir,
         })
     }
 }
@@ -118,6 +146,8 @@ impl Config {
             cors_origins: default_cors_origins(),
             allowed_hosts: AllowedHost::loopback(),
             p2p_port: None,
+            data_dir: None,
+            contracts: Vec::new(),
         }
     }
 
@@ -165,6 +195,26 @@ impl Config {
         Ok(())
     }
 
+    /// The root of the per-network data directories: `data_dir`, else the user data directory.
+    pub fn data_root(
+        &self,
+        env: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<PathBuf, ConfigError> {
+        match &self.data_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => default_data_root(env),
+        }
+    }
+
+    /// The data directory of `network` under [`Config::data_root`].
+    pub fn network_dir(
+        &self,
+        network: Network,
+        env: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<PathBuf, ConfigError> {
+        Ok(self.data_root(env)?.join(network.name()))
+    }
+
     /// The node settings, with state kept under `data_dir`.
     pub fn node_config(&self, data_dir: PathBuf) -> NodeConfig {
         let port = self.p2p_port.unwrap_or(0);
@@ -176,6 +226,7 @@ impl Config {
             watch: Watchlist {
                 addresses: self.addresses.clone(),
                 tokens: self.tokens.clone(),
+                contracts: self.contracts.clone(),
             },
             ports: Ports {
                 rlpx: port,
@@ -352,6 +403,88 @@ pub struct UnknownToken {
     pub symbol: String,
 }
 
+/// Why a config file's values were rejected after parsing.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidConfig {
+    /// A token symbol not in the network's registry.
+    #[error(transparent)]
+    Token(#[from] UnknownToken),
+    /// A malformed `[[contracts]]` entry.
+    #[error(transparent)]
+    Contract(#[from] InvalidContract),
+    /// `data_dir` would depend on the directory chibi is started from.
+    #[error("data_dir {} is not an absolute path", .0.display())]
+    RelativeDataDir(PathBuf),
+}
+
+/// A `[[contracts]]` entry that names no valid address or slot.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidContract {
+    /// The address is malformed or fails its checksum.
+    #[error("contracts[{index}]: {source}")]
+    Address {
+        /// Position of the entry in the file.
+        index: usize,
+        /// What was wrong with the address.
+        source: AddressError,
+    },
+    /// A slot is not hex or longer than 32 bytes.
+    #[error(
+        "contracts[{index}] ({address}): {slot:?} is not a storage slot (expected 0x followed by 1 to 64 hex digits)"
+    )]
+    Slot {
+        /// Position of the entry in the file.
+        index: usize,
+        /// The entry's address.
+        address: Address,
+        /// The slot as written.
+        slot: String,
+    },
+}
+
+/// One tracked contract per address, in first-seen order, with its slots deduplicated in order.
+fn parse_contracts(entries: &[ContractEntry]) -> Result<Vec<TrackedContract>, InvalidContract> {
+    let mut contracts: Vec<TrackedContract> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let address = parse_address(&entry.address)
+            .map_err(|source| InvalidContract::Address { index, source })?;
+        let slots = entry
+            .slots
+            .iter()
+            .map(|text| {
+                parse_slot(text).ok_or_else(|| InvalidContract::Slot {
+                    index,
+                    address,
+                    slot: text.clone(),
+                })
+            })
+            .collect::<Result<Vec<U256>, _>>()?;
+        if !contracts.iter().any(|contract| contract.address == address) {
+            contracts.push(TrackedContract {
+                address,
+                slots: Vec::new(),
+            });
+        }
+        if let Some(contract) = contracts.iter_mut().find(|c| c.address == address) {
+            for slot in slots {
+                if !contract.slots.contains(&slot) {
+                    contract.slots.push(slot);
+                }
+            }
+        }
+    }
+    Ok(contracts)
+}
+
+/// A storage key as `eth_getStorageAt` takes it: `0x` and up to 64 hex digits, not hashed.
+fn parse_slot(text: &str) -> Option<U256> {
+    let hex = text.trim().strip_prefix("0x")?;
+    if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    U256::from_str_radix(hex, 16).ok()
+}
+
 fn known_symbols(network: &Network) -> String {
     let spec = network.spec();
     let symbols: Vec<&str> = spec.tokens.iter().map(|token| token.symbol).collect();
@@ -387,18 +520,34 @@ pub fn default_tokens(network: Network) -> Vec<Token> {
         .collect()
 }
 
-/// `config.toml` in the user's config directory.
-pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-    dirs::config_dir()
+/// Reads one variable from the process environment, for the path functions below.
+pub fn process_env(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
+
+/// `chibi/config.toml` under `$XDG_CONFIG_HOME`, else under `$HOME/.config`.
+pub fn default_config_path(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, ConfigError> {
+    xdg_dir(&env, "XDG_CONFIG_HOME", ".config")
         .map(|dir| dir.join("chibi").join("config.toml"))
         .ok_or(ConfigError::NoConfigDir)
 }
 
-/// The per-network data directory in the user's data directory.
-pub fn data_dir(network: Network) -> Result<PathBuf, ConfigError> {
-    dirs::data_dir()
-        .map(|dir| dir.join("chibi").join(network.name()))
+/// `chibi` under `$XDG_DATA_HOME`, else under `$HOME/.local/share`.
+pub fn default_data_root(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, ConfigError> {
+    xdg_dir(&env, "XDG_DATA_HOME", ".local/share")
+        .map(|dir| dir.join("chibi"))
         .ok_or(ConfigError::NoDataDir)
+}
+
+/// `$var` when it holds an absolute path, else `$HOME/fallback`. The XDG base directory spec
+/// says relative values are invalid and must be ignored, which also covers empty ones.
+fn xdg_dir(env: &impl Fn(&str) -> Option<OsString>, var: &str, fallback: &str) -> Option<PathBuf> {
+    let absolute = |key: &str| {
+        env(key)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    absolute(var).or_else(|| absolute("HOME").map(|home| home.join(fallback)))
 }
 
 /// Parses a `0x`-prefixed address. Mixed-case input must carry a valid EIP-55 checksum.
@@ -432,11 +581,15 @@ pub enum AddressError {
 /// Why the config could not be located, read, or written.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The platform has no user config directory.
-    #[error("no user config directory on this platform; pass --config")]
+    /// Neither the XDG variable nor HOME gives a config directory.
+    #[error(
+        "cannot locate the config directory: neither XDG_CONFIG_HOME nor HOME is an absolute path; pass --config"
+    )]
     NoConfigDir,
-    /// The platform has no user data directory.
-    #[error("no user data directory on this platform")]
+    /// Neither the XDG variable nor HOME gives a data directory.
+    #[error(
+        "cannot locate the data directory: neither XDG_DATA_HOME nor HOME is an absolute path; set data_dir in the config"
+    )]
     NoDataDir,
     /// No config file exists yet.
     #[error("no config at {}; run `chibi init` first", .0.display())]
@@ -508,6 +661,28 @@ fn serialize_tokens<S: Serializer>(tokens: &[Token], serializer: S) -> Result<S:
     serializer.collect_seq(tokens.iter().map(|token| token.symbol))
 }
 
+fn serialize_contracts<S: Serializer>(
+    contracts: &[TrackedContract],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Entry {
+        address: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        slots: Vec<String>,
+    }
+    serializer.collect_seq(contracts.iter().map(|contract| {
+        Entry {
+            address: contract.address.to_checksum(None),
+            slots: contract
+                .slots
+                .iter()
+                .map(|slot| format!("{slot:#x}"))
+                .collect(),
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv6Addr;
@@ -517,6 +692,7 @@ mod tests {
     use super::*;
 
     const ALICE: Address = address!("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063");
+    const USDC: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 
     fn token(network: Network, symbol: &str) -> Token {
         network.spec().token(symbol).unwrap()
@@ -566,6 +742,11 @@ mod tests {
             cors_origins = ["https://app.example", "chrome-extension://abc*"]
             allowed_hosts = ["localhost", "chibi.local:9545"]
             p2p_port = 30303
+            data_dir = "/srv/chibi"
+
+            [[contracts]]
+            address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            slots = ["0x1"]
             "#,
         )
         .unwrap();
@@ -591,6 +772,11 @@ mod tests {
                     AllowedHost::try_from("chibi.local:9545".to_owned()).unwrap(),
                 ],
                 p2p_port: Some(30303),
+                data_dir: Some(PathBuf::from("/srv/chibi")),
+                contracts: vec![TrackedContract {
+                    address: USDC,
+                    slots: vec![U256::from(1)],
+                }],
             }
         );
         let node = config.node_config(PathBuf::from("/data"));
@@ -603,6 +789,7 @@ mod tests {
         );
         assert_eq!(node.watch.addresses, vec![ALICE]);
         assert_eq!(node.watch.tokens, config.tokens);
+        assert_eq!(node.watch.contracts, config.contracts);
     }
 
     #[test]
@@ -814,6 +1001,17 @@ mod tests {
             .cors_origins
             .push(OriginPattern::Exact("https://app.example".to_owned()));
         config.p2p_port = Some(30304);
+        config.data_dir = Some(PathBuf::from("/srv/chibi"));
+        config.contracts = vec![
+            TrackedContract {
+                address: USDC,
+                slots: vec![U256::from(1), U256::MAX],
+            },
+            TrackedContract {
+                address: ALICE,
+                slots: Vec::new(),
+            },
+        ];
         config.tokens = resolve_tokens(Network::Mainnet, &["dai", "WBTC"]).unwrap();
         config.rpc_host = "::1".parse().unwrap();
         config.rpc_port = port(9545);
@@ -821,6 +1019,8 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(r#"tokens = ["DAI", "WBTC"]"#), "{text}");
         assert!(text.contains(r#"rpc_host = "::1""#), "{text}");
+        assert!(text.contains("[[contracts]]"), "{text}");
+        assert!(text.contains(r#"slots = ["0x1", "0xffff"#), "{text}");
         assert_eq!(Config::load(&path).unwrap(), config);
     }
 
@@ -830,5 +1030,194 @@ mod tests {
         let error = Config::load(&dir.path().join("config.toml")).unwrap_err();
         assert!(matches!(error, ConfigError::Missing(_)), "{error}");
         assert!(error.to_string().contains("chibi init"));
+    }
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn paths_follow_xdg_variables_when_absolute() {
+        let vars = [
+            ("HOME", "/home/u"),
+            ("XDG_CONFIG_HOME", "/xdg/config"),
+            ("XDG_DATA_HOME", "/xdg/data"),
+        ];
+        assert_eq!(
+            default_config_path(env(&vars)).unwrap(),
+            PathBuf::from("/xdg/config/chibi/config.toml")
+        );
+        assert_eq!(
+            default_data_root(env(&vars)).unwrap(),
+            PathBuf::from("/xdg/data/chibi")
+        );
+    }
+
+    #[test]
+    fn paths_fall_back_to_home_when_xdg_is_unset_empty_or_relative() {
+        for xdg in [None, Some(""), Some("relative/dir")] {
+            let mut vars = vec![("HOME", "/home/u")];
+            if let Some(value) = xdg {
+                vars.extend([("XDG_CONFIG_HOME", value), ("XDG_DATA_HOME", value)]);
+            }
+            assert_eq!(
+                default_config_path(env(&vars)).unwrap(),
+                PathBuf::from("/home/u/.config/chibi/config.toml"),
+                "{xdg:?}"
+            );
+            assert_eq!(
+                default_data_root(env(&vars)).unwrap(),
+                PathBuf::from("/home/u/.local/share/chibi"),
+                "{xdg:?}"
+            );
+        }
+        assert!(matches!(
+            default_config_path(env(&[("HOME", "")])),
+            Err(ConfigError::NoConfigDir)
+        ));
+        assert!(matches!(
+            default_data_root(env(&[])),
+            Err(ConfigError::NoDataDir)
+        ));
+    }
+
+    #[test]
+    fn data_dir_replaces_the_data_root_and_keeps_the_network_subdir() {
+        let vars = [("HOME", "/home/u")];
+        let mut config = Config::new(Network::Sepolia, vec![ALICE]);
+        assert_eq!(
+            config.network_dir(Network::Sepolia, env(&vars)).unwrap(),
+            PathBuf::from("/home/u/.local/share/chibi/sepolia")
+        );
+        config.data_dir = Some(PathBuf::from("/srv/chibi"));
+        assert_eq!(
+            config.data_root(env(&[])).unwrap(),
+            PathBuf::from("/srv/chibi")
+        );
+        assert_eq!(
+            config.network_dir(Network::Mainnet, env(&[])).unwrap(),
+            PathBuf::from("/srv/chibi/mainnet")
+        );
+    }
+
+    #[test]
+    fn relative_data_dir_is_rejected() {
+        let error = Config::parse(r#"data_dir = "data""#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("data_dir data is not an absolute path"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn contracts_parse_with_and_without_slots() {
+        let config = Config::parse(
+            r#"
+            [[contracts]]
+            address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            slots = ["0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3", "0x1"]
+
+            [[contracts]]
+            address = "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"
+            "#,
+        )
+        .unwrap();
+        let mapping = U256::from_str_radix(
+            "7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3",
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            config.contracts,
+            vec![
+                TrackedContract {
+                    address: USDC,
+                    slots: vec![mapping, U256::from(1)],
+                },
+                TrackedContract {
+                    address: ALICE,
+                    slots: Vec::new(),
+                },
+            ]
+        );
+        assert!(Config::parse("").unwrap().contracts.is_empty());
+    }
+
+    #[test]
+    fn duplicate_contracts_merge_and_slots_dedupe() {
+        let config = Config::parse(
+            r#"
+            [[contracts]]
+            address = "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238"
+            slots = ["0x1", "0x01", "0x2"]
+
+            [[contracts]]
+            address = "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"
+
+            [[contracts]]
+            address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            slots = ["0x3", "0x0000000000000000000000000000000000000000000000000000000000000002"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.contracts,
+            vec![
+                TrackedContract {
+                    address: USDC,
+                    slots: vec![U256::from(1), U256::from(2), U256::from(3)],
+                },
+                TrackedContract {
+                    address: ALICE,
+                    slots: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bad_contract_entries_are_rejected_naming_the_entry() {
+        let entry = |address: &str, slot: &str| {
+            format!(
+                "[[contracts]]\naddress = \"{USDC}\"\n\n[[contracts]]\naddress = {address:?}\nslots = [{slot:?}]\n"
+            )
+        };
+        let error = |text: String| Config::parse(&text).unwrap_err().to_string();
+
+        let bad_address = error(entry("0x1234", "0x1"));
+        assert!(
+            bad_address.contains("contracts[1]: \"0x1234\" is not an address"),
+            "{bad_address}"
+        );
+        let bad_checksum = error(entry("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7239", "0x1"));
+        assert!(
+            bad_checksum.contains("contracts[1]: ") && bad_checksum.contains("invalid checksum"),
+            "{bad_checksum}"
+        );
+
+        let too_long = format!("0x1{}", "0".repeat(64));
+        for slot in ["0xzz", "1", "0x", "", too_long.as_str()] {
+            let message = error(entry(&ALICE.to_string(), slot));
+            assert!(
+                message.contains(&format!(
+                    "contracts[1] ({ALICE}): {slot:?} is not a storage slot"
+                )),
+                "{slot}: {message}"
+            );
+        }
+        assert!(Config::parse("[[contracts]]\nslots = [\"0x1\"]\n").is_err());
+        assert!(
+            Config::parse(&format!(
+                "[[contracts]]\naddress = \"{USDC}\"\nslot = [\"0x1\"]\n"
+            ))
+            .is_err(),
+            "unknown keys are rejected"
+        );
     }
 }
