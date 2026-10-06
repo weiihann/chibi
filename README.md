@@ -34,7 +34,7 @@ cd chibi
 
 1. The network (Sepolia by default).
 2. Watch-only addresses. Paste as many as you like and press Enter on an empty line to finish.
-3. Which tokens to track, as tick boxes. On Sepolia the choices are USDC, USDT, DAI, WETH, and LINK; mainnet adds WBTC. USDC is ticked by default. ETH is always tracked. Sepolia's USDT and DAI are Aave's test tokens, because Tether and Maker have no Sepolia deployments.
+3. Which tokens to track, as tick boxes. On Sepolia the choices are USDC, USDT, DAI, WETH, and LINK; mainnet adds WBTC. USDC is ticked by default. ETH is always tracked. Sepolia's USDC is Circle's own deployment. Sepolia's USDT and DAI are test tokens from Aave's Sepolia faucet, not tokens issued by Tether or Maker; anyone can mint them, so their balances carry no value.
 4. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
 
 It writes `config.toml` in your OS config directory (`~/Library/Application Support/chibi/` on macOS, `~/.config/chibi/` on Linux). In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:

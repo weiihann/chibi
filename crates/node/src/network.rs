@@ -179,13 +179,13 @@ const SEPOLIA_TOKENS: &[Token] = &[
     },
     Token {
         symbol: "USDT",
-        name: "Tether USD (Aave test token; Tether has no Sepolia deployment)",
+        name: "Tether USD (Aave faucet test token, not issued by Tether)",
         address: address!("0xaA8E23Fb1079EA71e0a56F48a2aA51851D8433D0"),
         decimals: 6,
     },
     Token {
         symbol: "DAI",
-        name: "Dai (Aave test token; Maker has no Sepolia deployment)",
+        name: "Dai (Aave faucet test token, not issued by Maker)",
         address: address!("0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357"),
         decimals: 18,
     },
