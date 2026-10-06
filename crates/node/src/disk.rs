@@ -481,6 +481,43 @@ mod tests {
     }
 
     #[test]
+    fn a_state_file_from_before_contracts_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = B256::repeat_byte(1);
+        let json = format!(
+            r#"{{
+  "snapshot": {{
+    "network": "sepolia",
+    "block": {{ "number": 11849838, "hash": "{hash}" }},
+    "saved_at": 1759700000,
+    "holdings": [
+      {{
+        "address": "0x8c03000000000000000000000000000000062ee0",
+        "balance": "0x2386f26fc10000",
+        "nonce": 4,
+        "tokens": [["USDC", "0xe4e1c0"], ["WETH", null]]
+      }}
+    ]
+  }},
+  "outbox": [],
+  "peers": []
+}}"#
+        );
+        fs::write(dir.path().join(STATE_FILE), json).unwrap();
+        let snapshot = read_state(dir.path()).unwrap().unwrap().snapshot.unwrap();
+        assert_eq!(snapshot.block.number, 11_849_838);
+        assert_eq!(snapshot.holdings[0].nonce, Some(4));
+        assert_eq!(
+            snapshot.holdings[0].tokens[0],
+            (
+                "USDC".to_owned(),
+                Some(alloy_primitives::U256::from(15_000_000u64))
+            )
+        );
+        assert!(snapshot.contracts.is_empty());
+    }
+
+    #[test]
     fn remembered_peers_merge_newest_first_dedupe_by_id_and_cap() {
         let mut file = StateFile::default();
         file.remember_peers(&[record(1, 1), record(2, 2)]);

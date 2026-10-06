@@ -19,7 +19,7 @@ fi
 
 if [ -d "$run_dir/home" ]; then
     # chibi status reads the saved snapshot without a running node; keep that last view.
-    env HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" \
+    env -u CHIBI_CONFIG HOME="$run_dir/home" XDG_CONFIG_HOME="$run_dir/home/.config" \
         XDG_DATA_HOME="$run_dir/home/.local/share" \
         "$run_dir/bin/chibi" status >"$run_dir/evidence/status-after-stop.txt" 2>&1 || true
 fi

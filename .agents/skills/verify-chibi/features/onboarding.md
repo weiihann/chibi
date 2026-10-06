@@ -20,7 +20,7 @@ A new user runs `./install.sh`, which installs the `chibi` binary and runs `chib
 
 Preconditions:
 
-- A scratch HOME: `S=$(mktemp -d /tmp/chibi-onboard.XXXX); mkdir -p "$S/evidence"`. `E="env HOME=$S XDG_CONFIG_HOME=$S/.config XDG_DATA_HOME=$S/.local/share"`.
+- A scratch HOME: `S=$(mktemp -d /tmp/chibi-onboard.XXXX); mkdir -p "$S/evidence"`. `E="env -u CHIBI_CONFIG HOME=$S XDG_CONFIG_HOME=$S/.config XDG_DATA_HOME=$S/.local/share"`.
 - A free port for the run, for example 8747: `lsof -nP -iTCP:8747 -sTCP:LISTEN` prints nothing.
 
 - **Install.** Run `tmux new-session -d -s chibi-onboard -x 160 -y 40 "$E RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo CARGO_INSTALL_ROOT=$S/install CARGO_TARGET_DIR=$PWD/target ./install.sh 2>&1 | tee $S/evidence/install.txt; sleep 600"`. Poll `tmux capture-pane -p -t chibi-onboard` until it shows `? Network`.
@@ -40,7 +40,7 @@ Preconditions:
 
 - The menus need a real terminal. Driving `install.sh` or `chibi init` through a pipe gives the plain prompts instead (`Network [sepolia]:`, `Tokens to track, comma-separated or none [USDC]:`, and so on), which is the `onboard-init-plain` path, not `onboard-init-menu`.
 - In the address prompt, a rejected line stays in the input box. Clear it with `BSpace` before typing the next address.
-- The config lives under `$XDG_CONFIG_HOME/chibi/` and the data under `$XDG_DATA_HOME/chibi/` on macOS and Linux alike; with those unset, under `$HOME/.config` and `$HOME/.local/share`. Override all three to isolate a run.
+- The config lives under `$XDG_CONFIG_HOME/chibi/` and the data under `$XDG_DATA_HOME/chibi/` on macOS and Linux alike; with those unset, under `$HOME/.config` and `$HOME/.local/share`. `CHIBI_CONFIG` overrides the config path, so it must be unset. Override HOME and both XDG variables and unset `CHIBI_CONFIG` to isolate a run.
 - Overriding HOME without `RUSTUP_HOME` and `CARGO_HOME` makes cargo look for a toolchain in the scratch directory and fail.
 - `chibi status` shows the URL from the config file. A `run` started with `--rpc-host` or `--rpc-port` overrides is not reflected there.
 - `chibi run -b`, `chibi stop`, and `chibi status` find the node through the config's data dir. Pass the same `--network` and `--config` (or `CHIBI_CONFIG`) to all three commands.

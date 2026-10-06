@@ -43,9 +43,9 @@ It writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is s
 chibi init --network sepolia --address 0xYourAddress --token USDC --token DAI --rpc-host 127.0.0.1 --rpc-port 8545
 ```
 
-`--data-dir PATH` writes a `data_dir` into the config (see below).
+`--data-dir PATH` writes a `data_dir` into the config (see below). When `chibi init` overwrites an existing config, it keeps that config's `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so.
 
-Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent:
+Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent; an empty `CHIBI_CONFIG` counts as unset:
 
 ```sh
 chibi --config ~/chibi-test.toml init
@@ -93,7 +93,7 @@ Data (light-client checkpoint, devp2p key, remembered peers, the state file, and
 
 ### Tracking contracts and storage slots
 
-Each `[[contracts]]` table tracks a contract account (balance, nonce, and code) and, optionally, raw storage slots. chibi proves them at every new head, or keeps them current from block access lists, so `eth_getBalance`, `eth_getCode`, and `eth_getStorageAt` for them answer without a fetch. `chibi status` prints each slot's value at the saved head.
+Each `[[contracts]]` table tracks a contract account (balance, nonce, and code hash) and, optionally, raw storage slots. chibi proves them at every new head, or keeps them current from block access lists, so `eth_getBalance`, `eth_getTransactionCount`, and `eth_getStorageAt` for them answer without a fetch. The contract's code is fetched once, on first use, and kept from then on. `chibi status` prints each slot's value at the saved head.
 
 ```toml
 [[contracts]]

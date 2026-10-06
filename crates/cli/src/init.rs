@@ -103,20 +103,38 @@ pub fn init(args: InitArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Re
     };
     let mut output = io::stdout().lock();
     match config {
-        Some(config) => {
+        Some((config, carried)) => {
             config.save(path)?;
-            write_next_steps(&mut output, path, &config, config_flag)?;
+            write_next_steps(&mut output, path, &config, &carried, config_flag)?;
         }
         None => writeln!(output, "kept the existing config at {}", path.display())?,
     }
     Ok(())
 }
 
-/// The config to write, or `None` when the user keeps the existing one.
-fn collect<A: Ask>(ask: &mut A, args: InitArgs, path: &Path) -> Result<Option<Config>, InitError> {
-    if path.exists() && !ask.overwrite(path)? {
-        return Ok(None);
-    }
+/// What an overwritten config passed on to its replacement, since init never asks for it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Carried {
+    data_dir: Option<PathBuf>,
+    contracts: usize,
+}
+
+/// The config to write and what it carried over, or `None` when the user keeps the existing
+/// one. An existing config that parses passes on its `[[contracts]]` and, unless `--data-dir`
+/// is given, its `data_dir`; one that does not parse is replaced outright.
+fn collect<A: Ask>(
+    ask: &mut A,
+    args: InitArgs,
+    path: &Path,
+) -> Result<Option<(Config, Carried)>, InitError> {
+    let existing = if path.exists() {
+        if !ask.overwrite(path)? {
+            return Ok(None);
+        }
+        Config::load(path).ok()
+    } else {
+        None
+    };
     let network = match args.network {
         Some(network) => network,
         None => ask.network()?,
@@ -145,7 +163,16 @@ fn collect<A: Ask>(ask: &mut A, args: InitArgs, path: &Path) -> Result<Option<Co
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
     config.data_dir = args.data_dir;
-    Ok(Some(config))
+    let mut carried = Carried::default();
+    if let Some(existing) = existing {
+        if config.data_dir.is_none() {
+            carried.data_dir.clone_from(&existing.data_dir);
+            config.data_dir = existing.data_dir;
+        }
+        carried.contracts = existing.contracts.len();
+        config.contracts = existing.contracts;
+    }
+    Ok(Some((config, carried)))
 }
 
 /// Interactive terminal screens.
@@ -498,6 +525,7 @@ fn write_next_steps<W: Write>(
     output: &mut W,
     path: &Path,
     config: &Config,
+    carried: &Carried,
     config_flag: Option<&Path>,
 ) -> io::Result<()> {
     let count = config.addresses.len();
@@ -513,6 +541,25 @@ fn write_next_steps<W: Write>(
         writeln!(output, ", no tokens)")?;
     } else {
         writeln!(output, ", tracking {})", symbols.join(", "))?;
+    }
+    if let Some(dir) = &carried.data_dir {
+        writeln!(
+            output,
+            "kept data_dir = {} from the existing config",
+            dir.display()
+        )?;
+    }
+    if carried.contracts > 0 {
+        let entries = if carried.contracts == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        writeln!(
+            output,
+            "kept {} [[contracts]] {entries} from the existing config",
+            carried.contracts
+        )?;
     }
     let flag = config_flag
         .map(|path| format!(" --config {}", path.display()))
@@ -729,7 +776,8 @@ mod tests {
             rpc_port: Some(port(9545)),
             ..InitArgs::default()
         };
-        let config = collect(&mut lines, args, &path).unwrap().unwrap();
+        let (config, carried) = collect(&mut lines, args, &path).unwrap().unwrap();
+        assert_eq!(carried, Carried::default());
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.addresses, vec![BOB]);
         assert_eq!(symbols(&config.tokens), ["WBTC", "DAI"]);
@@ -779,7 +827,7 @@ mod tests {
                 rpc_port: Some(port(8545)),
                 data_dir,
             };
-            collect(&mut lines, args, &path).unwrap().unwrap()
+            collect(&mut lines, args, &path).unwrap().unwrap().0
         };
 
         let plain = answered(None);
@@ -798,13 +846,91 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_keeps_data_dir_and_contracts_unless_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let old_dir = dir.path().join("old");
+        let contracts = vec![chibi_node::TrackedContract {
+            address: BOB,
+            slots: vec![alloy_primitives::U256::from(1)],
+        }];
+        let mut existing = Config::new(Network::Mainnet, vec![BOB]);
+        existing.data_dir = Some(old_dir.clone());
+        existing.contracts.clone_from(&contracts);
+        let overwrite = |data_dir: Option<PathBuf>| {
+            let mut lines = Lines {
+                input: Cursor::new(&b"y\n"[..]),
+                output: Vec::new(),
+            };
+            let args = InitArgs {
+                network: Some(Network::Sepolia),
+                addresses: vec![ALICE],
+                tokens: vec!["USDC".to_owned()],
+                rpc_host: Some(RpcHost::default()),
+                rpc_port: Some(port(8545)),
+                data_dir,
+            };
+            collect(&mut lines, args, &path).unwrap().unwrap()
+        };
+
+        existing.save(&path).unwrap();
+        let (config, carried) = overwrite(None);
+        assert_eq!(config.addresses, vec![ALICE]);
+        assert_eq!(config.data_dir, Some(old_dir.clone()));
+        assert_eq!(config.contracts, contracts);
+        assert_eq!(
+            carried,
+            Carried {
+                data_dir: Some(old_dir.clone()),
+                contracts: 1
+            }
+        );
+        let mut output = Vec::new();
+        write_next_steps(&mut output, &path, &config, &carried, None).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(&format!(
+                "kept data_dir = {} from the existing config\n\
+                 kept 1 [[contracts]] entry from the existing config\n",
+                old_dir.display()
+            )),
+            "{output}"
+        );
+
+        let new_dir = dir.path().join("new");
+        let (config, carried) = overwrite(Some(new_dir.clone()));
+        assert_eq!(config.data_dir, Some(new_dir));
+        assert_eq!(config.contracts, contracts);
+        assert_eq!(
+            carried,
+            Carried {
+                data_dir: None,
+                contracts: 1
+            }
+        );
+
+        std::fs::write(&path, "not = [valid").unwrap();
+        let (config, carried) = overwrite(None);
+        assert_eq!(config.data_dir, None);
+        assert!(config.contracts.is_empty());
+        assert_eq!(carried, Carried::default());
+    }
+
+    #[test]
     fn next_steps_list_tokens_url_and_how_to_start() {
         let mut output = Vec::new();
         let mut config = Config::new(Network::Sepolia, vec![ALICE]);
         config.tokens = resolve_tokens(Network::Sepolia, &["USDC", "WETH"]).unwrap();
         config.rpc_host = "chibi.local".parse().unwrap();
         config.rpc_port = port(8745);
-        write_next_steps(&mut output, Path::new("/cfg/config.toml"), &config, None).unwrap();
+        write_next_steps(
+            &mut output,
+            Path::new("/cfg/config.toml"),
+            &config,
+            &Carried::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "wrote /cfg/config.toml (sepolia, 1 address, tracking USDC, WETH)\n\
@@ -822,7 +948,14 @@ mod tests {
         let mut config = Config::new(Network::Mainnet, vec![ALICE, BOB]);
         config.tokens.clear();
         let custom = Path::new("/tmp/c.toml");
-        write_next_steps(&mut output, custom, &config, Some(custom)).unwrap();
+        write_next_steps(
+            &mut output,
+            custom,
+            &config,
+            &Carried::default(),
+            Some(custom),
+        )
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.starts_with("wrote /tmp/c.toml (mainnet, 2 addresses, no tokens)\n"));
         assert!(

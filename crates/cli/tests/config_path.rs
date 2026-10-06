@@ -50,12 +50,15 @@ fn stdout(output: &Output) -> String {
 }
 
 #[test]
-fn init_defaults_to_dot_config_under_home() {
-    let home = tempfile::tempdir().unwrap();
-    let written = stdout(&chibi(home.path(), None, &init_args("sepolia")));
-    let path = home.path().join(".config/chibi/config.toml");
-    assert!(path.is_file(), "{written}");
-    assert!(written.contains(&path.display().to_string()), "{written}");
+fn init_defaults_to_dot_config_under_home_when_chibi_config_is_unset_or_empty() {
+    for chibi_config in [None, Some(Path::new(""))] {
+        let home = tempfile::tempdir().unwrap();
+        let written = stdout(&chibi(home.path(), chibi_config, &init_args("sepolia")));
+        let path = home.path().join(".config/chibi/config.toml");
+        assert!(path.is_file(), "{chibi_config:?}: {written}");
+        assert!(written.contains(&path.display().to_string()), "{written}");
+        assert!(!written.contains("--config"), "{written}");
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ mod init;
 mod rpc;
 mod run;
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -36,8 +37,9 @@ const ETH_DECIMALS: u8 = 18;
     about = "A local Ethereum JSON-RPC endpoint for browser wallets that verifies everything it serves"
 )]
 struct Cli {
-    /// Config file to use instead of $XDG_CONFIG_HOME/chibi/config.toml.
-    #[arg(long, global = true, env = "CHIBI_CONFIG", value_name = "PATH")]
+    /// Config file to use instead of $XDG_CONFIG_HOME/chibi/config.toml; defaults to
+    /// $CHIBI_CONFIG when that is set and not empty.
+    #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -65,11 +67,10 @@ enum Command {
 
 fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
-    let named = cli
-        .config
+    let named = named_config(cli.config, process_env)
         .map(std::path::absolute)
         .transpose()
-        .wrap_err("cannot resolve the --config path")?;
+        .wrap_err("cannot resolve the config path")?;
     let path = match &named {
         Some(path) => path.clone(),
         None => default_config_path(process_env)?,
@@ -84,6 +85,15 @@ fn main() -> eyre::Result<()> {
         }
         Command::Status { network } => status(network, &path),
     }
+}
+
+/// The config the user named: `--config`, else a non-empty `CHIBI_CONFIG`.
+fn named_config(flag: Option<PathBuf>, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    flag.or_else(|| {
+        env("CHIBI_CONFIG")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
 }
 
 /// The network to show and its data directory. Without a config file, `--network` alone still
@@ -387,6 +397,25 @@ mod tests {
                 network: Some(Network::Mainnet)
             }
         ));
+    }
+
+    #[test]
+    fn chibi_config_applies_when_non_empty_and_the_flag_wins() {
+        let env = |value: Option<&'static str>| {
+            move |key: &str| {
+                assert_eq!(key, "CHIBI_CONFIG");
+                value.map(OsString::from)
+            }
+        };
+        let flag = || Some(PathBuf::from("/flag.toml"));
+        assert_eq!(named_config(None, env(None)), None);
+        assert_eq!(named_config(None, env(Some(""))), None);
+        assert_eq!(
+            named_config(None, env(Some("/env.toml"))),
+            Some(PathBuf::from("/env.toml"))
+        );
+        assert_eq!(named_config(flag(), env(Some("/env.toml"))), flag());
+        assert_eq!(named_config(flag(), env(Some(""))), flag());
     }
 
     #[test]

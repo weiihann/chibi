@@ -41,10 +41,12 @@ DIRTY=$(git -C "$repo" status --porcelain | wc -l | tr -d ' ')
 REPO=$repo
 EOF
 
-# chibi reads its config from $XDG_CONFIG_HOME/chibi and its data from $XDG_DATA_HOME/chibi.
+# chibi reads its config from $XDG_CONFIG_HOME/chibi and its data from $XDG_DATA_HOME/chibi,
+# unless CHIBI_CONFIG names another config.
 export HOME="$run_dir/home"
 export XDG_CONFIG_HOME="$run_dir/home/.config"
 export XDG_DATA_HOME="$run_dir/home/.local/share"
+unset CHIBI_CONFIG
 
 addresses=""
 for address in "$@"; do

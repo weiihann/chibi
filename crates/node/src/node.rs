@@ -105,7 +105,8 @@ pub struct Watchlist {
 /// A contract account tracked with some of its storage slots.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrackedContract {
-    /// The account, tracked for balance, nonce, and code.
+    /// The account, tracked for balance, nonce, and code hash. The code itself is fetched on
+    /// first use and then kept.
     pub address: Address,
     /// Storage keys as `eth_getStorageAt` takes them, not hashed.
     pub slots: Vec<U256>,
@@ -224,7 +225,8 @@ pub struct Snapshot {
     pub saved_at: u64,
     /// One entry per watched address.
     pub holdings: Vec<Holding>,
-    /// One entry per tracked contract.
+    /// One entry per tracked contract. Absent from state files written before contracts.
+    #[serde(default)]
     pub contracts: Vec<ContractSnapshot>,
 }
 
