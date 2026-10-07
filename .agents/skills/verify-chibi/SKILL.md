@@ -38,7 +38,7 @@ Read-only. Exits 0 only when the pid in `$RUN_DIR/chibi.pid` runs this run's bin
 - JSON-RPC: `.agents/skills/verify-chibi/scripts/rpc.sh "$RUN_DIR" <method> '<params-json>'` prints the response and appends request and response to `$RUN_DIR/evidence/rpc.log`. `cast ... --rpc-url http://127.0.0.1:<port>` exercises the same calls a wallet makes.
 - Oracle comparison: `CHIBI=http://127.0.0.1:<port> scripts/oracle-check.sh <address>... | tee "$RUN_DIR/evidence/oracle-check.txt"` compares chibi with publicnode at chibi's own head and exits non-zero on any difference. The oracle is a test input only; chibi never uses it.
 - CLI: run the copied binary with the run's environment, for example `env -u CHIBI_CONFIG HOME="$RUN_DIR/home" XDG_CONFIG_HOME="$RUN_DIR/home/.config" XDG_DATA_HOME="$RUN_DIR/home/.local/share" "$RUN_DIR/bin/chibi" status`.
-- Node behaviour: `$RUN_DIR/chibi.log`. Stable strings are `anchored head=` (with `keys=`, the pins plus the learned keys the last run saved), `head verified`, `stepped=Reanchored`, `stepped=Extended`, `step failed`, `transaction included`, `session established ... snap=true`.
+- Node behaviour: `$RUN_DIR/chibi.log`. Stable strings are `anchored head=` (with `keys=`, the pins plus the learned keys the last run saved), `head verified`, `stepped=Reanchored`, `stepped=Extended`, `step failed`, `transaction included`, `session established ... snap=true`, `status head=` (every 60 s once JSON-RPC opens, with `snap_peers=`, and `pins=` and `learned=` as held/total), `no snap/2 peer connected`, `pins not held at the head for two status lines` (with `count=` and up to five `pins=`), and, without a config file, `no config at`.
 
 ## Evidence
 

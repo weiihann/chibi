@@ -3,6 +3,7 @@
 //! This file is the contract between the node implementation and the JSON-RPC layer.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -304,6 +305,12 @@ pub struct Held {
     pub held: usize,
     /// Keys in the group.
     pub total: usize,
+}
+
+impl fmt::Display for Held {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.held, self.total)
+    }
 }
 
 /// What one follower step did.

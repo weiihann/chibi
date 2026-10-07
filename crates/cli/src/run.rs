@@ -1,5 +1,7 @@
 //! `chibi run` in the foreground or background, and `chibi stop`.
 
+use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -11,13 +13,15 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chibi_node::{Disk, Network, Node, NodeConfig};
+use chibi_core::state::Key;
+use chibi_node::{Disk, Network, Node, NodeConfig, Status};
 use clap::Args;
 use eyre::{WrapErr, bail};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +42,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RPC_DRAIN: Duration = Duration::from_secs(5);
 /// Log lines shown when a background start fails.
 const LOG_TAIL_LINES: usize = 20;
+/// How often a serving run logs its status.
+const STATUS_EVERY: Duration = Duration::from_secs(60);
+/// Most unheld pins one status warning names.
+const UNHELD_PINS_NAMED: usize = 5;
 
 /// `chibi run` flags.
 #[derive(Debug, Default, Args)]
@@ -156,6 +164,7 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
     }
     tokio::select! {
         result = follower.run() => result.wrap_err("head follower stopped"),
+        never = report(node.clone()) => match never {},
         () = server.clone().stopped() => bail!("JSON-RPC server stopped"),
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
@@ -170,6 +179,60 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
             Ok(())
         }
     }
+}
+
+/// Logs the node's status every [`STATUS_EVERY`], starting at once.
+async fn report(node: Node) -> Infallible {
+    let mut ticks = tokio::time::interval(STATUS_EVERY);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut previous = BTreeSet::new();
+    loop {
+        ticks.tick().await;
+        let status = node.status();
+        log_status(&status, &previous);
+        previous = status.unheld_pins.into_iter().collect();
+    }
+}
+
+/// Logs one status line, and warnings for no snap/2 peer and for pins `previous`, the last
+/// line's unheld pins, also lacked.
+fn log_status(status: &Status, previous: &BTreeSet<Key>) {
+    info!(
+        head = status.snapshot.block.number,
+        peers = status.peers,
+        snap_peers = status.snap_peers,
+        pins = %status.pins,
+        learned = %status.learned,
+        "status",
+    );
+    if status.snap_peers == 0 {
+        warn!("no snap/2 peer connected; the head and state requests stall until one returns");
+    }
+    if let Some((count, named)) = persisting_unheld(previous, &status.unheld_pins) {
+        warn!(count, pins = %named, "pins not held at the head for two status lines");
+    }
+}
+
+/// The pins unheld at this status line and at the one before, counted, with the first
+/// [`UNHELD_PINS_NAMED`] named. A pin still warming after start is unheld at one line only.
+fn persisting_unheld(previous: &BTreeSet<Key>, current: &[Key]) -> Option<(usize, String)> {
+    let persisting: Vec<Key> = current
+        .iter()
+        .filter(|key| previous.contains(key))
+        .copied()
+        .collect();
+    if persisting.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = persisting
+        .iter()
+        .take(UNHELD_PINS_NAMED)
+        .map(|key| match key {
+            Key::Account(address) => format!("{address}"),
+            Key::Slot(address, slot) => format!("{address} slot {slot:#x}"),
+        })
+        .collect();
+    Some((persisting.len(), named.join(", ")))
 }
 
 /// Resolves with the name of the first Ctrl-C or SIGTERM.
@@ -434,6 +497,39 @@ mod tests {
         fs::write(&path, "network = \"goerli\"\n").unwrap();
         let error = load(&path, None, None, None).unwrap_err().to_string();
         assert!(error.starts_with("invalid config "), "{error}");
+    }
+
+    #[test]
+    fn a_status_warning_names_at_most_five_pins_unheld_at_two_lines() {
+        use alloy_primitives::{Address, U256};
+
+        let accounts: Vec<Key> = (1..=6u8)
+            .map(|byte| Key::Account(Address::repeat_byte(byte)))
+            .collect();
+        let slot = Key::Slot(Address::repeat_byte(0xcc), U256::from(2));
+        let warming = Key::Account(Address::repeat_byte(0xdd));
+        let mut current = accounts.clone();
+        current.extend([slot, warming]);
+        let previous: BTreeSet<Key> = accounts.iter().copied().chain([slot]).collect();
+
+        assert_eq!(persisting_unheld(&BTreeSet::new(), &current), None);
+        assert_eq!(persisting_unheld(&previous, &[]), None);
+        assert_eq!(persisting_unheld(&previous, &[warming]), None);
+        assert_eq!(
+            persisting_unheld(&previous, &[slot]),
+            Some((
+                1,
+                "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC slot 0x2".to_owned()
+            ))
+        );
+        let (count, named) = persisting_unheld(&previous, &current).unwrap();
+        assert_eq!(count, 7);
+        assert_eq!(
+            named,
+            [1u8, 2, 3, 4, 5]
+                .map(|byte| Address::repeat_byte(byte).to_string())
+                .join(", ")
+        );
     }
 
     #[test]

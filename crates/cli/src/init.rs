@@ -588,7 +588,10 @@ mod tests {
         write_next_steps(&mut output, &path, &config, &Carried::default(), None).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(
-            output.starts_with(&format!("wrote {} (sepolia, 0 addresses)\n", path.display())),
+            output.starts_with(&format!(
+                "wrote {} (sepolia, 0 addresses)\n",
+                path.display()
+            )),
             "{output}"
         );
     }
