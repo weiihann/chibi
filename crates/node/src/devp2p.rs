@@ -739,6 +739,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::peers::SNAP_PER_PEER;
 
     fn session(snap: bool) -> Session {
         Session {
@@ -797,6 +798,55 @@ mod tests {
                 }
             }
         }
+
+        /// Drops every request sent to `peer`, as reth does when its session closes.
+        fn close(&self, peer: PeerKey) {
+            self.0.lock().retain(|(on, _)| *on != peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn after_one_of_two_full_snap_sessions_drops_the_survivor_keeps_its_share() {
+        let sessions = snap_sessions(&[A, B]);
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let first: Vec<_> = (0..2 * SNAP_PER_PEER)
+            .map(|_| wire.request(&load, &sessions))
+            .collect();
+        settle().await;
+        assert_eq!(
+            (wire.outstanding(A), wire.outstanding(B)),
+            (SNAP_PER_PEER, SNAP_PER_PEER)
+        );
+
+        let waiting: Vec<_> = (0..2 * SNAP_PER_PEER)
+            .map(|_| wire.request(&load, &sessions))
+            .collect();
+        settle().await;
+        assert_eq!(
+            (wire.outstanding(A), wire.outstanding(B)),
+            (SNAP_PER_PEER, SNAP_PER_PEER)
+        );
+
+        sessions.send_modify(|sessions| {
+            sessions.remove(&B);
+        });
+        wire.close(B);
+        settle().await;
+        for _ in 0..2 * SNAP_PER_PEER / 4 {
+            assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+            wire.answer(A, 4);
+            settle().await;
+        }
+        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+        wire.answer(A, SNAP_PER_PEER);
+
+        let answered = futures::future::join_all(first.into_iter().chain(waiting)).await;
+        let failed = answered
+            .into_iter()
+            .filter(|call| call.as_ref().unwrap().is_err())
+            .count();
+        assert_eq!(failed, SNAP_PER_PEER, "only the requests out at B fail");
     }
 
     async fn settle() {

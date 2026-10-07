@@ -23,7 +23,7 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// snap/2 requests one peer works on at once. A peer answers in about the same time with up to
 /// 32 in flight, and reth's session buffers 32 commands and drops the rest; half leaves room
 /// for reth's own traffic.
-const SNAP_PER_PEER: usize = 16;
+pub(crate) const SNAP_PER_PEER: usize = 16;
 
 /// Identifies the peer that sent a reply, so a failed verification can penalize it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
