@@ -976,14 +976,18 @@ async fn start_serves_reads_before_the_first_step_warms_the_pins() {
     assert_eq!(fixture.log().proofs, 3);
 }
 
-#[tokio::test(start_paused = true)]
-async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_out() {
-    let holders: Vec<(Address, WorldAccount)> = (1..=100u64)
+fn hundred_holders() -> Vec<(Address, WorldAccount)> {
+    (1..=100u64)
         .map(|i| {
             let address = Address::left_padding_from(&(0x1000 + i).to_be_bytes());
             (address, WorldAccount::eoa(eth(i)))
         })
-        .collect();
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_out() {
+    let holders = hundred_holders();
     let fixture = Fixture::genesis(holders.clone());
     fixture.serve_proofs(1, Duration::from_millis(340));
     let dir = tempfile::tempdir().unwrap();
@@ -997,6 +1001,28 @@ async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_o
         (1..=100).map(|i| Some(eth(i))).collect::<Vec<_>>()
     );
     assert_eq!(fixture.log().proofs, 100);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reads_pipeline_sixteen_deep_to_one_snap_peer_and_never_exceed_that() {
+    let holders = hundred_holders();
+    let fixture = Fixture::genesis(holders.clone());
+    fixture.serve_proofs(16, Duration::from_millis(200));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+
+    let started = tokio::time::Instant::now();
+    let balances =
+        futures::future::join_all(holders.iter().map(|(address, _)| balance(&node, *address)))
+            .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(1400));
+    assert_eq!(
+        balances,
+        (1..=100).map(|i| Some(eth(i))).collect::<Vec<_>>()
+    );
+    let log = fixture.log();
+    assert_eq!(log.proofs, 100);
+    assert_eq!(log.most_in_flight, 16);
 }
 
 const READER: Address = address!("0x0000000000000000000000000000000000005ead");
