@@ -8,7 +8,13 @@ set -u
 
 CHIBI=${CHIBI:-http://127.0.0.1:8545}
 ORACLE=${ORACLE:-https://ethereum-sepolia-rpc.publicnode.com}
-TOKENS=${TOKENS:-$(cargo run -q -p chibi-node --example registry | awk -F '\t' '$1 == "sepolia" { print $3 }')}
+if [ -z "${TOKENS+set}" ]; then
+    registry=$(cargo run -q -p chibi-node --example registry) || {
+        echo "cannot list chibi's token registry; set TOKENS" >&2
+        exit 2
+    }
+    TOKENS=$(printf '%s\n' "$registry" | awk -F '\t' '$1 == "sepolia" { print $3 }')
+fi
 failures=0
 
 [ $# -ge 1 ] || { echo "usage: $0 ADDRESS [ADDRESS...]" >&2; exit 2; }
