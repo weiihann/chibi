@@ -37,7 +37,7 @@ use reth_network_api::{Direction, PeerRequest, Peers as _};
 use reth_network_p2p::block_access_lists::client::{BalRequirement, BlockAccessListsClient};
 use reth_network_p2p::bodies::client::BodiesClient;
 use reth_network_p2p::download::DownloadClient;
-use reth_network_p2p::error::RequestError;
+use reth_network_p2p::error::{RequestError, RequestResult};
 use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
 use reth_network_p2p::receipts::client::ReceiptsClient;
 use reth_network_p2p::snap::client::SnapResponse;
@@ -106,14 +106,33 @@ pub struct Session {
 /// Established sessions by peer.
 pub type Sessions = HashMap<PeerKey, Session>;
 
+/// A snap/2 reply as reth's session resolves it.
+type SnapReply = oneshot::Receiver<RequestResult<SnapResponse>>;
+
 /// chibi's snap/2 requests in flight, by session.
 #[derive(Debug, Default)]
 struct SnapLoad(Mutex<HashMap<PeerKey, usize>>);
 
 impl SnapLoad {
-    /// The snap/2 session in `sessions` with the fewest requests in flight, counted against it
-    /// until the lease drops.
-    fn lease(&self, sessions: &Sessions) -> Option<Lease<'_>> {
+    /// Hands `send` the snap/2 session in `sessions` with the fewest requests in flight and
+    /// waits for the reply it returns.
+    async fn submit(
+        self: &Arc<Self>,
+        sessions: watch::Receiver<Sessions>,
+        send: impl FnOnce(PeerId) -> SnapReply,
+    ) -> Result<(PeerId, SnapResponse), NetError> {
+        let lease = self
+            .lease(&sessions.borrow())
+            .ok_or(NetError::NoPeer { capability: SNAP })?;
+        let peer = lease.peer.0;
+        match send(peer).await {
+            Ok(Ok(response)) => Ok((peer, response)),
+            Ok(Err(err)) => Err(net_error(&err, SNAP)),
+            Err(_) => Err(NetError::Rejected),
+        }
+    }
+
+    fn lease(self: &Arc<Self>, sessions: &Sessions) -> Option<Lease> {
         let mut load = self.0.lock();
         let peer = sessions
             .iter()
@@ -121,18 +140,21 @@ impl SnapLoad {
             .map(|(peer, _)| *peer)
             .min_by_key(|peer| load.get(peer).copied().unwrap_or_default())?;
         *load.entry(peer).or_default() += 1;
-        Some(Lease { load: self, peer })
+        Some(Lease {
+            load: Arc::clone(self),
+            peer,
+        })
     }
 }
 
 /// One request counted against `peer`.
 #[derive(Debug)]
-struct Lease<'a> {
-    load: &'a SnapLoad,
+struct Lease {
+    load: Arc<SnapLoad>,
     peer: PeerKey,
 }
 
-impl Drop for Lease<'_> {
+impl Drop for Lease {
     fn drop(&mut self) {
         let mut load = self.load.0.lock();
         if let Some(count) = load.get_mut(&self.peer) {
@@ -167,7 +189,7 @@ pub struct Devp2p {
     fetch: FetchClient,
     chain: Arc<ChainSpec>,
     sessions: watch::Receiver<Sessions>,
-    snap_load: SnapLoad,
+    snap_load: Arc<SnapLoad>,
     tasks: [JoinHandle<()>; 3],
 }
 
@@ -237,7 +259,7 @@ impl Devp2p {
             fetch,
             chain: Arc::clone(&spec.chain),
             sessions,
-            snap_load: SnapLoad::default(),
+            snap_load: Arc::default(),
             tasks,
         })
     }
@@ -277,19 +299,14 @@ impl Devp2p {
     /// Sends `request` to the connected snap/2 session with the fewest chibi requests in
     /// flight. reth's fetcher would hold each peer to one request at a time.
     async fn snap(&self, request: SnapProtocolMessage) -> Result<(PeerId, SnapResponse), NetError> {
-        let lease = self
-            .snap_load
-            .lease(&self.sessions.borrow())
-            .ok_or(NetError::NoPeer { capability: SNAP })?;
-        let peer = lease.peer.0;
-        let (response, reply) = oneshot::channel();
-        self.handle
-            .send_request(peer, PeerRequest::GetSnap { request, response });
-        match reply.await {
-            Ok(Ok(response)) => Ok((peer, response)),
-            Ok(Err(err)) => Err(net_error(&err, SNAP)),
-            Err(_) => Err(NetError::Rejected),
-        }
+        self.snap_load
+            .submit(self.sessions.clone(), |peer| {
+                let (response, reply) = oneshot::channel();
+                self.handle
+                    .send_request(peer, PeerRequest::GetSnap { request, response });
+                reply
+            })
+            .await
     }
 
     async fn snap_block_access_lists(
@@ -720,7 +737,6 @@ mod tests {
         GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetReceipts,
         GetReceipts70, HeadersDirection,
     };
-    use reth_network_p2p::error::RequestResult;
 
     use super::*;
 
@@ -733,29 +749,95 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snap_requests_go_to_the_least_loaded_snap_session_until_released() {
-        let (a, b, eth) = (
-            PeerKey(B512::repeat_byte(1)),
-            PeerKey(B512::repeat_byte(2)),
-            PeerKey(B512::repeat_byte(3)),
+    fn snap_sessions(peers: &[PeerKey]) -> watch::Sender<Sessions> {
+        watch::Sender::new(peers.iter().map(|peer| (*peer, session(true))).collect())
+    }
+
+    fn answer() -> RequestResult<SnapResponse> {
+        Ok(SnapResponse::ByteCodes(ByteCodesMessage {
+            request_id: 0,
+            codes: Vec::new(),
+        }))
+    }
+
+    type Responder = oneshot::Sender<RequestResult<SnapResponse>>;
+
+    /// Requests [`SnapLoad`] submitted, held unanswered like reth's session holds them until
+    /// the peer replies, whether or not the caller still waits.
+    #[derive(Clone, Debug, Default)]
+    struct Wire(Arc<Mutex<Vec<(PeerKey, Responder)>>>);
+
+    impl Wire {
+        fn request(
+            &self,
+            load: &Arc<SnapLoad>,
+            sessions: &watch::Sender<Sessions>,
+        ) -> JoinHandle<Result<(PeerId, SnapResponse), NetError>> {
+            let (load, sessions, wire) = (Arc::clone(load), sessions.subscribe(), self.clone());
+            tokio::spawn(async move {
+                load.submit(sessions, |peer| {
+                    let (response, reply) = oneshot::channel();
+                    wire.0.lock().push((PeerKey(peer), response));
+                    reply
+                })
+                .await
+            })
+        }
+
+        fn outstanding(&self, peer: PeerKey) -> usize {
+            self.0.lock().iter().filter(|(on, _)| *on == peer).count()
+        }
+
+        /// Answers up to `count` of the oldest requests sent to `peer`.
+        fn answer(&self, peer: PeerKey, count: usize) {
+            let mut sent = self.0.lock();
+            for _ in 0..count {
+                if let Some(at) = sent.iter().position(|(on, _)| *on == peer) {
+                    sent.remove(at).1.send(answer()).ok();
+                }
+            }
+        }
+    }
+
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    const A: PeerKey = PeerKey(B512::repeat_byte(1));
+    const B: PeerKey = PeerKey(B512::repeat_byte(2));
+
+    #[tokio::test]
+    async fn snap_requests_go_to_the_least_loaded_snap_session_and_need_one() {
+        let eth = PeerKey(B512::repeat_byte(3));
+        let sessions = snap_sessions(&[A, B]);
+        sessions.send_modify(|sessions| {
+            sessions.insert(eth, session(false));
+        });
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let calls: Vec<_> = (0..4).map(|_| wire.request(&load, &sessions)).collect();
+        settle().await;
+        assert_eq!(
+            (
+                wire.outstanding(A),
+                wire.outstanding(B),
+                wire.outstanding(eth)
+            ),
+            (2, 2, 0)
         );
-        let sessions = Sessions::from([
-            (a, session(true)),
-            (b, session(true)),
-            (eth, session(false)),
-        ]);
-        let load = SnapLoad::default();
-
-        let leases: Vec<_> = (0..4).map(|_| load.lease(&sessions).unwrap()).collect();
-        let on = |peer| leases.iter().filter(|lease| lease.peer == peer).count();
-        assert_eq!((on(a), on(b), on(eth)), (2, 2, 0));
-
-        drop(leases);
+        wire.answer(A, 2);
+        wire.answer(B, 2);
+        for call in calls {
+            assert!(call.await.unwrap().is_ok());
+        }
         assert!(load.0.lock().is_empty());
-        assert!(
-            load.lease(&Sessions::from([(eth, session(false))]))
-                .is_none()
+
+        let no_snap = watch::Sender::new(Sessions::from([(eth, session(false))]));
+        assert_eq!(
+            wire.request(&load, &no_snap).await.unwrap(),
+            Err(NetError::NoPeer { capability: SNAP })
         );
     }
 
