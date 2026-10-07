@@ -26,7 +26,7 @@ JSON-RPC opens as soon as the head is verified. Pins and other keys are proven i
 ## Requirements
 
 - Rust (the toolchain is pinned in `rust-toolchain.toml` and installed by rustup on first build).
-- Outbound access to devp2p peers (TCP and UDP) and to a beacon API endpoint. The Sepolia default is `https://beacon.sepolia.ethpandaops.io`.
+- Outbound access to devp2p peers (TCP and UDP) and to a beacon API endpoint. The Sepolia default is `https://beacon.sepolia.ethpandaops.io/nimbus`.
 
 ## Install and set up
 
