@@ -34,7 +34,7 @@ cd chibi
 
 1. The network (Sepolia by default).
 2. Watch-only addresses. Paste as many as you like and press Enter on an empty line to finish.
-3. Which tokens to track, as tick boxes. On Sepolia the choices are USDC, USDT, DAI, WETH, and LINK; mainnet adds WBTC. USDC is ticked by default. ETH is always tracked. Sepolia's USDC is Circle's own deployment. Sepolia's USDT and DAI are test tokens from Aave's Sepolia faucet, not tokens issued by Tether or Maker; anyone can mint them, so their balances carry no value.
+3. Which tokens to track, as tick boxes, from the 15 ERC-20s with the most transfers on mainnet in the 30 days to 2026-10-07. Mainnet offers all 15: USDT, USDC, WETH, WBTC, UNI, LINK, QNT, DAI, PYUSD, ONDO, AAVE, PEPE, SHIB, 1INCH, and CRV. Sepolia offers the 9 with a Sepolia deployment: USDT, USDC, WETH, WBTC, UNI, LINK, DAI, PYUSD, and AAVE. USDC is ticked by default. ETH is always tracked. Sepolia's USDC, PYUSD, and LINK are their issuers' own deployments. Sepolia's USDT, DAI, WBTC, and AAVE are test tokens from Aave's Sepolia faucet, not tokens issued by Tether, Maker, BitGo, or Aave; anyone can mint them, so their balances carry no value.
 4. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
 
 It writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is set to an absolute path, otherwise to `~/.config/chibi/`, on macOS and Linux alike. In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:

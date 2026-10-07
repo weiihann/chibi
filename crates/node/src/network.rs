@@ -170,13 +170,8 @@ impl BlockClock {
     }
 }
 
+/// Sepolia deployments of the mainnet registry's tokens, where one exists.
 const SEPOLIA_TOKENS: &[Token] = &[
-    Token {
-        symbol: "USDC",
-        name: "USD Coin (Circle)",
-        address: address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
-        decimals: 6,
-    },
     Token {
         symbol: "USDT",
         name: "Tether USD (Aave faucet test token, not issued by Tether)",
@@ -184,10 +179,10 @@ const SEPOLIA_TOKENS: &[Token] = &[
         decimals: 6,
     },
     Token {
-        symbol: "DAI",
-        name: "Dai (Aave faucet test token, not issued by Maker)",
-        address: address!("0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357"),
-        decimals: 18,
+        symbol: "USDC",
+        name: "USD Coin (Circle)",
+        address: address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+        decimals: 6,
     },
     Token {
         symbol: "WETH",
@@ -196,20 +191,46 @@ const SEPOLIA_TOKENS: &[Token] = &[
         decimals: 18,
     },
     Token {
+        symbol: "WBTC",
+        name: "Wrapped Bitcoin (Aave faucet test token, not issued by BitGo)",
+        address: address!("0x29f2D40B0605204364af54EC677bD022dA425d03"),
+        decimals: 8,
+    },
+    Token {
+        symbol: "UNI",
+        name: "Uniswap",
+        address: address!("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"),
+        decimals: 18,
+    },
+    Token {
         symbol: "LINK",
         name: "Chainlink",
         address: address!("0x779877A7B0D9E8603169DdbD7836e478b4624789"),
         decimals: 18,
     },
-];
-
-const MAINNET_TOKENS: &[Token] = &[
     Token {
-        symbol: "USDC",
-        name: "USD Coin (Circle)",
-        address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        symbol: "DAI",
+        name: "Dai (Aave faucet test token, not issued by Maker)",
+        address: address!("0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "PYUSD",
+        name: "PayPal USD (Paxos)",
+        address: address!("0xCaC524BcA292aaade2DF8A05cC58F0a65B1B3bB9"),
         decimals: 6,
     },
+    Token {
+        symbol: "AAVE",
+        name: "Aave (Aave faucet test token)",
+        address: address!("0x88541670E55cC00bEEFD87eB59EDd1b7C511AC9a"),
+        decimals: 18,
+    },
+];
+
+/// The 15 ERC-20s with the most transfer transactions on mainnet in the 30 days to 2026-10-07,
+/// most used first.
+const MAINNET_TOKENS: &[Token] = &[
     Token {
         symbol: "USDT",
         name: "Tether USD",
@@ -217,15 +238,27 @@ const MAINNET_TOKENS: &[Token] = &[
         decimals: 6,
     },
     Token {
-        symbol: "DAI",
-        name: "Dai",
-        address: address!("0x6B175474E89094C44Da98b954EedeAC495271d0F"),
-        decimals: 18,
+        symbol: "USDC",
+        name: "USD Coin (Circle)",
+        address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        decimals: 6,
     },
     Token {
         symbol: "WETH",
         name: "Wrapped Ether",
         address: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "WBTC",
+        name: "Wrapped Bitcoin",
+        address: address!("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),
+        decimals: 8,
+    },
+    Token {
+        symbol: "UNI",
+        name: "Uniswap",
+        address: address!("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"),
         decimals: 18,
     },
     Token {
@@ -235,10 +268,58 @@ const MAINNET_TOKENS: &[Token] = &[
         decimals: 18,
     },
     Token {
-        symbol: "WBTC",
-        name: "Wrapped Bitcoin",
-        address: address!("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),
-        decimals: 8,
+        symbol: "QNT",
+        name: "Quant",
+        address: address!("0x4a220E6096B25EADb88358cb44068A3248254675"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "DAI",
+        name: "Dai",
+        address: address!("0x6B175474E89094C44Da98b954EedeAC495271d0F"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "PYUSD",
+        name: "PayPal USD (Paxos)",
+        address: address!("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"),
+        decimals: 6,
+    },
+    Token {
+        symbol: "ONDO",
+        name: "Ondo",
+        address: address!("0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "AAVE",
+        name: "Aave",
+        address: address!("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "PEPE",
+        name: "Pepe",
+        address: address!("0x6982508145454Ce325dDbE47a25d4ec3d2311933"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "SHIB",
+        name: "Shiba Inu",
+        address: address!("0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "1INCH",
+        name: "1inch",
+        address: address!("0x111111111117dC0aa78b770fA6A738034120C302"),
+        decimals: 18,
+    },
+    Token {
+        symbol: "CRV",
+        name: "Curve DAO Token",
+        address: address!("0xD533a949740bb3306d119CC777fa900bA034cd52"),
+        decimals: 18,
     },
 ];
 

@@ -678,39 +678,40 @@ mod tests {
         for script in ["\n", ""] {
             let (tokens, output) = scripted(script, |i, o| prompt_tokens(i, o, Network::Sepolia));
             assert_eq!(symbols(&tokens.unwrap()), ["USDC"], "{script:?}");
+            assert!(output.starts_with("Tokens on sepolia:\n"), "{output}");
             assert!(
-                output.starts_with(
-                    "Tokens on sepolia:\n  \
-                     USDC  USD Coin (Circle)  0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238\n"
+                output.contains(
+                    "  USDC  USD Coin (Circle)  0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238\n"
                 ),
                 "{output}"
             );
             assert!(
                 output.contains("  LINK  Chainlink  0x779877A7B0D9E8603169DdbD7836e478b4624789\n")
             );
-            assert!(!output.contains("WBTC"));
+            assert!(!output.contains("PEPE"));
         }
     }
 
     #[test]
     fn token_prompt_reprompts_on_unknown_symbols() {
-        let (tokens, output) = scripted("usdc, wbtc\n , \n weth,usdc ,DAI\n", |i, o| {
+        let (tokens, output) = scripted("usdc, pepe\n , \n weth,usdc ,DAI\n", |i, o| {
             prompt_tokens(i, o, Network::Sepolia)
         });
         assert_eq!(symbols(&tokens.unwrap()), ["WETH", "USDC", "DAI"]);
         let prompt = "Tokens to track, comma-separated or none [USDC]: ";
         let answers = output.split_once(prompt).map(|(_, rest)| rest).unwrap();
+        let (refusal, rest) = answers.split_once('\n').unwrap();
+        assert!(
+            refusal.starts_with("unknown token \"pepe\" on sepolia; known tokens: USDT, USDC"),
+            "{refusal}"
+        );
         assert_eq!(
-            answers,
-            format!(
-                "unknown token \"wbtc\" on sepolia; known tokens: USDC, USDT, DAI, WETH, LINK\n\
-                 {prompt}Enter token symbols separated by commas, or none.\n\
-                 {prompt}"
-            )
+            rest,
+            format!("{prompt}Enter token symbols separated by commas, or none.\n{prompt}")
         );
 
-        let (mainnet, _) = scripted("WBTC\n", |i, o| prompt_tokens(i, o, Network::Mainnet));
-        assert_eq!(symbols(&mainnet.unwrap()), ["WBTC"]);
+        let (mainnet, _) = scripted("PEPE\n", |i, o| prompt_tokens(i, o, Network::Mainnet));
+        assert_eq!(symbols(&mainnet.unwrap()), ["PEPE"]);
         let (none, _) = scripted("None\n", |i, o| prompt_tokens(i, o, Network::Sepolia));
         assert!(none.unwrap().is_empty());
     }
@@ -796,7 +797,7 @@ mod tests {
         };
         let args = InitArgs {
             network: Some(Network::Sepolia),
-            tokens: vec!["WBTC".to_owned()],
+            tokens: vec!["PEPE".to_owned()],
             ..InitArgs::default()
         };
         let error =

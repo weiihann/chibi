@@ -2,13 +2,13 @@
 # Compares a running chibi against a public RPC used only as a test oracle.
 # Usage: scripts/oracle-check.sh ADDRESS [ADDRESS...]
 # Env: CHIBI (default http://127.0.0.1:8545), ORACLE (default publicnode Sepolia),
-#      TOKENS (space-separated token addresses, default every Sepolia token chibi knows).
+#      TOKENS (space-separated token addresses, default every Sepolia token in chibi's registry).
 #      Requires foundry's `cast` and curl.
 set -u
 
 CHIBI=${CHIBI:-http://127.0.0.1:8545}
 ORACLE=${ORACLE:-https://ethereum-sepolia-rpc.publicnode.com}
-TOKENS=${TOKENS:-0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238 0xaA8E23Fb1079EA71e0a56F48a2aA51851D8433D0 0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14 0x779877A7B0D9E8603169DdbD7836e478b4624789}
+TOKENS=${TOKENS:-$(cargo run -q -p chibi-node --example registry | awk -F '\t' '$1 == "sepolia" { print $3 }')}
 failures=0
 
 [ $# -ge 1 ] || { echo "usage: $0 ADDRESS [ADDRESS...]" >&2; exit 2; }
