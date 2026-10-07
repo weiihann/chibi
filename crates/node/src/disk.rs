@@ -336,7 +336,6 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
         }
         _ => db_error(&path, &err),
     };
-    // In the rollback-journal mode a reader only takes a shared lock on the database file.
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(&path, flags).map_err(fail)?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
@@ -355,8 +354,7 @@ fn open_db(dir: &Path) -> Result<Db, NodeError> {
     let fail = |err| db_error(&path, &err);
     let mut conn = Connection::open(&path).map_err(fail)?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
-    // The rollback journal, so readers create no files. Also switches a database an
-    // earlier build left in WAL mode.
+    // The rollback journal, so readers create no files.
     let mode: String = conn
         .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
         .map_err(fail)?;
@@ -832,7 +830,6 @@ mod tests {
         let err = read_state(crashed.path()).unwrap_err().to_string();
         assert!(err.contains("start the node once"), "{err}");
         assert_eq!(listing(crashed.path()), before);
-        // The writer rolls the journal back on open, and status reads the saved state again.
         drop(Disk::open(crashed.path()).unwrap());
         assert_pre_contracts_snapshot(&read_snapshot(crashed.path()).unwrap().unwrap());
     }
@@ -878,8 +875,8 @@ mod tests {
                         .unwrap();
                     committed.store(byte, Ordering::Release);
                     drop(disk);
-                    // Leave the database closed for a while, so reads also find no writer.
-                    thread::sleep(Duration::from_millis(1));
+                    let closed_gap = Duration::from_millis(1);
+                    thread::sleep(closed_gap);
                 }
             })
         };
