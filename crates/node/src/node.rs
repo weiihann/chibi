@@ -28,7 +28,7 @@ use url::Url;
 
 use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
 use crate::devp2p::{Devp2p, Devp2pError, HeadHint, Ports};
-use crate::disk::{Disk, OutboxTx, StateFile};
+use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
 use crate::follow::Search;
 use crate::heads::Heads;
@@ -79,7 +79,7 @@ const SNAP_PEER_PROGRESS: Duration = Duration::from_secs(30);
 pub struct NodeConfig {
     /// The chain to follow.
     pub network: Network,
-    /// Per-network data directory: helios checkpoint, devp2p key, peers, and the state file.
+    /// Per-network data directory: helios checkpoint, devp2p key, and the state database.
     pub data_dir: PathBuf,
     /// Beacon API endpoint. `None` uses the network's default.
     pub beacon_url: Option<Url>,
@@ -144,7 +144,7 @@ impl<P: Peers> Clone for Node<P> {
     }
 }
 
-/// The only task that advances the store, reanchors it, and writes the state file.
+/// The only task that advances the store, reanchors it, and writes the saved state.
 /// Not `Clone`: exactly one exists per node.
 #[derive(Debug)]
 pub struct Follower<P: Peers = Devp2p> {
@@ -225,7 +225,7 @@ pub struct Snapshot {
     pub saved_at: u64,
     /// One entry per watched address.
     pub holdings: Vec<Holding>,
-    /// One entry per tracked contract. Absent from state files written before contracts.
+    /// One entry per tracked contract. Absent from snapshots saved before contracts.
     #[serde(default)]
     pub contracts: Vec<ContractSnapshot>,
 }
@@ -286,7 +286,7 @@ impl Node<Devp2p> {
             .snap_peers
             .iter()
             .copied()
-            .chain(disk.read(StateFile::peers))
+            .chain(disk.read(Saved::peers))
             .collect();
         let checkpoint = checkpoint(&spec, config.checkpoint, &config.data_dir).await?;
         let url = match config.beacon_url {
@@ -847,7 +847,7 @@ impl<P: Peers> Follower<P> {
         }
     }
 
-    /// Moves to the newest attested head once, then persists the state file.
+    /// Moves to the newest attested head once, then persists the state.
     pub async fn step(&mut self) -> Result<Stepped, NodeError> {
         self.follow().await
     }
@@ -1014,7 +1014,7 @@ impl<P: Peers> Shared<P> {
         }
     }
 
-    /// Writes the snapshot, the outbox, and snap/2 peers to the state file.
+    /// Writes the snapshot, the outbox, and snap/2 peers to the state database.
     pub(crate) async fn persist(self: &Arc<Self>) -> Result<(), NodeError> {
         let shared = Arc::clone(self);
         blocking(move || {
@@ -1207,7 +1207,7 @@ async fn blocking<R: Send + 'static>(
 ) -> Result<R, NodeError> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|err| NodeError::Disk(format!("state file writer failed: {err}")))?
+        .map_err(|err| NodeError::Disk(format!("state writer failed: {err}")))?
 }
 
 /// `balanceOf(holder)` sent by the holder, so the run reads no account besides those it needs.

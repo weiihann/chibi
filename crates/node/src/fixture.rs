@@ -47,7 +47,7 @@ pub enum Fault {
 pub struct Broadcast {
     /// The transaction.
     pub transaction: Transaction,
-    /// Whether the state file's outbox held it when the broadcast happened.
+    /// Whether the saved outbox held it when the broadcast happened.
     pub persisted: bool,
 }
 
@@ -199,7 +199,7 @@ impl Fixture {
         self.inner.log.lock().clone()
     }
 
-    /// Makes each broadcast record whether the state file in `dir` already held the
+    /// Makes each broadcast record whether the state saved in `dir` already held the
     /// transaction in its outbox.
     pub fn watch_outbox(&self, dir: PathBuf) {
         *self.inner.outbox_dir.lock() = Some(dir);

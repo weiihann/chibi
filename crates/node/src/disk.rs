@@ -1,9 +1,9 @@
-//! The per-network data directory: its lock, the devp2p identity, and the state file.
+//! The per-network data directory: its lock, the devp2p identity, and the state database.
 //!
-//! The state file holds a display snapshot, the outbox of pending raw transactions, and
+//! The database holds a display snapshot, the outbox of pending raw transactions, and
 //! snap/2 peers worth dialing first. Tracked keys are not saved: they follow from the
-//! watchlist at each start. The file is replaced atomically (temp file, fsync, rename). Its
-//! values are display-only: nothing read from it enters a `Store`.
+//! watchlist at each start. Its values are display-only: nothing read from it enters a
+//! `Store`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
@@ -15,16 +15,39 @@ use alloy_eips::BlockNumHash;
 use alloy_primitives::{Bytes, hex};
 use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
-use serde::{Deserialize, Serialize};
+use rusqlite::types::Type;
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
+use serde::Deserialize;
 use tracing::warn;
 
 use crate::devp2p::{SecretKey, rng_secret_key};
 use crate::node::{NodeError, Snapshot};
 
 const LOCK_FILE: &str = "chibi.lock";
-const STATE_FILE: &str = "state.json";
-const STATE_TEMP: &str = "state.json.tmp";
+const DB_FILE: &str = "chibi.db";
+/// The JSON file that held the state before the database. [`Disk::open`] imports it once and
+/// deletes it.
+const LEGACY_STATE_FILE: &str = "state.json";
 const KEY_FILE: &str = "devp2p.key";
+
+/// The version [`SCHEMA`] records in `PRAGMA user_version`; 0 means no schema yet.
+const SCHEMA_VERSION: i32 = 1;
+const SCHEMA: &str = "
+CREATE TABLE snapshot (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    json TEXT NOT NULL
+);
+CREATE TABLE outbox (
+    position INTEGER PRIMARY KEY,
+    raw BLOB NOT NULL,
+    since_number INTEGER NOT NULL,
+    since_hash BLOB NOT NULL
+);
+CREATE TABLE peers (
+    position INTEGER PRIMARY KEY,
+    record TEXT NOT NULL
+);
+";
 
 /// Most snap/2 peers remembered across restarts.
 const REMEMBERED_PEERS: usize = 16;
@@ -60,7 +83,7 @@ impl Holder {
 
 /// A submitted transaction not yet located, and the anchor chibi held when it was submitted.
 /// Inclusion can only be in a later block, so a search for it need not reach further back.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct OutboxTx {
     /// The EIP-2718 encoding.
     pub(crate) raw: Bytes,
@@ -68,15 +91,15 @@ pub(crate) struct OutboxTx {
     pub(crate) since: BlockNumHash,
 }
 
-/// The state file's contents.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StateFile {
+/// The saved state. Deserializes from the legacy JSON file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct Saved {
     snapshot: Option<Snapshot>,
     outbox: Vec<OutboxTx>,
     peers: Vec<String>,
 }
 
-impl StateFile {
+impl Saved {
     pub(crate) const fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
@@ -118,13 +141,20 @@ impl StateFile {
 #[derive(Debug)]
 pub struct Disk {
     dir: PathBuf,
+    db: Mutex<Db>,
     _lock: File,
-    file: Mutex<StateFile>,
+}
+
+/// The writer's connection and what it last committed.
+#[derive(Debug)]
+struct Db {
+    conn: Connection,
+    saved: Saved,
 }
 
 impl Disk {
     /// Creates `dir` if needed, takes its exclusive lock, records this process id in the lock
-    /// file, and loads the state file.
+    /// file, and opens the database, importing a legacy state file into a new one.
     pub fn open(dir: &Path) -> Result<Self, NodeError> {
         fs::create_dir_all(dir).map_err(|err| io_error(dir, &err))?;
         let lock_path = dir.join(LOCK_FILE);
@@ -156,11 +186,11 @@ impl Disk {
             .and_then(|()| lock.write_all(pid.as_bytes()))
             .and_then(|()| lock.sync_all())
             .map_err(|err| io_error(&lock_path, &err))?;
-        let file = read_state(dir)?.unwrap_or_default();
+        let db = open_db(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            db: Mutex::new(db),
             _lock: lock,
-            file: Mutex::new(file),
         })
     }
 
@@ -233,32 +263,33 @@ impl Disk {
         &self.dir
     }
 
-    /// Reads the loaded state file.
-    pub(crate) fn read<R>(&self, f: impl FnOnce(&StateFile) -> R) -> R {
-        f(&self.file.lock())
+    /// Reads the loaded state.
+    pub(crate) fn read<R>(&self, f: impl FnOnce(&Saved) -> R) -> R {
+        f(&self.db.lock().saved)
     }
 
-    /// Edits the state file and writes it out before releasing it, so concurrent writers
-    /// cannot reorder their writes. Blocks on fsync; call it off the async workers.
-    pub(crate) fn save(&self, edit: impl FnOnce(&mut StateFile)) -> Result<(), NodeError> {
+    /// Edits the state and commits the tables it changed before releasing it, so concurrent
+    /// writers cannot reorder their writes. Blocks on fsync; call it off the async workers.
+    pub(crate) fn save(&self, edit: impl FnOnce(&mut Saved)) -> Result<(), NodeError> {
         self.save_then(edit, || ())
     }
 
-    /// Like [`Disk::save`], and runs `written` once the file is durable, still holding the
-    /// file, so no other write lands between the two. On failure the loaded state is left as
-    /// it was and `written` does not run.
+    /// Like [`Disk::save`], and runs `written` once the commit is durable, still holding the
+    /// database, so no other write lands between the two. On failure the loaded state is left
+    /// as it was and `written` does not run.
     pub(crate) fn save_then<R>(
         &self,
-        edit: impl FnOnce(&mut StateFile),
+        edit: impl FnOnce(&mut Saved),
         written: impl FnOnce() -> R,
     ) -> Result<R, NodeError> {
-        let mut file = self.file.lock();
-        let mut next = file.clone();
+        let mut db = self.db.lock();
+        let Db { conn, saved } = &mut *db;
+        let mut next = saved.clone();
         edit(&mut next);
-        let json = serde_json::to_vec_pretty(&next)
-            .map_err(|err| NodeError::Disk(format!("encoding the state file: {err}")))?;
-        write_atomic(&self.dir, &json)?;
-        *file = next;
+        if next != *saved {
+            commit(conn, saved, &next).map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?;
+            *saved = next;
+        }
         Ok(written())
     }
 
@@ -285,9 +316,79 @@ impl Disk {
     }
 }
 
-/// Reads the state file in `dir` without taking the lock. `None` if there is none yet.
-pub(crate) fn read_state(dir: &Path) -> Result<Option<StateFile>, NodeError> {
-    let path = dir.join(STATE_FILE);
+/// Reads the state saved in `dir` without taking the lock, alongside a running writer. `None`
+/// if there is none yet.
+pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
+    let path = dir.join(DB_FILE);
+    if !path.try_exists().map_err(|err| io_error(&path, &err))? {
+        return Ok(None);
+    }
+    let fail = |err| db_error(&path, &err);
+    let mut conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(fail)?;
+    let tx = conn.transaction().map_err(fail)?;
+    match schema_version(&tx).map_err(fail)? {
+        0 => Ok(None),
+        SCHEMA_VERSION => load(&tx).map(Some).map_err(fail),
+        newer => Err(newer_schema(&path, newer)),
+    }
+}
+
+/// Opens the writer's connection to `dir`'s database. A new database gets the schema and
+/// the contents of a legacy state file if there is one.
+fn open_db(dir: &Path) -> Result<Db, NodeError> {
+    let path = dir.join(DB_FILE);
+    let fail = |err| db_error(&path, &err);
+    let mut conn = Connection::open(&path).map_err(fail)?;
+    let mode: String = conn
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+        .map_err(fail)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(NodeError::Disk(format!(
+            "{}: journal mode is {mode}, not WAL",
+            path.display()
+        )));
+    }
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(fail)?;
+    match schema_version(&conn).map_err(fail)? {
+        0 => create(&mut conn, dir).map_err(fail)?,
+        SCHEMA_VERSION => {}
+        newer => return Err(newer_schema(&path, newer)),
+    }
+    let saved = load(&conn).map_err(fail)?;
+    Ok(Db { conn, saved })
+}
+
+/// Creates the schema, filled from the legacy state file if there is one, and deletes that
+/// file once the import is committed. An unreadable legacy file is left in place and ignored.
+fn create(conn: &mut Connection, dir: &Path) -> rusqlite::Result<()> {
+    let legacy = read_legacy(dir).unwrap_or_else(|err| {
+        warn!(target: "chibi::disk", %err, "ignoring the unreadable legacy state file");
+        None
+    });
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA)?;
+    if let Some(legacy) = &legacy {
+        write_tables(&tx, &Saved::default(), legacy)?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    let legacy_path = dir.join(LEGACY_STATE_FILE);
+    if legacy.is_some()
+        && let Err(err) = fs::remove_file(&legacy_path)
+    {
+        warn!(target: "chibi::disk", path = %legacy_path.display(), %err, "could not delete the imported legacy state file");
+    }
+    Ok(())
+}
+
+/// Reads the legacy state file in `dir`. `None` if there is none.
+fn read_legacy(dir: &Path) -> Result<Option<Saved>, NodeError> {
+    let path = dir.join(LEGACY_STATE_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -298,19 +399,89 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<StateFile>, NodeError> {
         .map_err(|err| NodeError::Disk(format!("{}: {err}", path.display())))
 }
 
-fn write_atomic(dir: &Path, bytes: &[u8]) -> Result<(), NodeError> {
-    let temp = dir.join(STATE_TEMP);
-    let path = dir.join(STATE_FILE);
-    let mut file = File::create(&temp).map_err(|err| io_error(&temp, &err))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|err| io_error(&temp, &err))?;
-    fs::rename(&temp, &path).map_err(|err| io_error(&path, &err))?;
-    // The rename is durable only once the directory entry is synced.
-    if let Err(err) = File::open(dir).and_then(|dir| dir.sync_all()) {
-        warn!(target: "chibi::disk", dir = %dir.display(), %err, "could not sync the data directory");
+fn schema_version(conn: &Connection) -> rusqlite::Result<i32> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+fn load(conn: &Connection) -> rusqlite::Result<Saved> {
+    let snapshot = conn
+        .query_row("SELECT json FROM snapshot", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(err)))?;
+    let outbox = conn
+        .prepare("SELECT raw, since_number, since_hash FROM outbox ORDER BY position")?
+        .query_map([], |row| {
+            Ok(OutboxTx {
+                raw: Bytes::from(row.get::<_, Vec<u8>>(0)?),
+                since: BlockNumHash::new(row.get(1)?, row.get::<_, [u8; 32]>(2)?.into()),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let peers = conn
+        .prepare("SELECT record FROM peers ORDER BY position")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Saved {
+        snapshot,
+        outbox,
+        peers,
+    })
+}
+
+/// Commits `after` over `before` in one transaction.
+fn commit(conn: &mut Connection, before: &Saved, after: &Saved) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    write_tables(&tx, before, after)?;
+    tx.commit()
+}
+
+/// Rewrites the tables whose content differs between `before` and `after`.
+fn write_tables(conn: &Connection, before: &Saved, after: &Saved) -> rusqlite::Result<()> {
+    if after.snapshot != before.snapshot {
+        conn.execute("DELETE FROM snapshot", [])?;
+        if let Some(snapshot) = &after.snapshot {
+            let json = serde_json::to_string(snapshot)
+                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+            conn.execute("INSERT INTO snapshot (id, json) VALUES (0, ?1)", [json])?;
+        }
+    }
+    if after.outbox != before.outbox {
+        conn.execute("DELETE FROM outbox", [])?;
+        let mut insert = conn.prepare(
+            "INSERT INTO outbox (position, raw, since_number, since_hash) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (position, entry) in after.outbox.iter().enumerate() {
+            insert.execute(params![
+                position,
+                entry.raw.as_ref(),
+                entry.since.number,
+                entry.since.hash.as_slice()
+            ])?;
+        }
+    }
+    if after.peers != before.peers {
+        conn.execute("DELETE FROM peers", [])?;
+        let mut insert = conn.prepare("INSERT INTO peers (position, record) VALUES (?1, ?2)")?;
+        for (position, record) in after.peers.iter().enumerate() {
+            insert.execute(params![position, record])?;
+        }
     }
     Ok(())
+}
+
+fn newer_schema(path: &Path, version: i32) -> NodeError {
+    NodeError::Disk(format!(
+        "{}: schema version {version} is newer than this chibi's {SCHEMA_VERSION}; upgrade chibi",
+        path.display()
+    ))
+}
+
+fn db_error(path: &Path, err: &rusqlite::Error) -> NodeError {
+    NodeError::Disk(format!("{}: {err}", path.display()))
 }
 
 #[cfg(unix)]
@@ -333,8 +504,24 @@ fn io_error(path: &Path, err: &std::io::Error) -> NodeError {
 }
 
 #[cfg(test)]
+impl Disk {
+    /// Makes saves fail until the returned connection drops: it holds the database's write
+    /// lock, and this writer stops waiting for it after 10 ms.
+    pub(crate) fn block_writes(&self) -> Connection {
+        self.db
+            .lock()
+            .conn
+            .busy_timeout(Duration::from_millis(10))
+            .unwrap();
+        let other = Connection::open(self.dir.join(DB_FILE)).unwrap();
+        other.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        other
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use alloy_primitives::B256;
+    use alloy_primitives::{B256, U256};
 
     use super::*;
 
@@ -460,33 +647,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn saved_state_round_trips_and_leaves_no_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let outbox = vec![queued(1, 9), queued(2, 11)];
-        {
-            let disk = Disk::open(dir.path()).unwrap();
-            disk.save(|file| {
-                file.set_outbox(outbox.clone());
-                file.remember_peers(&[record(1, 30303)]);
-            })
-            .unwrap();
-        }
-        assert!(!dir.path().join(STATE_TEMP).exists());
-        let disk = Disk::open(dir.path()).unwrap();
-        disk.read(|file| {
-            assert_eq!(file.outbox(), outbox.as_slice());
-            assert_eq!(file.peers(), vec![record(1, 30303)]);
-        });
-    }
-
-    #[test]
-    fn a_state_file_from_before_contracts_still_loads() {
-        let dir = tempfile::tempdir().unwrap();
+    /// A snapshot as written before contracts were tracked.
+    fn pre_contracts_snapshot_json() -> String {
         let hash = B256::repeat_byte(1);
-        let json = format!(
+        format!(
             r#"{{
-  "snapshot": {{
     "network": "sepolia",
     "block": {{ "number": 11849838, "hash": "{hash}" }},
     "saved_at": 1759700000,
@@ -498,28 +663,91 @@ mod tests {
         "tokens": [["USDC", "0xe4e1c0"], ["WETH", null]]
       }}
     ]
-  }},
-  "outbox": [],
-  "peers": []
-}}"#
-        );
-        fs::write(dir.path().join(STATE_FILE), json).unwrap();
-        let snapshot = read_state(dir.path()).unwrap().unwrap().snapshot.unwrap();
+  }}"#
+        )
+    }
+
+    fn assert_pre_contracts_snapshot(snapshot: &Snapshot) {
         assert_eq!(snapshot.block.number, 11_849_838);
+        assert_eq!(snapshot.block.hash, B256::repeat_byte(1));
+        assert_eq!(snapshot.saved_at, 1_759_700_000);
         assert_eq!(snapshot.holdings[0].nonce, Some(4));
         assert_eq!(
-            snapshot.holdings[0].tokens[0],
-            (
-                "USDC".to_owned(),
-                Some(alloy_primitives::U256::from(15_000_000u64))
-            )
+            snapshot.holdings[0].tokens,
+            vec![
+                ("USDC".to_owned(), Some(U256::from(15_000_000u64))),
+                ("WETH".to_owned(), None)
+            ]
         );
         assert!(snapshot.contracts.is_empty());
     }
 
+    /// Writes a legacy state file holding the pre-contracts snapshot, one outbox entry equal
+    /// to `queued(1, 9)`, and `record(1, 30303)`.
+    fn write_legacy_state(dir: &Path) {
+        let snapshot = pre_contracts_snapshot_json();
+        let hash = B256::repeat_byte(1);
+        let peer = record(1, 30303);
+        let json = format!(
+            r#"{{
+  "snapshot": {snapshot},
+  "outbox": [{{ "raw": "0x01", "since": {{ "number": 9, "hash": "{hash}" }} }}],
+  "peers": ["{peer}"]
+}}"#
+        );
+        fs::write(dir.join(LEGACY_STATE_FILE), json).unwrap();
+    }
+
+    #[test]
+    fn outbox_peers_and_snapshot_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            disk.save(|saved| {
+                saved.set_outbox(vec![queued(1, 9), queued(2, 11)]);
+                saved.set_snapshot(snapshot.clone());
+                saved.remember_peers(&[record(1, 30303)]);
+            })
+            .unwrap();
+            disk.save(|saved| saved.remember_peers(&[record(2, 30304)]))
+                .unwrap();
+        }
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.read(|saved| {
+            assert_eq!(saved.outbox(), &[queued(1, 9), queued(2, 11)]);
+            assert_eq!(saved.peers(), vec![record(2, 30304), record(1, 30303)]);
+            assert_pre_contracts_snapshot(saved.snapshot().unwrap());
+        });
+    }
+
+    #[test]
+    fn a_legacy_state_file_from_before_contracts_is_imported_then_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy_state(dir.path());
+        drop(Disk::open(dir.path()).unwrap());
+        assert!(!dir.path().join(LEGACY_STATE_FILE).exists());
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.read(|saved| {
+            assert_eq!(saved.outbox(), &[queued(1, 9)]);
+            assert_eq!(saved.peers(), vec![record(1, 30303)]);
+            assert_pre_contracts_snapshot(saved.snapshot().unwrap());
+        });
+    }
+
+    #[test]
+    fn an_unreadable_legacy_state_file_is_left_and_the_state_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_STATE_FILE);
+        fs::write(&legacy, "{ not json").unwrap();
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.read(|saved| assert_eq!(saved, &Saved::default()));
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), "{ not json");
+    }
+
     #[test]
     fn remembered_peers_merge_newest_first_dedupe_by_id_and_cap() {
-        let mut file = StateFile::default();
+        let mut file = Saved::default();
         file.remember_peers(&[record(1, 1), record(2, 2)]);
         file.remember_peers(&[]);
         assert_eq!(file.peers(), vec![record(1, 1), record(2, 2)]);
@@ -530,23 +758,30 @@ mod tests {
         assert_eq!(file.peers(), many[..REMEMBERED_PEERS].to_vec());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_failed_save_leaves_the_loaded_state_and_skips_the_commit() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn a_failed_save_leaves_the_loaded_state_and_skips_written() {
         let dir = tempfile::tempdir().unwrap();
         let disk = Disk::open(dir.path()).unwrap();
-        disk.save(|file| file.set_outbox(vec![queued(1, 1)]))
+        disk.save(|saved| saved.set_outbox(vec![queued(1, 1)]))
             .unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
-        let mut committed = false;
-        let saved = disk.save_then(
-            |file| file.set_outbox(vec![queued(2, 1)]),
-            || committed = true,
+        let blocker = disk.block_writes();
+        let mut written = false;
+        let result = disk.save_then(
+            |saved| saved.set_outbox(vec![queued(2, 1)]),
+            || written = true,
         );
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(saved, Err(NodeError::Disk(_))));
-        assert!(!committed);
-        disk.read(|file| assert_eq!(file.outbox(), &[queued(1, 1)]));
+        assert!(matches!(result, Err(NodeError::Disk(_))));
+        assert!(!written);
+        disk.read(|saved| assert_eq!(saved.outbox(), &[queued(1, 1)]));
+
+        drop(blocker);
+        disk.save(|saved| saved.remember_peers(&[record(1, 1)]))
+            .unwrap();
+        drop(disk);
+        let reopened = Disk::open(dir.path()).unwrap();
+        reopened.read(|saved| {
+            assert_eq!(saved.outbox(), &[queued(1, 1)]);
+            assert_eq!(saved.peers(), vec![record(1, 1)]);
+        });
     }
 }

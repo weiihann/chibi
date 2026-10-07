@@ -688,21 +688,19 @@ async fn a_transaction_whose_nonce_another_took_is_dropped_once_its_blocks_were_
     assert!(read_state(dir.path()).unwrap().unwrap().outbox().is_empty());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_submission_whose_outbox_cannot_be_saved_is_neither_recorded_nor_sent() {
-    use std::os::unix::fs::PermissionsExt as _;
     let signer = PrivateKeySigner::random();
     let sender = signer.address();
     let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = start(&fixture, dir.path(), &[sender], &[]).await;
+    let (node, follower) = start(&fixture, dir.path(), &[sender], &[]).await;
     fixture.watch_outbox(dir.path().to_path_buf());
     let tx = signed_transfer(&signer, node.chain_id(), 0);
 
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let blocker = follower.shared.disk.block_writes();
     let refused = node.submit(&tx.encoded_2718()).await;
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(blocker);
     assert!(matches!(refused, Err(NodeError::Disk(_))));
     assert_eq!(node.transaction(*tx.tx_hash()).unwrap(), None);
     assert_eq!(
