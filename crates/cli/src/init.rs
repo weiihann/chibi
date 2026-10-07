@@ -165,7 +165,7 @@ fn write_reset<W: Write>(
         dir.join("chibi.db").display(),
         count(reset.snapshot, "snapshot"),
         count(reset.outbox, "pending transaction"),
-        count(reset.keys, "remembered key"),
+        count(reset.keys, "learned key"),
     )
 }
 

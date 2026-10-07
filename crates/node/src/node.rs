@@ -366,7 +366,7 @@ struct KeysSaved {
 impl Node<Devp2p> {
     /// Opens the data dir (taking its lock), starts the light client and devp2p, and returns
     /// once the state is anchored at a fresh verified head. Nothing is proven yet: the
-    /// follower warms pins and remembered keys, and requests fetch what they miss.
+    /// follower warms pins and learned keys, and requests fetch what they miss.
     pub async fn start(config: NodeConfig) -> Result<(Self, Follower<Devp2p>), NodeError> {
         let spec = config.network.spec();
         let disk = Disk::open(&config.data_dir)?;
