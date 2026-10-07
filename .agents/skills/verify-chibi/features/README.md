@@ -6,7 +6,7 @@ This directory is the maintained source for verifying chibi's user-facing behavi
 
 - A run started with `.agents/skills/verify-chibi/scripts/launch.sh`, with `RUN_DIR` and its `PORT` (from `$RUN_DIR/meta.env`) known.
 - `doctor.sh "$RUN_DIR"` exits 0, including the head-freshness check.
-- `cast`, `curl`, `lsof`, and `tmux` are on `PATH`.
+- `cast`, `curl`, `lsof`, and `tmux` are on `PATH`, and `bun` for `wallet-check.sh`.
 - Outbound access to Sepolia devp2p peers, `https://beacon.sepolia.ethpandaops.io/nimbus` (the light client's beacon API), and `https://ethereum-sepolia-rpc.publicnode.com` (the oracle).
 - Never drive the user's own chibi (default port 8545).
 

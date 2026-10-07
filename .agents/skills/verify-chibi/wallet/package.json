@@ -1,0 +1,16 @@
+{
+  "name": "chibi-wallet-check",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@metamask/assets-controller": "15.0.0",
+    "@metamask/assets-controllers": "112.0.4",
+    "@metamask/messenger": "3.0.0",
+    "@metamask/network-controller": "36.0.0"
+  },
+  "overrides": {
+    "@metamask/network-controller": "36.0.0",
+    "@metamask/eth-json-rpc-middleware": "24.0.2",
+    "@metamask/eth-block-tracker": "15.0.1"
+  }
+}
