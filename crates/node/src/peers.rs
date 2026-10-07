@@ -257,3 +257,132 @@ pub enum NetError {
     #[error("network stopped")]
     Stopped,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::*;
+
+    /// Answers each account request when the test says so, with a snap/2 peer count the test
+    /// sets.
+    #[derive(Debug)]
+    struct Stub {
+        snap_peers: AtomicUsize,
+        arrived: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    }
+
+    impl Peers for Stub {
+        async fn headers(&self, _: B256, _: u64) -> Result<Reply<Vec<Header>>, NetError> {
+            unreachable!("headers")
+        }
+
+        async fn account_range(
+            &self,
+            _: AccountRangeRequest,
+        ) -> Result<Reply<AccountReply>, NetError> {
+            let (answer, answered) = oneshot::channel();
+            self.arrived.send(answer).unwrap();
+            answered.await.map_err(|_| NetError::Stopped)?;
+            Ok(Reply {
+                peer: PeerKey(B512::ZERO),
+                value: AccountReply::default(),
+            })
+        }
+
+        async fn storage_range(
+            &self,
+            _: StorageRangeRequest,
+        ) -> Result<Reply<StorageReply>, NetError> {
+            unreachable!("storage_range")
+        }
+
+        async fn byte_codes(&self, _: Vec<B256>) -> Result<Reply<Vec<Bytes>>, NetError> {
+            unreachable!("byte_codes")
+        }
+
+        async fn block_access_lists(
+            &self,
+            _: Vec<B256>,
+        ) -> Result<Reply<Vec<Option<Bytes>>>, NetError> {
+            unreachable!("block_access_lists")
+        }
+
+        async fn bodies(&self, _: Vec<B256>) -> Result<Reply<Vec<Body>>, NetError> {
+            unreachable!("bodies")
+        }
+
+        async fn receipts(&self, _: B256) -> Result<Reply<Vec<Receipt>>, NetError> {
+            unreachable!("receipts")
+        }
+
+        async fn broadcast(&self, _: Transaction) -> Result<usize, NetError> {
+            unreachable!("broadcast")
+        }
+
+        fn penalize(&self, _: PeerKey) {}
+
+        fn announce(&self, _: &VerifiedHeader) {}
+
+        fn census(&self) -> Census {
+            Census {
+                snap_peers: self.snap_peers.load(Ordering::SeqCst),
+                ..Census::default()
+            }
+        }
+    }
+
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn after_snap_peers_drop_from_four_to_one_only_one_request_is_out_at_a_time() {
+        let (arrived, mut arrivals) = mpsc::unbounded_channel();
+        let paced = Arc::new(Paced::new(Stub {
+            snap_peers: AtomicUsize::new(4),
+            arrived,
+        }));
+        let request = AccountRangeRequest {
+            root: B256::ZERO,
+            key: B256::ZERO,
+        };
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let paced = Arc::clone(&paced);
+                tokio::spawn(async move { paced.account_range(request).await })
+            })
+            .collect();
+
+        settle().await;
+        let mut first = Vec::new();
+        while let Ok(answer) = arrivals.try_recv() {
+            first.push(answer);
+        }
+        assert_eq!(first.len(), 4);
+
+        paced.inner.snap_peers.store(1, Ordering::SeqCst);
+        for answer in first {
+            answer.send(()).unwrap();
+        }
+        for _ in 0..4 {
+            settle().await;
+            let mut out = Vec::new();
+            while let Ok(answer) = arrivals.try_recv() {
+                out.push(answer);
+            }
+            assert_eq!(out.len(), 1, "requests out at the one remaining peer");
+            for answer in out {
+                answer.send(()).unwrap();
+            }
+        }
+        for call in calls {
+            assert!(call.await.unwrap().is_ok());
+        }
+    }
+}
