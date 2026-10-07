@@ -31,8 +31,6 @@ fn init_args(network: &str) -> Vec<&str> {
         network,
         "--address",
         ALICE,
-        "--token",
-        "USDC",
         "--rpc-host",
         "127.0.0.1",
         "--rpc-port",

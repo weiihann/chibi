@@ -23,12 +23,12 @@ $ ./install.sh
 Network [sepolia]:
 Watch-only address (blank to finish): 0x3D76...5ce6
 Watch-only address (blank to finish):
-wrote ~/.config/chibi/config.toml (sepolia, 1 address, tracking USDC)
+wrote ~/.config/chibi/config.toml (sepolia, 1 address)
 
 $ chibi run
 INFO chibi::node: light client synced network=sepolia
 INFO chibi::node: waiting for a snap/2 peer peers=0 snap_peers=0 dialed=6 elapsed_s=0
-INFO chibi::node: anchored head=11848650 keys=8
+INFO chibi::node: anchored head=11848650 keys=1
 INFO chibi::rpc: JSON-RPC on http://127.0.0.1:8545, chain id 11155111
 INFO chibi::follow: head verified head=11848651 stepped=Reanchored(..)
 
@@ -37,7 +37,7 @@ sepolia head 11848656 (saved 7s ago, not re-verified)
 0x3D767Bf85779E2b550aB5Fcd7E3bE39FB77A5ce6   0.000710619962413892 ETH   226.00 USDC
 ```
 
-The user adds `http://127.0.0.1:8545` as a custom network in the wallet. Balances arrive through `eth_getBalance`, USDC through `eth_call(balanceOf)`, and sends through `eth_estimateGas`, `eth_feeHistory`, `eth_sendRawTransaction`, and `eth_getTransactionReceipt`.
+The user adds `http://127.0.0.1:8545` as a custom network in the wallet. Balances arrive through `eth_getBalance`, USDC through `eth_call(balanceOf)`, and sends through `eth_estimateGas`, `eth_feeHistory`, `eth_sendRawTransaction`, and `eth_getTransactionReceipt`. USDC shows in `chibi status` once the wallet has read its keys, as long as the balance is not zero.
 
 `chibi run` in the binary:
 
@@ -67,7 +67,7 @@ assert_eq!(balance(&node, ALICE).await, Some(eth(4)));
 ```text
 chibi/
   install.sh
-  crates/core   chibi-core, no tokio: verify.rs state.rs exec.rs tx.rs
+  crates/core   chibi-core, no tokio: verify.rs state.rs working.rs exec.rs tx.rs
   crates/node   chibi-node: node.rs follow.rs fetch.rs disk.rs peers.rs heads.rs devp2p.rs beacon.rs network.rs fixture.rs
   crates/cli    chibi (bin): main.rs (init, run, status), config.rs, rpc.rs
 ```
@@ -78,7 +78,7 @@ Dependencies point one way: `cli -> node -> core`. reth-network and helios compi
 
 `Store` is partial state at one verified block, its anchor. It holds `accounts: HashMap<Address, Entry>` with `Entry::Absent | Present { account, slots }`, code by hash, and a window of the anchor plus up to 256 verified ancestors, enough for `BLOCKHASH`. Reads return `Result<_, Miss>`. A slot of an absent account is a known zero without a fetch. Slots live inside their account, so a slot without a proven account cannot be represented. Entries carry no block number of their own: the whole store moves together, so "valid at which block" has one answer. No storage root is held, because BALs would leave it stale. Each slot proof fetches its account proof at the same root, and both requests go out concurrently.
 
-`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the tracked key set, the finalized header, and the `TxBook` of submitted transactions. Tracked keys are the watched accounts, each configured `[[contracts]]` account with its listed raw storage slots, plus every key the token seeding runs read. Seeding runs two calls per watched address and selected token: `balanceOf(holder)` and a simulated `transfer(holder, 0)` from the holder. Together they cover proxy slots, pause flags, fee parameters, blacklist entries, and the holder's balance, so a send only has to fetch the recipient's slot. Recipient and allowance slots depend on the transaction and stay fetch-on-miss. Untracked keys fetched for dapp calls form a cache that a reanchor drops. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
+`State` is the canonical value the follower owns. It wraps `Arc<Store>`, the `WorkingSet`, the finalized header, and the `TxBook` of submitted transactions. The `WorkingSet` (`core::working`) is the one source of truth for which keys chibi keeps; the store holds a key only if the working set does, and working-set keys the store lacks are unheld. Pins are the watched accounts, each configured `[[contracts]]` account with its listed raw storage slots, and every key the seeding runs for pinned tokens read. Seeding runs two calls per watched address and pinned token: `balanceOf(holder)` and a simulated `transfer(holder, 0)` from the holder. Together they cover proxy slots, pause flags, fee parameters, blacklist entries, and the holder's balance, so a send only has to fetch the recipient's slot. Every other key a request reads (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`, `eth_estimateGas`) is learned. The set holds at most `WORKING_SET_CAP` = 1024 keys including pins and evicts the least recently used learned key. Pins are never evicted. Evicting an account evicts its learned slots, and evicted values leave the store. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
 
 ### Trust boundary
 
@@ -86,22 +86,31 @@ Dependencies point one way: `cli -> node -> core`. reth-network and helios compi
 
 Values enter a `Store` only through `Store::insert(Proven)` at the anchor, `State::advance(VerifiedBlock)` for the anchor's child, or a reanchor that builds a new store from `Proven` facts. Values read back from disk never enter a `Store`.
 
+### Start
+
+Once the trusted head's header is fetched and verified, `Node::start` builds an empty store at that anchor with the working set (the pins plus the learned keys the last run saved), restores the outbox, persists, and returns, and JSON-RPC opens. Nothing is proven before RPC opens. The follower's first step seeds pinned tokens and warms everything unheld. Requests during warm-up fetch their misses on demand.
+
 ### Advancing to a new head
 
-`State::plan(&target)` is pure and returns `Current`, `Extend { blocks }`, or `Reanchor`. It returns `Extend` when the gap is at most 32 blocks and every header in it has a `block_access_list_hash`. For `Extend` the follower verifies the header chain down to the anchor, fetches each BAL with snap/2 first and eth/71 with `BalRequirement::Optional` second, checks `keccak(raw)` against the header, and applies the BALs in one `update`. BAL semantics follow reth's `block_access_list_update`: last change wins, unknown addresses are ignored, an account left empty becomes `Absent` with its slots (EIP-161), and new code is stored by hash.
+`State::plan(&target)` is pure and returns `Current`, `Extend { blocks }`, or `Reanchor`. It returns `Extend` when the gap is at most 32 blocks and every header in it has a `block_access_list_hash`. For `Extend` the follower verifies the header chain down to the anchor, fetches each BAL with snap/2 first and eth/71 with `BalRequirement::Optional` second, checks `keccak(raw)` against the header, and applies the BALs in one `update`. BAL semantics follow reth's `block_access_list_update`: last change wins, an account left empty becomes `Absent` with its slots (EIP-161), and new code is stored by hash. Application updates only held keys: unheld accounts and slots are ignored, including a written slot of a held account.
 
-`Reanchor` proves every tracked key at the target into a fresh store while the old store stays published, then swaps. Startup, reopen, headers without BALs, missing BALs, reorgs, and long gaps all take this path. After each reanchor the token seeding runs repeat, so an upgraded token contract that moves its balance slot heals itself.
+`Reanchor` proves the pins at the target into a fresh store while the old store stays published, then swaps; one failed pin proof aborts it. Headers without BALs, failed BAL fetches, reorgs, and long gaps take this path. After the swap the token seeding runs repeat, so an upgraded token contract that moves its balance slot heals itself, and then learned keys are warmed. A seeding run that fails keeps every previous seeded pin, adds the keys the other runs read, and seeding is retried at each step until every run succeeds, so a peer that cannot yet serve an upgraded implementation never demotes a token's pins. Learned keys cannot block or abort a reanchor. Before Glamsterdam every head reanchors, so learned keys only partly re-warm between heads.
+
+### Warming
+
+The follower warms after each step: it proves unheld keys at the current anchor, pins first, then learned keys most recently used first, with at most `WARM_IN_FLIGHT` = 2 proofs in flight, merging every 64 proofs. reth keeps one in-flight snap request per peer, so wallet requests and BAL fetches wait behind at most 2 warm proofs. It stops at once when a new head arrives. A key that fails stays unheld for the next pass and never blocks the head. Requests wake the follower when anything is unheld.
 
 ### Requests and misses
 
-`Node` pins `Arc<Store>` and runs a pure step on it. `exec::execute` uses a revm `Database` whose error type cannot be constructed. A miss is recorded and reads as empty for the rest of that run only, and any recorded miss withholds the result (`Result<_, Misses>`, where `Misses` is non-empty by construction). One run can find several misses. The node proves them in one parallel batch at the pinned anchor, inserts them into the request's own copy (`Arc::make_mut`), and runs again, so round trips scale with dependency depth rather than key count. At the end `State::merge` keeps the new facts if the anchor has not moved and drops them otherwise. Gas estimation is reth's bisection as a pure function inside the same loop.
+`Node` pins `Arc<Store>` and runs a pure step on it. `exec::execute` uses a revm `Database` whose error type cannot be constructed. A miss is recorded and reads as empty for the rest of that run only, and any recorded miss withholds the result (`Result<_, Misses>`, where `Misses` is non-empty by construction). One run can find several misses. The node proves them in one parallel batch at the pinned anchor, inserts them into the request's own copy (`Arc::make_mut`), and runs again, so round trips scale with dependency depth rather than key count. At the end `State::merge` learns every key the request read. It keeps the new values if the anchor has not moved; otherwise it drops them, except code, which is content-addressed, and the follower warms those keys at the current anchor, so the next identical call is warm. Gas estimation is reth's bisection as a pure function inside the same loop.
 
 ### Concurrency
 
 | Pair | Outcome |
 |---|---|
 | Follower advance and RPC read | The read keeps its pinned `Arc<Store>`. It sees one head. |
-| Follower advance and a request's merge | Serialized by the mutex. A merge for an old anchor is dropped. |
+| Follower advance and a request's merge | Serialized by the mutex. A merge for an old anchor learns its keys and drops its values. |
+| Warming and follower advance | Warming runs inside the follower, so its merges never straddle an anchor move. |
 | Two requests missing the same key | Both fetch. The second merge re-inserts an equal value. |
 | Reanchor and RPC reads | Reads use the old store until the swap. |
 | Submit and follower | Both write the state database through `Disk`, always taking the disk lock before the state lock. Submit commits the outbox first and records the tx only if that commit succeeded, then broadcasts. Inclusion is found by a later step. |
@@ -110,7 +119,7 @@ The canonical `State` sits behind one `parking_lot::Mutex`, reachable only throu
 
 ### Persistence
 
-The state database is `chibi.db` in the per-network data directory, a SQLite file (rusqlite with the bundled SQLite) with the rollback journal (`journal_mode = DELETE`) and `synchronous = EXTRA`, so a commit is durable when it returns; with a rollback journal SQLite only guarantees that with EXTRA, which also syncs the directory after deleting the journal. A database an earlier build left in WAL mode is switched on the node's open. `PRAGMA user_version` holds the schema version. It has three tables: `snapshot`, one row holding the display snapshot of the watched values and its block number as JSON; `outbox`, one row per pending raw transaction with the block number and hash chibi held at submission, in submission order; and `peers`, up to 16 remembered snap/2 peer records in rank order. Each save commits, in one transaction on a blocking thread, only the tables whose content changed. Tracked keys are not saved: they are derived from the watchlist at every start, so a token removed from the config stops being tracked. Only peers reached through outbound sessions are remembered, because an inbound session's address is an ephemeral port. `chibi status` opens the database read-only without the directory lock, then prints the snapshot labeled with its block. With the rollback journal a reader only takes a shared lock on the database file and creates no files, so status works in a read-only directory; WAL was dropped because its readers create `-wal` and `-shm` files. The node and status wait up to 5 s for each other's lock, which a commit every block holds for milliseconds. If a crashed node left a hot journal, status cannot roll it back read-only, so it reports that the node must start once to recover instead of reading partial data. On start, pending outbox transactions are re-broadcast. Earlier versions kept this state in `state.json`: opening a directory with no database imports that file in one transaction and deletes it after the commit, and until then `chibi status` reads it directly. A lock file lets one `chibi run` own the directory, and it holds that process's id for `chibi stop` and `chibi status`. The devp2p key and helios's checkpoint stay plain files.
+The state database is `chibi.db` in the per-network data directory, a SQLite file (rusqlite with the bundled SQLite) with the rollback journal (`journal_mode = DELETE`) and `synchronous = EXTRA`, so a commit is durable when it returns; with a rollback journal SQLite only guarantees that with EXTRA, which also syncs the directory after deleting the journal. A database an earlier build left in WAL mode is switched on the node's open. `PRAGMA user_version` holds the schema version. It has four tables: `snapshot`, one row holding the display snapshot of the watched values and its block number as JSON; `outbox`, one row per pending raw transaction with the block number and hash chibi held at submission, in submission order; `peers`, up to 16 remembered snap/2 peer records in rank order; and, since schema version 2, `keys`, the learned working-set keys most recently used first (`position`, a 20-byte `address`, and a 32-byte `slot` or NULL for an account). Opening a version 1 database adds `keys` and sets version 2 in one transaction; `chibi status` reads either version. Each save commits, in one transaction on a blocking thread, only the tables whose content changed. Pins are never saved: they derive from the config at every start, so a token removed from the config stops being pinned. Learned keys are saved without block numbers, recency being row order, and at start they seed the working set in that order; rows that do not parse are skipped. They are saved when membership changed, at most once per 5 heads; when only recency changed, once the last save is over an hour old; and on clean shutdown. Re-reading a known key never writes by itself. Only peers reached through outbound sessions are remembered, because an inbound session's address is an ephemeral port. `chibi status` opens the database read-only without the directory lock, then prints the snapshot labeled with its block: for each watched address, ETH, the nonce, every pinned token (`?` until computed), and every other registry token whose balance computes from held keys and is nonzero, in registry order. With the rollback journal a reader only takes a shared lock on the database file and creates no files, so status works in a read-only directory; WAL was dropped because its readers create `-wal` and `-shm` files. The node and status wait up to 5 s for each other's lock, which a commit every block holds for milliseconds. If a crashed node left a hot journal, status cannot roll it back read-only, so it reports that the node must start once to recover instead of reading partial data. On start, pending outbox transactions are re-broadcast. Earlier versions kept this state in `state.json`: opening a directory with no database imports that file in one transaction and deletes it after the commit, and until then `chibi status` reads it directly. A lock file lets one `chibi run` own the directory, and it holds that process's id for `chibi stop` and `chibi status`. The devp2p key and helios's checkpoint stay plain files.
 
 ### Transactions and fees
 
@@ -122,7 +131,7 @@ The state database is `chibi.db` in the per-network data directory, a SQLite fil
 
 ### Networks
 
-`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, pinned snap/2 peers, and the registry of known tokens. The mainnet registry holds the 15 ERC-20s with the most transfer transactions on mainnet in the 30 days to 2026-10-07; the Sepolia registry holds the 9 of them with a Sepolia deployment. `scripts/registry-check.sh` checks every entry's code, symbol, and decimals against each chain, reading the registry through the `registry` example so there is one list. The user picks which registry tokens to track; `NodeConfig.watch` carries the addresses and the picked tokens. On Sepolia, USDC is Circle's deployment, PYUSD is Paxos's, and LINK is Chainlink's. USDT, DAI, WBTC, and AAVE are the test tokens Aave's Sepolia faucet mints (owner `0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D`, listed as `FAUCET` in Aave's address book); Aave's own Sepolia USDC (`0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8`) is a different contract from Circle's and is not in the registry. Sepolia is the default. Its beacon default is `https://beacon.sepolia.ethpandaops.io`, a Nimbus node that served Gloas light-client data after the fork; publicnode's Lighthouse node stopped serving it at the fork. A beacon endpoint can stall chibi but cannot make it accept a wrong header.
+`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, pinned snap/2 peers, and the registry of known tokens. The mainnet registry holds the 15 ERC-20s with the most transfer transactions on mainnet in the 30 days to 2026-10-07; the Sepolia registry holds the 9 of them with a Sepolia deployment. `scripts/registry-check.sh` checks every entry's code, symbol, and decimals against each chain, reading the registry through the `registry` example so there is one list. The registry labels tokens in `chibi status` and lists what the optional `tokens` config key accepts; `chibi init` never asks for tokens. `NodeConfig.watch` carries the addresses, the pinned tokens, and the configured contracts. On Sepolia, USDC is Circle's deployment, PYUSD is Paxos's, and LINK is Chainlink's. USDT, DAI, WBTC, and AAVE are the test tokens Aave's Sepolia faucet mints (owner `0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D`, listed as `FAUCET` in Aave's address book); Aave's own Sepolia USDC (`0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8`) is a different contract from Circle's and is not in the registry. Sepolia is the default. Its beacon default is `https://beacon.sepolia.ethpandaops.io`, a Nimbus node that served Gloas light-client data after the fork; publicnode's Lighthouse node stopped serving it at the fork. A beacon endpoint can stall chibi but cannot make it accept a wrong header.
 
 The light-client checkpoint follows one precedence: a user override, else the checkpoint helios saved in the data directory (a file of exactly 32 bytes), else the newest checkpoint from the community checkpoint services, logged as a warning. chibi never passes helios's shipped default, which is older than helios's 14-day limit. helios saves only checkpoints newer than the one it started from, so after a first-run sync chibi saves that checkpoint itself in helios's file format.
 
@@ -138,7 +147,7 @@ Core has `VerifyError` (lying or garbled peer), `StateError` (stale proof, non-c
 
 ### RPC exposure
 
-The server binds to loopback. A `Host` header filter admits only `localhost`, `127.0.0.1`, and `[::1]` by default, which blocks DNS rebinding. Cross-origin browser requests are allowed only from `chrome-extension://` and `moz-extension://` origins by default, so an ordinary website cannot read tracked balances. Both lists are configurable.
+The server binds to loopback. A `Host` header filter admits only `localhost`, `127.0.0.1`, and `[::1]` by default, which blocks DNS rebinding. Cross-origin browser requests are allowed only from `chrome-extension://` and `moz-extension://` origins by default, so an ordinary website cannot read watched balances. Both lists are configurable.
 
 ## Synthesis decision
 
@@ -154,10 +163,16 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 
 ## Tradeoffs accepted
 
-- We accept dropping a request's fetched facts when the head moves mid-request, in exchange for no roll-forward machinery.
+- We accept re-proving the keys of a request cut by a head move at the new anchor, instead of rolling stale facts forward (the roll-forward window was rejected above).
 - We accept duplicate fetches when concurrent requests miss the same key, in exchange for no shared in-flight table.
-- We accept re-proving tracked keys at every head before Glamsterdam (tens of keys every 12 s), in exchange for one advance path.
-- We accept that dapp keys are dropped at each reanchor and fetched again on the next call.
+- We accept re-proving pins at every head before Glamsterdam (tens of keys every 12 s), in exchange for one advance path.
+- We accept that learned keys are cold after start and after a reanchor until warming reaches them, in exchange for reanchors that no dapp key can block.
+- We accept warming inside the follower, so its merges never straddle an anchor move, at the cost of warming that pauses while the follower moves the head.
+- We accept discarding BAL post-states for unheld slots, so the store stays bounded and immune to other users' traffic; a dapp re-reading such a slot pays a fetch.
+- We accept a constant cap of 1024 keys with no config knob. Measured on Sepolia, one snap/2 peer proves about 3 keys a second, so a full re-warm takes about 6 minutes.
+- We accept slow warming (2 proofs in flight), in exchange for wallet requests and BAL fetches that never queue behind more than 2 warm proofs.
+- We accept opening RPC before any proof, so the first reads pay a fetch, in exchange for a wallet that never sees the network as down while chibi proves.
+- We accept losing up to 5 heads of newly learned keys, and up to an hour of recency, on a crash, in exchange for not rewriting up to 1024 rows at every head.
 - We accept rewriting the snapshot row at each head (a few KB of JSON), in exchange for keeping the display-only snapshot out of the schema. The outbox and peers tables are rewritten only when they change.
 - We accept one mutex around the canonical value, in exchange for no actor. It guards only synchronous pure calls.
 - We accept receipts only for transactions submitted through chibi.
@@ -169,14 +184,15 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - A redb ledger as the shared state. It gives MVCC and atomic commits, but adds a dependency and a schema, and its read transactions would be held across awaits.
 - revm's `WrapDatabaseAsync`. It puts awaits inside the EVM, needs fibers and a multi-thread runtime, and costs one serial round trip per miss.
 - Per-entry block numbers. Every read would need a freshness check, and one run could mix entries of different ages.
-- A per-token storage-layout table, or asking users for storage slot keys. Running `balanceOf` and a self-transfer and tracking the keys they read covers proxies, pause flags, fees, and nonstandard layouts without per-token code. Raw slot keys stay available as an opt-in in `config.toml` (`[[contracts]]`) for contracts outside the token registry; `chibi init` never asks for them.
+- A per-token storage-layout table, or asking users for storage slot keys. Running `balanceOf` and a self-transfer and pinning the keys they read covers proxies, pause flags, fees, and nonstandard layouts without per-token code. Raw slot keys stay available as an opt-in in `config.toml` (`[[contracts]]`) for contracts outside the token registry; `chibi init` never asks for them.
+- Asking users which tokens to keep. Learning keys from requests covers every token a wallet shows without a question; `tokens` remains an opt-in pin.
 
 ## Open questions and risks
 
 - Some wallets send state queries tagged `finalized`. Should those serve the anchor instead of an error?
 - Should the RPC fail closed when the anchor falls behind the light client because no snap peer is reachable?
 - Will Nethermind peers serve BALs over snap/2 after the fork, and will geth and reth peers enable snap/2? Today only Nethermind does on Sepolia, and the five pinned peers are a single point of slowness.
-- One failed tracked-key proof aborts a whole reanchor, which keeps the old head published until the next step. Is that acceptable with one or two snap/2 peers?
+- One failed pin proof aborts a whole reanchor, which keeps the old head published until the next step. Is that acceptable with one or two snap/2 peers?
 - The first run trusts the community checkpoint services for weak subjectivity unless the user sets `checkpoint`. Should a release ship a recent checkpoint instead?
 - Does MetaMask's background page send an `Origin` header to a custom RPC? If it does not, the CORS allowlist never applies to it.
 

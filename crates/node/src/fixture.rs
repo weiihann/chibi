@@ -15,6 +15,7 @@ use chibi_core::wire::{
 };
 use chibi_core::{TrustedHash, VerifiedHeader};
 use parking_lot::Mutex;
+use tokio::sync::watch;
 
 use crate::disk::read_state;
 use crate::heads::{Heads, HeadsSender};
@@ -81,6 +82,10 @@ struct Inner {
     faults: Mutex<Faults>,
     log: Mutex<Log>,
     outbox_dir: Mutex<Option<PathBuf>>,
+    /// While true, proof requests wait.
+    holding: watch::Sender<bool>,
+    /// Proof requests that have waited at the gate.
+    parked: watch::Sender<usize>,
 }
 
 /// An offline chain and the light client watching it.
@@ -106,6 +111,8 @@ impl Fixture {
                 faults: Mutex::new(Faults::default()),
                 log: Mutex::new(Log::default()),
                 outbox_dir: Mutex::new(None),
+                holding: watch::Sender::new(false),
+                parked: watch::Sender::new(0),
             }),
             sender,
             heads,
@@ -204,6 +211,26 @@ impl Fixture {
     pub fn watch_outbox(&self, dir: PathBuf) {
         *self.inner.outbox_dir.lock() = Some(dir);
     }
+
+    /// Makes proof requests wait until [`Fixture::release_proofs`].
+    pub fn hold_proofs(&self) {
+        self.inner.holding.send_replace(true);
+    }
+
+    /// Waits until a proof request is waiting at the gate.
+    pub async fn proof_held(&self) {
+        let mut parked = self.inner.parked.subscribe();
+        parked
+            .wait_for(|parked| *parked > 0)
+            .await
+            .map(|_| ())
+            .unwrap_or_default();
+    }
+
+    /// Lets waiting and later proof requests through.
+    pub fn release_proofs(&self) {
+        self.inner.holding.send_replace(false);
+    }
 }
 
 /// [`Peers`] over a [`Fixture`]'s world.
@@ -222,6 +249,18 @@ impl FixturePeers {
 
     fn proof_served(&self) {
         self.inner.log.lock().proofs += 1;
+    }
+
+    async fn pass_gate(&self) {
+        let mut holding = self.inner.holding.subscribe();
+        if *holding.borrow_and_update() {
+            self.inner.parked.send_modify(|parked| *parked += 1);
+            holding
+                .wait_for(|holding| !*holding)
+                .await
+                .map(|_| ())
+                .unwrap_or_default();
+        }
     }
 }
 
@@ -249,6 +288,7 @@ impl Peers for FixturePeers {
         &self,
         request: AccountRangeRequest,
     ) -> Result<Reply<AccountReply>, NetError> {
+        self.pass_gate().await;
         self.proof_served();
         let mut faults = self.inner.faults.lock();
         if faults.unavailable.contains(&request.key) {
@@ -275,6 +315,7 @@ impl Peers for FixturePeers {
         &self,
         request: StorageRangeRequest,
     ) -> Result<Reply<StorageReply>, NetError> {
+        self.pass_gate().await;
         self.proof_served();
         self.inner
             .log
@@ -294,6 +335,7 @@ impl Peers for FixturePeers {
     }
 
     async fn byte_codes(&self, hashes: Vec<B256>) -> Result<Reply<Vec<Bytes>>, NetError> {
+        self.pass_gate().await;
         self.proof_served();
         let world = self.inner.world.lock();
         Self::honest(hashes.iter().filter_map(|hash| world.code(*hash)).collect())

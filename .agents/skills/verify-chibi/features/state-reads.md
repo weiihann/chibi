@@ -35,3 +35,4 @@ Preconditions:
 - `SKIP ... chibi head kept moving` in `oracle-check.sh` usually means chibi's request failed (no snap/2 peer for a miss), not that the head moved. Check `chibi.log` for `step failed` or run `doctor.sh`.
 - `eth_gasPrice` differs from the oracle by design (different tip oracle); the script prints it as `INFO`, not a comparison.
 - After the fork, gas estimates change (EIP-8037: an ETH transfer that creates an account costs 204600). Compare against the oracle at the same block, never against numbers recorded before the fork.
+- JSON-RPC opens before anything is proven. Right after start, and after a reanchor, reads fetch their keys on demand, so the first reads are slower; every key read is then kept (up to 1024, least recently used dropped) and re-proved at each head.

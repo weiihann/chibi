@@ -1,9 +1,9 @@
 //! The per-network data directory: its lock, the devp2p identity, and the state database.
 //!
-//! The database holds a display snapshot, the outbox of pending raw transactions, and
-//! snap/2 peers worth dialing first. Tracked keys are not saved: they follow from the
-//! watchlist at each start. Its values are display-only: nothing read from it enters a
-//! `Store`.
+//! The database holds a display snapshot, the outbox of pending raw transactions, snap/2
+//! peers worth dialing first, and the learned working-set keys, most recently used first.
+//! Pins are not saved: they follow from the config at each start. Its values are
+//! display-only: nothing read from it enters a `Store`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
@@ -12,10 +12,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Bytes, hex};
+use alloy_primitives::{Address, Bytes, U256, hex};
+use chibi_core::state::Key;
 use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
-use rusqlite::types::Type;
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::Deserialize;
 use tracing::warn;
@@ -32,9 +33,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_STATE_FILE: &str = "state.json";
 const KEY_FILE: &str = "devp2p.key";
 
-/// The version [`SCHEMA`] records in `PRAGMA user_version`; 0 means no schema yet.
-const SCHEMA_VERSION: i32 = 1;
-const SCHEMA: &str = "
+/// The schema version recorded in `PRAGMA user_version`; 0 means no schema yet.
+const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_V1: &str = "
 CREATE TABLE snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     json TEXT NOT NULL
@@ -48,6 +49,15 @@ CREATE TABLE outbox (
 CREATE TABLE peers (
     position INTEGER PRIMARY KEY,
     record TEXT NOT NULL
+);
+";
+/// What version 2 adds: the learned keys, most recently used first. `slot` is NULL for an
+/// account key.
+const SCHEMA_V2: &str = "
+CREATE TABLE keys (
+    position INTEGER PRIMARY KEY,
+    address BLOB NOT NULL,
+    slot BLOB
 );
 ";
 
@@ -295,6 +305,31 @@ impl Disk {
         Ok(written())
     }
 
+    /// The learned keys the last save stored, most recently used first. Rows that do not
+    /// parse are skipped.
+    pub(crate) fn load_keys(&self) -> Result<Vec<Key>, NodeError> {
+        let db = self.db.lock();
+        let mut select = db
+            .conn
+            .prepare("SELECT address, slot FROM keys ORDER BY position")
+            .map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?;
+        let rows = select
+            .query_map([], |row| Ok(parse_key(row.get_ref(0)?, row.get_ref(1)?)))
+            .map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.extend(row.map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?);
+        }
+        Ok(keys)
+    }
+
+    /// Replaces the stored learned keys with `keys`, most recently used first, in one
+    /// transaction. Blocks on fsync; call it off the async workers.
+    pub(crate) fn save_keys(&self, keys: &[Key]) -> Result<(), NodeError> {
+        let mut db = self.db.lock();
+        write_keys(&mut db.conn, keys).map_err(|err| db_error(&self.dir.join(DB_FILE), &err))
+    }
+
     /// The devp2p secret key, created on first use so the node keeps one identity.
     pub(crate) fn secret_key(&self) -> Result<SecretKey, NodeError> {
         let path = self.dir.join(KEY_FILE);
@@ -342,7 +377,7 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
     let tx = conn.transaction().map_err(fail)?;
     match schema_version(&tx).map_err(fail)? {
         0 => read_legacy(dir),
-        SCHEMA_VERSION => load(&tx).map(Some).map_err(fail),
+        1 | SCHEMA_VERSION => load(&tx).map(Some).map_err(fail),
         newer => Err(newer_schema(&path, newer)),
     }
 }
@@ -370,6 +405,7 @@ fn open_db(dir: &Path) -> Result<Db, NodeError> {
         .map_err(fail)?;
     match schema_version(&conn).map_err(fail)? {
         0 => create(&mut conn, dir).map_err(fail)?,
+        1 => upgrade_from_v1(&mut conn).map_err(fail)?,
         SCHEMA_VERSION => {}
         newer => return Err(newer_schema(&path, newer)),
     }
@@ -385,7 +421,8 @@ fn create(conn: &mut Connection, dir: &Path) -> rusqlite::Result<()> {
         None
     });
     let tx = conn.transaction()?;
-    tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(SCHEMA_V1)?;
+    tx.execute_batch(SCHEMA_V2)?;
     if let Some(legacy) = &legacy {
         write_tables(&tx, &Saved::default(), legacy)?;
     }
@@ -398,6 +435,14 @@ fn create(conn: &mut Connection, dir: &Path) -> rusqlite::Result<()> {
         warn!(target: "chibi::disk", path = %legacy_path.display(), %err, "could not delete the imported legacy state file");
     }
     Ok(())
+}
+
+/// Adds the keys table to a version 1 database in one transaction.
+fn upgrade_from_v1(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA_V2)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
 }
 
 /// Reads the legacy state file in `dir`. `None` if there is none.
@@ -485,6 +530,45 @@ fn write_tables(conn: &Connection, before: &Saved, after: &Saved) -> rusqlite::R
         }
     }
     Ok(())
+}
+
+fn write_keys(conn: &mut Connection, keys: &[Key]) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM keys", [])?;
+    {
+        let mut insert =
+            tx.prepare("INSERT INTO keys (position, address, slot) VALUES (?1, ?2, ?3)")?;
+        for (position, key) in keys.iter().enumerate() {
+            match key {
+                Key::Account(address) => {
+                    insert.execute(params![position, address.as_slice(), None::<&[u8]>])?;
+                }
+                Key::Slot(address, slot) => {
+                    insert.execute(params![
+                        position,
+                        address.as_slice(),
+                        slot.to_be_bytes::<32>().as_slice()
+                    ])?;
+                }
+            }
+        }
+    }
+    tx.commit()
+}
+
+/// The key a `keys` row names: a 20-byte address and either no slot or a 32-byte one.
+fn parse_key(address: ValueRef<'_>, slot: ValueRef<'_>) -> Option<Key> {
+    let ValueRef::Blob(address) = address else {
+        return None;
+    };
+    let address = Address::try_from(address).ok()?;
+    match slot {
+        ValueRef::Null => Some(Key::Account(address)),
+        ValueRef::Blob(slot) if slot.len() == 32 => {
+            Some(Key::Slot(address, U256::from_be_slice(slot)))
+        }
+        ValueRef::Integer(_) | ValueRef::Real(_) | ValueRef::Text(_) | ValueRef::Blob(_) => None,
+    }
 }
 
 fn newer_schema(path: &Path, version: i32) -> NodeError {
@@ -927,6 +1011,49 @@ mod tests {
         let many: Vec<NodeRecord> = (10..40).map(|id| record(id, 1)).collect();
         file.remember_peers(&many);
         assert_eq!(file.peers(), many[..REMEMBERED_PEERS].to_vec());
+    }
+
+    #[test]
+    fn a_new_database_is_at_version_2_and_keeps_learned_keys_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = [
+            Key::Slot(Address::repeat_byte(2), U256::from(7)),
+            Key::Account(Address::repeat_byte(2)),
+            Key::Account(Address::repeat_byte(1)),
+        ];
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            assert_eq!(disk.load_keys().unwrap(), vec![]);
+            disk.save_keys(&keys).unwrap();
+        }
+        let disk = Disk::open(dir.path()).unwrap();
+        assert_eq!(disk.load_keys().unwrap(), keys);
+        assert_eq!(schema_version(&disk.db.lock().conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_version_1_database_gains_the_keys_table_and_keeps_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            disk.save(|saved| saved.set_outbox(vec![queued(1, 9)]))
+                .unwrap();
+        }
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        conn.execute_batch("DROP TABLE keys; PRAGMA user_version = 1;")
+            .unwrap();
+        drop(conn);
+        assert!(
+            read_state(dir.path()).unwrap().is_some(),
+            "status reads version 1"
+        );
+
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.read(|saved| assert_eq!(saved.outbox(), &[queued(1, 9)]));
+        assert_eq!(disk.load_keys().unwrap(), vec![]);
+        disk.save_keys(&[Key::Account(Address::repeat_byte(1))])
+            .unwrap();
+        assert_eq!(schema_version(&disk.db.lock().conn).unwrap(), 2);
     }
 
     #[test]

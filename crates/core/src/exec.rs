@@ -165,13 +165,23 @@ impl From<EVMError<Infallible>> for ExecError {
     }
 }
 
-/// A run that read only held keys.
+/// What a run over held keys produced, and every account and slot it read.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Executed {
-    /// The execution result, or why the EVM refused the transaction.
-    pub result: Result<ExecutionResult<HaltReason>, ExecError>,
+pub struct Executed<T> {
+    /// The run's answer.
+    pub result: T,
     /// Every account and slot the run read.
     pub read: HashSet<Key>,
+}
+
+impl<T> Executed<T> {
+    /// A read of exactly one key.
+    pub fn one(result: T, key: Key) -> Self {
+        Self {
+            result,
+            read: HashSet::from([key]),
+        }
+    }
 }
 
 /// Why gas estimation produced no estimate.
@@ -212,7 +222,11 @@ pub enum EstimateError {
 ///
 /// Any miss withholds the result, even an EVM refusal, because the missing value read as
 /// empty may have caused it.
-pub fn execute(store: &Store, env: &ChainEnv, req: &CallRequest) -> Result<Executed, Misses> {
+pub fn execute(
+    store: &Store,
+    env: &ChainEnv,
+    req: &CallRequest,
+) -> Result<Executed<Result<ExecutionResult<HaltReason>, ExecError>>, Misses> {
     let mut evm_env = env.call_env(store.anchor());
     evm_env.cfg_env.disable_block_gas_limit = true;
     if !evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
@@ -249,11 +263,11 @@ pub fn estimate_gas(
     store: &Store,
     env: &ChainEnv,
     req: &CallRequest,
-) -> Result<Result<u64, EstimateError>, Misses> {
+) -> Result<Executed<Result<u64, EstimateError>>, Misses> {
     let evm_env = env.call_env(store.anchor());
     let mut db = Db::new(store);
-    let outcome = estimate_with(&mut db, evm_env, req);
-    db.finish().map(|_| outcome)
+    let result = estimate_with(&mut db, evm_env, req);
+    db.finish().map(|read| Executed { result, read })
 }
 
 fn estimate_with(
@@ -709,7 +723,7 @@ mod tests {
         let env = ChainEnv::new(world.spec());
         let mut store = Store::new(world.verified(world.head()));
         let (estimate, _) = discover(world, &mut store, |store| estimate_gas(store, &env, req));
-        let estimate = estimate.unwrap();
+        let estimate = estimate.result.unwrap();
         let run = |gas| {
             let req = CallRequest { gas, ..req.clone() };
             let (executed, _) = discover(world, &mut store.clone(), |store| {
@@ -820,7 +834,9 @@ mod tests {
         let (estimate, _) = discover(&world, &mut store, |store| {
             estimate_gas(store, &env, &transfer)
         });
-        assert_eq!(estimate, Ok(MIN_TRANSACTION_GAS));
+        assert_eq!(estimate.result, Ok(MIN_TRANSACTION_GAS));
+        assert!(estimate.read.contains(&Key::Account(ALICE)));
+        assert!(estimate.read.contains(&Key::Account(BOB)));
     }
 
     #[test]
@@ -831,7 +847,7 @@ mod tests {
         let (estimate, _) = discover(&world, &mut store, |store| {
             estimate_gas(store, &env, &balance_of())
         });
-        let estimate = estimate.unwrap();
+        let estimate = estimate.result.unwrap();
         let run = |gas| {
             execute(
                 &store,
@@ -902,7 +918,9 @@ mod tests {
             ..CallRequest::default()
         };
         let mut estimate = |req: CallRequest| {
-            discover(&world, &mut store, |store| estimate_gas(store, &env, &req)).0
+            discover(&world, &mut store, |store| estimate_gas(store, &env, &req))
+                .0
+                .result
         };
         let revert = Bytes::from(B256::from(U256::from(0x2a)).to_vec());
 

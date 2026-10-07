@@ -8,12 +8,20 @@ chibi is early software. It targets Sepolia first. Mainnet support exists in the
 
 - A sync-committee light client ([helios](https://github.com/a16z/helios)) vouches for execution block hashes. chibi fetches each header over devp2p and checks its hash.
 - Account and storage values come from single-key snap/2 range proofs, checked against the verified header's state root. A key chibi never fetched is never read as zero.
-- chibi stores only the keys you use: your watched accounts, the storage of the tokens you picked (balances plus anything a transfer checks, such as pause flags or fees), any contracts and storage slots you list in the config, and whatever your dapps' calls touch.
-- After the Glamsterdam upgrade, each block's access list (EIP-7928) keeps those keys current. Before it, chibi proves the tracked keys again at every new head.
+- chibi keeps only the state your wallet and dapps read, up to 1024 keys (see [What chibi keeps](#what-chibi-keeps)).
+- After the Glamsterdam upgrade, each block's access list (EIP-7928) keeps those keys current. Before it, chibi proves the pins again at every new head and re-proves the other keys in the background.
 - `eth_call` and `eth_estimateGas` run in a local EVM. A missing key is fetched with a proof and the call runs again.
 - Signed transactions go straight to devp2p peers. chibi finds them in verified block bodies and checks their receipts against the block's receipts root.
 
 The design and its tradeoffs are in [docs/DESIGN.md](docs/DESIGN.md). The decision trail for the first build is [docs/decisions.tsv](docs/decisions.tsv).
+
+## What chibi keeps
+
+chibi remembers the state your wallet and dapps read. You don't pick tokens. Watched addresses, plus any `tokens` or `[[contracts]]` in the config, are pins: they are kept proven at every head and are never dropped. Everything else a request reads is remembered, up to 1024 keys, dropping the least recently used. It is kept current at every head.
+
+Remembered keys survive restarts: chibi saves them in `chibi.db`, most recently used first, and after a restart proves them again in that order in the background. Pins are not saved; they come from the config at every start.
+
+JSON-RPC opens as soon as the head is verified. Pins and other keys are proven in the background, and anything not yet proven is fetched with a proof on first use.
 
 ## Requirements
 
@@ -34,16 +42,15 @@ cd chibi
 
 1. The network (Sepolia by default).
 2. Watch-only addresses. Paste as many as you like and press Enter on an empty line to finish.
-3. Which tokens to track, as tick boxes, from the 15 ERC-20s with the most transfers on mainnet in the 30 days to 2026-10-07. Mainnet offers all 15: USDT, USDC, WETH, WBTC, UNI, LINK, QNT, DAI, PYUSD, ONDO, AAVE, PEPE, SHIB, 1INCH, and CRV. Sepolia offers the 9 with a Sepolia deployment: USDT, USDC, WETH, WBTC, UNI, LINK, DAI, PYUSD, and AAVE. USDC is ticked by default. ETH is always tracked. Sepolia's USDC, PYUSD, and LINK are their issuers' own deployments. Sepolia's USDT, DAI, WBTC, and AAVE are test tokens from Aave's Sepolia faucet, not tokens issued by Tether, Maker, BitGo, or Aave; anyone can mint them, so their balances carry no value.
-4. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
+3. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
 
 It writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is set to an absolute path, otherwise to `~/.config/chibi/`, on macOS and Linux alike. In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:
 
 ```sh
-chibi init --network sepolia --address 0xYourAddress --token USDC --token DAI --rpc-host 127.0.0.1 --rpc-port 8545
+chibi init --network sepolia --address 0xYourAddress --rpc-host 127.0.0.1 --rpc-port 8545
 ```
 
-`--data-dir PATH` writes a `data_dir` into the config (see below). When `chibi init` overwrites an existing config, it keeps that config's `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so.
+`--data-dir PATH` writes a `data_dir` into the config (see below). A fresh config has no `tokens`. When `chibi init` overwrites an existing config, it keeps that config's `tokens` and `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so.
 
 Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent; an empty `CHIBI_CONFIG` counts as unset:
 
@@ -68,7 +75,9 @@ chibi then waits for a devp2p peer that serves snap/2, logging progress every 30
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
 
-`chibi status` reads the snapshot saved at the last verified head, so it works without a running node. Those values are labeled with their block and are not re-verified.
+`chibi status` reads the snapshot saved at the last verified head, so it works without a running node. For each watched address it shows ETH, the nonce, every pinned token (`?` until computed), and any other listed token whose balance chibi can compute from the keys it holds and is not zero, in list order. An unpinned token appears only after something read its keys. Those values are labeled with their block and are not re-verified.
+
+The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 days to 2026-10-07. Mainnet has all 15: USDT, USDC, WETH, WBTC, UNI, LINK, QNT, DAI, PYUSD, ONDO, AAVE, PEPE, SHIB, 1INCH, and CRV. Sepolia has the 9 with a Sepolia deployment: USDT, USDC, WETH, WBTC, UNI, LINK, DAI, PYUSD, and AAVE. Sepolia's USDC, PYUSD, and LINK are their issuers' own deployments. Sepolia's USDT, DAI, WBTC, and AAVE are test tokens from Aave's Sepolia faucet, not tokens issued by Tether, Maker, BitGo, or Aave; anyone can mint them, so their balances carry no value.
 
 ## Configuration
 
@@ -77,23 +86,23 @@ When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a
 | Field | Default | Meaning |
 |---|---|---|
 | `network` | `sepolia` | `sepolia` or `mainnet` |
-| `addresses` | none | Watch-only addresses to track |
+| `addresses` | none | Watch-only addresses, pinned |
 | `beacon_url` | network default | Beacon API endpoint for the light client |
 | `checkpoint` | none | Finalized beacon block root to start the light client from |
-| `tokens` | `["USDC"]` | Tokens to track, by symbol, from the network's list |
+| `tokens` | none | Optional. Tokens to pin, by symbol, from the network's token list, for example `["USDC"]`; their balance and transfer keys for each watched address stay proven |
 | `rpc_host` | `127.0.0.1` | IP address or domain JSON-RPC listens on; also accepted as a `Host` header |
 | `rpc_port` | `8545` | JSON-RPC port |
 | `cors_origins` | `chrome-extension://*`, `moz-extension://*` | Browser origins allowed to call the RPC |
 | `allowed_hosts` | `localhost`, `127.0.0.1`, `[::1]` | Accepted `Host` headers, which blocks DNS rebinding |
 | `p2p_port` | `0` (OS picks) | devp2p listen port |
 | `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
-| `contracts` | none | Contract accounts and storage slots to track, see below |
+| `contracts` | none | Contract accounts and storage slots to pin, see below |
 
-Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, and remembered peers, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi run` and then deleted. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
+Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, remembered peers, and remembered keys, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi run` and then deleted. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
 
-### Tracking contracts and storage slots
+### Pinning contracts and storage slots
 
-Each `[[contracts]]` table tracks a contract account (balance, nonce, and code hash) and, optionally, raw storage slots. chibi proves them at every new head, or keeps them current from block access lists, so `eth_getBalance`, `eth_getTransactionCount`, and `eth_getStorageAt` for them answer without a fetch. The contract's code is fetched once, on first use, and kept from then on. `chibi status` prints each slot's value at the saved head.
+Each `[[contracts]]` table pins a contract account (balance, nonce, and code hash) and, optionally, raw storage slots. chibi keeps them proven at every new head, from block access lists or by proving them again, so `eth_getBalance`, `eth_getTransactionCount`, and `eth_getStorageAt` for them answer without a fetch once proven. The contract's code is fetched once, on first use, and kept from then on. `chibi status` prints each slot's value at the saved head.
 
 ```toml
 [[contracts]]

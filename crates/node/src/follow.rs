@@ -1,14 +1,16 @@
-//! One follower step: reach the light client's newest head, follow finality, locate submitted
-//! transactions, and persist.
+//! One follower step: reach the light client's newest head, warm the working set, follow
+//! finality, locate submitted transactions, and persist.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{B256, TxHash};
-use chibi_core::VerifiedHeader;
-use chibi_core::state::{HEADER_WINDOW, Plan};
+use chibi_core::state::{HEADER_WINDOW, Key, Plan};
 use chibi_core::tx::Lookup;
+use chibi_core::{TrustedHash, VerifiedHeader};
+use futures::StreamExt as _;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::fetch;
@@ -28,6 +30,13 @@ const ANCESTOR_BATCH: u64 = 512;
 
 /// Bodies fetched, searched, and released per batch, so a deep search holds few bodies.
 const BODY_BATCH: usize = 64;
+
+/// Proofs a warm pass gathers before merging them, so requests see its progress early.
+const WARM_MERGE: usize = 64;
+
+/// Warm proofs in flight at once. reth keeps one snap request in flight per peer, so a wallet
+/// request or a BAL fetch queues behind at most this many warm proofs.
+const WARM_IN_FLIGHT: usize = 2;
 
 /// Which blocks have been searched for pending transactions.
 ///
@@ -122,6 +131,13 @@ impl<P: Peers> Follower<P> {
                 true
             }
         };
+        if matches!(stepped, Stepped::Reanchored(_)) {
+            self.seed_due = true;
+        }
+        if self.seed_due {
+            self.seed_due = !shared.seed().await;
+        }
+        shared.warm(self.heads.latest.clone()).await;
 
         shared.follow_finalized(&self.heads).await;
         let anchor = shared.read(|s| s.anchor().clone());
@@ -144,6 +160,7 @@ impl<P: Peers> Follower<P> {
         self.collect_receipts().await;
 
         shared.persist().await?;
+        shared.save_keys(Some(self.moves)).await?;
         shared.peers.announce(&anchor);
         Ok(stepped)
     }
@@ -321,6 +338,43 @@ impl<P: Peers> Shared<P> {
         Ok(())
     }
 
+    /// Proves the working-set keys the store lacks at the anchor, pins first, then learned
+    /// keys most recently used first, merging every [`WARM_MERGE`] proofs. Each key is tried
+    /// once; a failure leaves it unheld for the next pass. Stops as soon as `latest` changes,
+    /// merging what completed. Only the follower moves the anchor, so no merge is dropped.
+    pub(crate) async fn warm(&self, mut latest: watch::Receiver<Option<TrustedHash>>) {
+        let (anchor, keys) = self.read(|s| (s.anchor().clone(), warm_order(s.unheld())));
+        if keys.is_empty() {
+            return;
+        }
+        let wanted = keys.len();
+        let mut proofs = std::pin::pin!(fetch::each(&self.peers, &anchor, keys, WARM_IN_FLIGHT));
+        let mut batch = Vec::with_capacity(WARM_MERGE);
+        let mut failed = 0;
+        let interrupted = loop {
+            tokio::select! {
+                biased;
+                _ = latest.changed() => break true,
+                next = proofs.next() => match next {
+                    None => break false,
+                    Some((_, Ok(proven))) => {
+                        batch.push(proven);
+                        if batch.len() == WARM_MERGE {
+                            self.update(|s| s.merge(anchor.hash(), &batch));
+                            batch.clear();
+                        }
+                    }
+                    Some((key, Err(err))) => {
+                        failed += 1;
+                        debug!(target: "chibi::follow", ?key, %err, "warming a key failed; retrying next pass");
+                    }
+                },
+            }
+        };
+        self.update(|s| s.merge(anchor.hash(), &batch));
+        debug!(target: "chibi::follow", head = anchor.number(), wanted, failed, interrupted, "warmed");
+    }
+
     /// Records the light client's finalized header once it is fetched and verified.
     async fn follow_finalized(&self, heads: &Heads) {
         let Some(trusted) = *heads.finalized.borrow() else {
@@ -376,4 +430,20 @@ impl<P: Peers> Shared<P> {
             }
         }
     }
+}
+
+/// The keys to prove for `unheld`, in order. An account is left out when one of its slots is
+/// listed, because a slot proof carries its account.
+fn warm_order(unheld: impl Iterator<Item = Key>) -> Vec<Key> {
+    let keys: Vec<Key> = unheld.collect();
+    let with_slots: HashSet<_> = keys
+        .iter()
+        .filter_map(|key| match key {
+            Key::Slot(address, _) => Some(*address),
+            Key::Account(_) => None,
+        })
+        .collect();
+    keys.into_iter()
+        .filter(|key| !matches!(key, Key::Account(address) if with_slots.contains(address)))
+        .collect()
 }

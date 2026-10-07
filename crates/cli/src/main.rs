@@ -173,7 +173,7 @@ fn write_running<W: Write>(output: &mut W, running: Option<&Holder>) -> io::Resu
 fn write_status<W: Write>(
     output: &mut W,
     snapshot: &Snapshot,
-    tokens: &[Token],
+    registry: &[Token],
     now: u64,
 ) -> io::Result<()> {
     writeln!(
@@ -190,7 +190,7 @@ fn write_status<W: Write>(
             None => write!(output, "   ? ETH")?,
         }
         for (symbol, amount) in &holding.tokens {
-            let decimals = tokens
+            let decimals = registry
                 .iter()
                 .find(|token| token.symbol == symbol)
                 .map(|token| token.decimals);
@@ -335,6 +335,40 @@ mod tests {
                 "sepolia head 9318211 (saved 8s ago, not re-verified)\n\
                  {ALICE}   1.2034 ETH   250.00 USDC   5 XYZ (base units)\n\
                  {BOB}   ? ETH   ? USDC\n"
+            )
+        );
+    }
+
+    #[test]
+    fn status_renders_unpinned_registry_tokens_with_registry_decimals() {
+        let snapshot = Snapshot {
+            network: Network::Mainnet,
+            block: BlockNumHash::new(21_000_000, B256::repeat_byte(1)),
+            saved_at: 1_000,
+            holdings: vec![Holding {
+                address: ALICE,
+                balance: Some(U256::from(1_000_000_000_000_000_000u128)),
+                nonce: Some(0),
+                tokens: vec![
+                    ("USDC".to_owned(), None),
+                    ("WBTC".to_owned(), Some(U256::from(150_000_000u64))),
+                ],
+            }],
+            contracts: Vec::new(),
+        };
+        let mut output = Vec::new();
+        write_status(
+            &mut output,
+            &snapshot,
+            Network::Mainnet.spec().tokens,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!(
+                "mainnet head 21000000 (saved 0s ago, not re-verified)\n\
+                 {ALICE}   1.00 ETH   ? USDC   1.50 WBTC\n"
             )
         );
     }

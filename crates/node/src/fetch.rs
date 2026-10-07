@@ -13,7 +13,7 @@ use chibi_core::verify::{
     VerifiedReceipts,
 };
 use chibi_core::{TrustedHash, VerifiedHeader, VerifyError};
-use futures::{StreamExt as _, TryStreamExt as _, stream};
+use futures::{Stream, StreamExt as _, TryStreamExt as _, stream};
 use tracing::debug;
 
 use crate::node::NodeError;
@@ -329,6 +329,19 @@ pub(crate) async fn keys<P: Peers>(
         .buffer_unordered(CONCURRENCY)
         .try_collect()
         .await
+}
+
+/// Proves each key at `at` with at most `in_flight` proofs at once, yielding every key's own
+/// result, so one key that cannot be proven never sinks the others.
+pub(crate) fn each<'a, P: Peers>(
+    peers: &'a P,
+    at: &'a VerifiedHeader,
+    keys: Vec<Key>,
+    in_flight: usize,
+) -> impl Stream<Item = (Key, Result<Proven, NodeError>)> + 'a {
+    stream::iter(keys)
+        .map(move |k| async move { (k, key(peers, at, k).await) })
+        .buffer_unordered(in_flight)
 }
 
 /// Fetches everything `misses` names at `store`'s anchor, in parallel. Block-hash misses

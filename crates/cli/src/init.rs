@@ -9,14 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use chibi_node::{Network, Token};
+use chibi_node::Network;
 use clap::Args;
 use inquire::validator::Validation;
-use inquire::{Confirm, CustomType, InquireError, MultiSelect, Select, Text};
+use inquire::{Confirm, CustomType, InquireError, Select, Text};
 
 use crate::config::{
-    Config, DEFAULT_RPC_PORT, DEFAULT_TOKENS, InvalidRpcHost, RpcHost, UnknownToken,
-    default_tokens, parse_address, resolve_tokens,
+    Config, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, UnknownToken, parse_address, resolve_tokens,
 };
 
 /// How long the port check waits for a listener to accept.
@@ -31,9 +30,6 @@ pub struct InitArgs {
     /// Watch-only address to track; repeat for several.
     #[arg(long = "address", value_name = "ADDRESS", value_parser = parse_address)]
     pub addresses: Vec<Address>,
-    /// Token to track, by symbol from the network's registry; repeat for several.
-    #[arg(long = "token", value_name = "SYMBOL")]
-    pub tokens: Vec<String>,
     /// IP address or domain wallets use to reach chibi; chibi listens on what it resolves to.
     #[arg(long)]
     pub rpc_host: Option<RpcHost>,
@@ -84,7 +80,6 @@ trait Ask {
     fn overwrite(&mut self, path: &Path) -> Result<bool, InitError>;
     fn network(&mut self) -> Result<Network, InitError>;
     fn addresses(&mut self) -> Result<Vec<Address>, InitError>;
-    fn tokens(&mut self, network: Network) -> Result<Vec<Token>, InitError>;
     fn rpc_host(&mut self) -> Result<RpcHost, InitError>;
     fn rpc_port(&mut self, host: &RpcHost) -> Result<NonZeroU16, InitError>;
 }
@@ -117,11 +112,13 @@ pub fn init(args: InitArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Re
 struct Carried {
     data_dir: Option<PathBuf>,
     contracts: usize,
+    tokens: Vec<&'static str>,
 }
 
 /// The config to write and what it carried over, or `None` when the user keeps the existing
-/// one. An existing config that parses passes on its `[[contracts]]` and, unless `--data-dir`
-/// is given, its `data_dir`; one that does not parse is replaced outright.
+/// one. An existing config that parses passes on its `tokens`, re-resolved on the chosen
+/// network, its `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`; one that
+/// does not parse is replaced outright.
 fn collect<A: Ask>(
     ask: &mut A,
     args: InitArgs,
@@ -139,16 +136,10 @@ fn collect<A: Ask>(
         Some(network) => network,
         None => ask.network()?,
     };
-    let flag_tokens = resolve_tokens(network, &args.tokens)?;
     let addresses = if args.addresses.is_empty() {
         ask.addresses()?
     } else {
         unique(args.addresses)
-    };
-    let tokens = if args.tokens.is_empty() {
-        ask.tokens(network)?
-    } else {
-        flag_tokens
     };
     let rpc_host = match args.rpc_host {
         Some(host) => host,
@@ -159,7 +150,6 @@ fn collect<A: Ask>(
         None => ask.rpc_port(&rpc_host)?,
     };
     let mut config = Config::new(network, addresses);
-    config.tokens = tokens;
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
     config.data_dir = args.data_dir;
@@ -171,6 +161,9 @@ fn collect<A: Ask>(
         }
         carried.contracts = existing.contracts.len();
         config.contracts = existing.contracts;
+        let symbols: Vec<&str> = existing.tokens.iter().map(|token| token.symbol).collect();
+        config.tokens = resolve_tokens(network, &symbols)?;
+        carried.tokens = config.tokens.iter().map(|token| token.symbol).collect();
     }
     Ok(Some((config, carried)))
 }
@@ -220,37 +213,6 @@ impl Ask for Screens {
         }
     }
 
-    fn tokens(&mut self, network: Network) -> Result<Vec<Token>, InitError> {
-        let choices: Vec<TokenChoice> = network
-            .spec()
-            .tokens
-            .iter()
-            .copied()
-            .map(TokenChoice)
-            .collect();
-        let defaults: Vec<usize> = choices
-            .iter()
-            .enumerate()
-            .filter(|(_, choice)| DEFAULT_TOKENS.contains(&choice.0.symbol))
-            .map(|(index, _)| index)
-            .collect();
-        let chosen = MultiSelect::new("Tokens to track", choices)
-            .with_default(&defaults)
-            .with_help_message("space ticks, enter confirms; ETH is always tracked")
-            .with_formatter(&|picked| {
-                if picked.is_empty() {
-                    return "none".to_owned();
-                }
-                picked
-                    .iter()
-                    .map(|choice| choice.value.0.symbol)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .prompt()?;
-        Ok(chosen.into_iter().map(|choice| choice.0).collect())
-    }
-
     fn rpc_host(&mut self) -> Result<RpcHost, InitError> {
         let default = RpcHost::default().to_string();
         let answer = Text::new("RPC host")
@@ -283,22 +245,6 @@ impl Ask for Screens {
     }
 }
 
-/// A registry token as a tick-box line.
-#[derive(Clone, Copy)]
-struct TokenChoice(Token);
-
-impl fmt::Display for TokenChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Token {
-            symbol,
-            name,
-            address,
-            ..
-        } = self.0;
-        write!(f, "{symbol:<5} {name}  {address}")
-    }
-}
-
 /// Whether something accepts connections on `port` at `host`.
 fn port_in_use(host: &RpcHost, port: NonZeroU16) -> bool {
     host.bind_addr(port)
@@ -323,10 +269,6 @@ impl<R: BufRead, W: Write> Ask for Lines<R, W> {
 
     fn addresses(&mut self) -> Result<Vec<Address>, InitError> {
         prompt_addresses(&mut self.input, &mut self.output)
-    }
-
-    fn tokens(&mut self, network: Network) -> Result<Vec<Token>, InitError> {
-        prompt_tokens(&mut self.input, &mut self.output, network)
     }
 
     fn rpc_host(&mut self) -> Result<RpcHost, InitError> {
@@ -421,45 +363,6 @@ fn prompt_addresses<R: BufRead, W: Write>(
     }
 }
 
-/// Lists the network's tokens and reads a comma-separated choice. Blank or ended input keeps
-/// the default; `none` tracks no tokens.
-fn prompt_tokens<R: BufRead, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    network: Network,
-) -> Result<Vec<Token>, InitError> {
-    writeln!(output, "Tokens on {network}:")?;
-    for token in network.spec().tokens {
-        writeln!(output, "  {}", TokenChoice(*token))?;
-    }
-    let default = DEFAULT_TOKENS.join(",");
-    loop {
-        let prompt = format_args!("Tokens to track, comma-separated or none [{default}]: ");
-        let Some(answer) = ask(input, output, prompt)? else {
-            return Ok(default_tokens(network));
-        };
-        if answer.is_empty() {
-            return Ok(default_tokens(network));
-        }
-        if answer.eq_ignore_ascii_case("none") {
-            return Ok(Vec::new());
-        }
-        let symbols: Vec<&str> = answer
-            .split(',')
-            .map(str::trim)
-            .filter(|symbol| !symbol.is_empty())
-            .collect();
-        if symbols.is_empty() {
-            writeln!(output, "Enter token symbols separated by commas, or none.")?;
-            continue;
-        }
-        match resolve_tokens(network, &symbols) {
-            Ok(tokens) => return Ok(tokens),
-            Err(unknown) => writeln!(output, "{unknown}")?,
-        }
-    }
-}
-
 /// Reads the RPC host. Blank or ended input keeps the default.
 fn prompt_rpc_host<R: BufRead, W: Write>(
     input: &mut R,
@@ -538,9 +441,9 @@ fn write_next_steps<W: Write>(
     )?;
     let symbols: Vec<&str> = config.tokens.iter().map(|token| token.symbol).collect();
     if symbols.is_empty() {
-        writeln!(output, ", no tokens)")?;
+        writeln!(output, ")")?;
     } else {
-        writeln!(output, ", tracking {})", symbols.join(", "))?;
+        writeln!(output, ", pinning {})", symbols.join(", "))?;
     }
     if let Some(dir) = &carried.data_dir {
         writeln!(
@@ -559,6 +462,13 @@ fn write_next_steps<W: Write>(
             output,
             "kept {} [[contracts]] {entries} from the existing config",
             carried.contracts
+        )?;
+    }
+    if !carried.tokens.is_empty() {
+        writeln!(
+            output,
+            "kept tokens = [{}] from the existing config",
+            carried.tokens.join(", ")
         )?;
     }
     let flag = config_flag
@@ -602,10 +512,6 @@ mod tests {
         let mut output = Vec::new();
         let result = prompt(&mut input, &mut output);
         (result, String::from_utf8(output).unwrap())
-    }
-
-    fn symbols(tokens: &[Token]) -> Vec<&'static str> {
-        tokens.iter().map(|token| token.symbol).collect()
     }
 
     fn port(port: u16) -> NonZeroU16 {
@@ -674,49 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn token_prompt_lists_the_registry_and_defaults_to_usdc() {
-        for script in ["\n", ""] {
-            let (tokens, output) = scripted(script, |i, o| prompt_tokens(i, o, Network::Sepolia));
-            assert_eq!(symbols(&tokens.unwrap()), ["USDC"], "{script:?}");
-            assert!(output.starts_with("Tokens on sepolia:\n"), "{output}");
-            assert!(
-                output.contains(
-                    "  USDC  USD Coin (Circle)  0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238\n"
-                ),
-                "{output}"
-            );
-            assert!(
-                output.contains("  LINK  Chainlink  0x779877A7B0D9E8603169DdbD7836e478b4624789\n")
-            );
-            assert!(!output.contains("PEPE"));
-        }
-    }
-
-    #[test]
-    fn token_prompt_reprompts_on_unknown_symbols() {
-        let (tokens, output) = scripted("usdc, pepe\n , \n weth,usdc ,DAI\n", |i, o| {
-            prompt_tokens(i, o, Network::Sepolia)
-        });
-        assert_eq!(symbols(&tokens.unwrap()), ["WETH", "USDC", "DAI"]);
-        let prompt = "Tokens to track, comma-separated or none [USDC]: ";
-        let answers = output.split_once(prompt).map(|(_, rest)| rest).unwrap();
-        let (refusal, rest) = answers.split_once('\n').unwrap();
-        assert!(
-            refusal.starts_with("unknown token \"pepe\" on sepolia; known tokens: USDT, USDC"),
-            "{refusal}"
-        );
-        assert_eq!(
-            rest,
-            format!("{prompt}Enter token symbols separated by commas, or none.\n{prompt}")
-        );
-
-        let (mainnet, _) = scripted("PEPE\n", |i, o| prompt_tokens(i, o, Network::Mainnet));
-        assert_eq!(symbols(&mainnet.unwrap()), ["PEPE"]);
-        let (none, _) = scripted("None\n", |i, o| prompt_tokens(i, o, Network::Sepolia));
-        assert!(none.unwrap().is_empty());
-    }
-
-    #[test]
     fn host_prompt_defaults_and_reprompts_on_invalid() {
         for script in ["\n", ""] {
             let (host, output) = scripted(script, |i, o| prompt_rpc_host(i, o));
@@ -773,7 +636,6 @@ mod tests {
         };
         let args = InitArgs {
             network: Some(Network::Mainnet),
-            tokens: vec!["wbtc".to_owned(), "Dai".to_owned()],
             rpc_port: Some(port(9545)),
             ..InitArgs::default()
         };
@@ -781,29 +643,11 @@ mod tests {
         assert_eq!(carried, Carried::default());
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.addresses, vec![BOB]);
-        assert_eq!(symbols(&config.tokens), ["WBTC", "DAI"]);
+        assert!(config.tokens.is_empty());
         assert_eq!(config.rpc_url(), "http://chibi.local:9545");
         let output = String::from_utf8(lines.output).unwrap();
         assert!(!output.contains("Network"), "{output}");
-        assert!(!output.contains("Tokens"), "{output}");
         assert!(!output.contains("RPC port"), "{output}");
-    }
-
-    #[test]
-    fn unknown_token_flag_fails_before_any_question() {
-        let mut lines = Lines {
-            input: Cursor::new(&b""[..]),
-            output: Vec::new(),
-        };
-        let args = InitArgs {
-            network: Some(Network::Sepolia),
-            tokens: vec!["PEPE".to_owned()],
-            ..InitArgs::default()
-        };
-        let error =
-            collect(&mut lines, args, &PathBuf::from("/nonexistent/config.toml")).unwrap_err();
-        assert!(matches!(error, InitError::Token(_)), "{error}");
-        assert!(lines.output.is_empty());
     }
 
     #[test]
@@ -823,7 +667,6 @@ mod tests {
             let args = InitArgs {
                 network: Some(Network::Sepolia),
                 addresses: vec![ALICE],
-                tokens: vec!["USDC".to_owned()],
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
                 data_dir,
@@ -847,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_keeps_data_dir_and_contracts_unless_replaced() {
+    fn overwrite_keeps_data_dir_contracts_and_tokens_unless_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let old_dir = dir.path().join("old");
@@ -856,6 +699,7 @@ mod tests {
             slots: vec![alloy_primitives::U256::from(1)],
         }];
         let mut existing = Config::new(Network::Mainnet, vec![BOB]);
+        existing.tokens = resolve_tokens(Network::Mainnet, &["WETH", "USDC"]).unwrap();
         existing.data_dir = Some(old_dir.clone());
         existing.contracts.clone_from(&contracts);
         let overwrite = |data_dir: Option<PathBuf>| {
@@ -866,7 +710,6 @@ mod tests {
             let args = InitArgs {
                 network: Some(Network::Sepolia),
                 addresses: vec![ALICE],
-                tokens: vec!["USDC".to_owned()],
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
                 data_dir,
@@ -879,23 +722,37 @@ mod tests {
         assert_eq!(config.addresses, vec![ALICE]);
         assert_eq!(config.data_dir, Some(old_dir.clone()));
         assert_eq!(config.contracts, contracts);
+        assert_eq!(config.network, Network::Sepolia);
+        assert_eq!(
+            config.tokens,
+            resolve_tokens(Network::Sepolia, &["WETH", "USDC"]).unwrap()
+        );
         assert_eq!(
             carried,
             Carried {
                 data_dir: Some(old_dir.clone()),
-                contracts: 1
+                contracts: 1,
+                tokens: vec!["WETH", "USDC"],
             }
         );
         let mut output = Vec::new();
         write_next_steps(&mut output, &path, &config, &carried, None).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(
-            output.contains(&format!(
-                "kept data_dir = {} from the existing config\n\
-                 kept 1 [[contracts]] entry from the existing config\n",
+        assert_eq!(
+            output,
+            format!(
+                "wrote {} (sepolia, 1 address, pinning WETH, USDC)\n\
+                 kept data_dir = {} from the existing config\n\
+                 kept 1 [[contracts]] entry from the existing config\n\
+                 kept tokens = [WETH, USDC] from the existing config\n\
+                 \n\
+                 Next steps:\n\
+                 \x20 1. Start chibi with `chibi run` (foreground) or `chibi run -b` (background).\n\
+                 \x20 2. In your wallet, add a custom network with RPC URL http://127.0.0.1:8545 and chain id 11155111.\n\
+                 \x20 3. Check on it with `chibi status`; stop it with `chibi stop`.\n",
+                path.display(),
                 old_dir.display()
-            )),
-            "{output}"
+            )
         );
 
         let new_dir = dir.path().join("new");
@@ -906,7 +763,8 @@ mod tests {
             carried,
             Carried {
                 data_dir: None,
-                contracts: 1
+                contracts: 1,
+                tokens: vec!["WETH", "USDC"],
             }
         );
 
@@ -914,11 +772,12 @@ mod tests {
         let (config, carried) = overwrite(None);
         assert_eq!(config.data_dir, None);
         assert!(config.contracts.is_empty());
+        assert!(config.tokens.is_empty());
         assert_eq!(carried, Carried::default());
     }
 
     #[test]
-    fn next_steps_list_tokens_url_and_how_to_start() {
+    fn next_steps_list_pinned_tokens_url_and_how_to_start() {
         let mut output = Vec::new();
         let mut config = Config::new(Network::Sepolia, vec![ALICE]);
         config.tokens = resolve_tokens(Network::Sepolia, &["USDC", "WETH"]).unwrap();
@@ -934,7 +793,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "wrote /cfg/config.toml (sepolia, 1 address, tracking USDC, WETH)\n\
+            "wrote /cfg/config.toml (sepolia, 1 address, pinning USDC, WETH)\n\
              \n\
              Next steps:\n\
              \x20 1. Start chibi with `chibi run` (foreground) or `chibi run -b` (background).\n\
@@ -946,8 +805,7 @@ mod tests {
     #[test]
     fn next_steps_repeat_a_custom_config_path() {
         let mut output = Vec::new();
-        let mut config = Config::new(Network::Mainnet, vec![ALICE, BOB]);
-        config.tokens.clear();
+        let config = Config::new(Network::Mainnet, vec![ALICE, BOB]);
         let custom = Path::new("/tmp/c.toml");
         write_next_steps(
             &mut output,
@@ -958,14 +816,14 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("wrote /tmp/c.toml (mainnet, 2 addresses, no tokens)\n"));
-        assert!(
-            output.contains("`chibi run -b --config /tmp/c.toml`"),
-            "{output}"
-        );
-        assert!(
-            output.contains("`chibi stop --config /tmp/c.toml`"),
-            "{output}"
+        assert_eq!(
+            output,
+            "wrote /tmp/c.toml (mainnet, 2 addresses)\n\
+             \n\
+             Next steps:\n\
+             \x20 1. Start chibi with `chibi run --config /tmp/c.toml` (foreground) or `chibi run -b --config /tmp/c.toml` (background).\n\
+             \x20 2. In your wallet, add a custom network with RPC URL http://127.0.0.1:8545 and chain id 1.\n\
+             \x20 3. Check on it with `chibi status --config /tmp/c.toml`; stop it with `chibi stop --config /tmp/c.toml`.\n"
         );
     }
 }

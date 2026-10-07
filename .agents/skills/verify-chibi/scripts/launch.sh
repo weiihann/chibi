@@ -53,8 +53,11 @@ for address in "$@"; do
     addresses="$addresses --address $address"
 done
 # shellcheck disable=SC2086
-"$run_dir/bin/chibi" init --network "$network" $addresses --token USDC \
+"$run_dir/bin/chibi" init --network "$network" $addresses \
     --rpc-host 127.0.0.1 --rpc-port "$port" </dev/null >"$run_dir/evidence/init.txt"
+# init never pins tokens; pin USDC so status always lists it. A fresh config has no
+# tables, so a key appended at the end stays top-level.
+echo 'tokens = ["USDC"]' >>"$XDG_CONFIG_HOME/chibi/config.toml"
 
 # env and nohup exec in place, so $! is chibi's own pid.
 env RUST_LOG="${CHIBI_VERIFY_LOG:-info,chibi::devp2p=debug}" \

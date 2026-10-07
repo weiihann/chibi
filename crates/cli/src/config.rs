@@ -23,9 +23,6 @@ pub const DEFAULT_RPC_PORT: NonZeroU16 = match NonZeroU16::new(8545) {
     None => panic!("8545 is not zero"),
 };
 
-/// Tokens tracked when the user picks none explicitly.
-pub const DEFAULT_TOKENS: [&str; 1] = ["USDC"];
-
 /// Origins of browser-extension pages; ordinary websites cannot read tracked balances.
 const DEFAULT_CORS_ORIGINS: [&str; 2] = ["chrome-extension://*", "moz-extension://*"];
 
@@ -38,8 +35,11 @@ pub struct Config {
     /// Watch-only addresses whose balances are tracked.
     #[serde(serialize_with = "serialize_addresses")]
     pub addresses: Vec<Address>,
-    /// Tokens from the network's registry tracked for every watched address.
-    #[serde(serialize_with = "serialize_tokens")]
+    /// Registry tokens pinned for every watched address: kept proven at every head.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_tokens"
+    )]
     pub tokens: Vec<Token>,
     /// Beacon API endpoint; the network's default when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,7 +77,7 @@ struct ConfigFile {
     network: Network,
     #[serde(default, deserialize_with = "deserialize_addresses")]
     addresses: Vec<Address>,
-    #[serde(default = "default_token_symbols")]
+    #[serde(default)]
     tokens: Vec<String>,
     #[serde(default)]
     beacon_url: Option<Url>,
@@ -138,7 +138,7 @@ impl Config {
         Self {
             network,
             addresses,
-            tokens: default_tokens(network),
+            tokens: Vec::new(),
             beacon_url: None,
             checkpoint: None,
             rpc_host: RpcHost::default(),
@@ -187,7 +187,7 @@ impl Config {
         std::fs::write(path, text).map_err(write_error)
     }
 
-    /// Switches to `network`, tracking the same token symbols at that network's addresses.
+    /// Switches to `network`, pinning the same token symbols at that network's addresses.
     pub fn set_network(&mut self, network: Network) -> Result<(), UnknownToken> {
         let symbols: Vec<&str> = self.tokens.iter().map(|token| token.symbol).collect();
         self.tokens = resolve_tokens(network, &symbols)?;
@@ -511,15 +511,6 @@ pub fn resolve_tokens<S: AsRef<str>>(
     Ok(tokens)
 }
 
-/// The tokens tracked unless the user chooses otherwise.
-pub fn default_tokens(network: Network) -> Vec<Token> {
-    let spec = network.spec();
-    DEFAULT_TOKENS
-        .iter()
-        .filter_map(|symbol| spec.token(symbol))
-        .collect()
-}
-
 /// Reads one variable from the process environment, for the path functions below.
 pub fn process_env(key: &str) -> Option<OsString> {
     std::env::var_os(key)
@@ -627,13 +618,6 @@ fn default_rpc_port() -> NonZeroU16 {
     DEFAULT_RPC_PORT
 }
 
-fn default_token_symbols() -> Vec<String> {
-    DEFAULT_TOKENS
-        .iter()
-        .map(|symbol| (*symbol).to_owned())
-        .collect()
-}
-
 fn default_cors_origins() -> Vec<OriginPattern> {
     DEFAULT_CORS_ORIGINS
         .into_iter()
@@ -707,7 +691,7 @@ mod tests {
         let config =
             Config::parse(r#"addresses = ["0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"]"#).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, vec![ALICE]));
-        assert_eq!(config.tokens, vec![token(Network::Sepolia, "USDC")]);
+        assert!(config.tokens.is_empty());
         assert_eq!(config.rpc_host, RpcHost::Ip(Ipv4Addr::LOCALHOST.into()));
         assert_eq!(config.rpc_port, port(8545));
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
@@ -814,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn network_switch_tracks_the_same_symbols_on_the_new_network() {
+    fn network_switch_pins_the_same_symbols_on_the_new_network() {
         let mut config = Config::parse(r#"tokens = ["USDC", "WETH"]"#).unwrap();
         config.set_network(Network::Mainnet).unwrap();
         assert_eq!(config.network, Network::Mainnet);
@@ -843,8 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_token_list_tracks_none() {
+    fn config_without_tokens_pins_none_and_saves_no_tokens_line() {
         let config = Config::parse("tokens = []").unwrap();
+        assert!(config.tokens.is_empty());
+        let config =
+            Config::parse(r#"addresses = ["0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"]"#).unwrap();
+        assert_eq!(config.tokens, Vec::<Token>::new());
         assert!(
             config
                 .node_config(PathBuf::from("/data"))
@@ -852,6 +840,12 @@ mod tests {
                 .tokens
                 .is_empty()
         );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("tokens"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), config);
     }
 
     #[test]
