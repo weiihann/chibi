@@ -75,7 +75,9 @@ chibi then waits for a devp2p peer that serves snap/2, logging progress every 30
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
 
-`chibi status` reads the snapshot saved at the last verified head, so it works without a running node. For each watched address it shows ETH, the nonce, every pinned token (`?` until computed), and any other listed token whose balance chibi can compute from the keys it holds and is not zero, in list order. An unpinned token appears only after something read its keys. Those values are labeled with their block and are not re-verified.
+`chibi status` reads the snapshot saved at the last verified head, so it works without a running node. For each watched address it shows the address's primary ENS name, ETH, the nonce, every pinned token (`?` until computed), and any other listed token whose balance chibi can compute from the keys it holds and is not zero, in list order. An unpinned token appears only after something read its keys. Those values are labeled with their block and are not re-verified.
+
+The ENS name comes from the chain's ENS UniversalResolver, run by chibi itself over proven state, and is shown only when the name also resolves back to the address. A name served offchain through CCIP-read is not shown, because chibi contacts no gateway or other service. A name containing control or other invisible characters is not printed.
 
 The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 days to 2026-10-07. Mainnet has all 15: USDT, USDC, WETH, WBTC, UNI, LINK, QNT, DAI, PYUSD, ONDO, AAVE, PEPE, SHIB, 1INCH, and CRV. Sepolia has the 9 with a Sepolia deployment: USDT, USDC, WETH, WBTC, UNI, LINK, DAI, PYUSD, and AAVE. Sepolia's USDC, PYUSD, and LINK are their issuers' own deployments. Sepolia's USDT, DAI, WBTC, and AAVE are test tokens from Aave's Sepolia faucet, not tokens issued by Tether, Maker, BitGo, or Aave; anyone can mint them, so their balances carry no value.
 
