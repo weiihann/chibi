@@ -32,6 +32,7 @@ const IMPL: Address = address!("0x0000000000000000000000000000000000001111");
 const CAROL: Address = address!("0x00000000000000000000000000000000000ca201");
 const PAUSABLE: Address = address!("0x0000000000000000000000000000000000009a05");
 const PAUSABLE_IMPL: Address = address!("0x0000000000000000000000000000000000002222");
+const NEW_IMPL: Address = address!("0x0000000000000000000000000000000000003333");
 
 const TKN: Token = Token {
     symbol: "TKN",
@@ -326,6 +327,51 @@ async fn token_seeding_pins_proxy_keys_and_follows_bal_writes() {
         node.status().snapshot.holdings[0].tokens,
         vec![("TKN".to_owned(), Some(U256::from(300)))]
     );
+}
+
+#[tokio::test]
+async fn a_reseed_that_cannot_complete_keeps_seeded_pins_and_retries() {
+    let mut accounts = token_accounts(250);
+    accounts.push((NEW_IMPL, WorldAccount::contract(mapping_reader_code())));
+    let fixture = Fixture::genesis(accounts);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], TOKENS).await;
+    let seeded = BTreeSet::from([
+        Key::Account(ALICE),
+        Key::Account(PROXY),
+        Key::Account(IMPL),
+        Key::Slot(PROXY, impl_slot()),
+        Key::Slot(PROXY, mapping_slot(ALICE)),
+    ]);
+    assert_eq!(node.working().0, seeded);
+
+    fixture.fault(Fault::Unavailable(NEW_IMPL));
+    let upgrade = U256::from_be_slice(NEW_IMPL.as_slice());
+    let hash = fixture.mine_without_bal(BlockWrites::default().slot(PROXY, impl_slot(), upgrade));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
+    let (pins, learned) = node.working();
+    assert_eq!(pins, seeded);
+    assert!(learned.is_disjoint(&seeded), "no seeded pin is demoted");
+
+    fixture.heal();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    let (pins, learned) = node.working();
+    assert_eq!(
+        pins,
+        BTreeSet::from([
+            Key::Account(ALICE),
+            Key::Account(PROXY),
+            Key::Account(NEW_IMPL),
+            Key::Slot(PROXY, impl_slot()),
+            Key::Slot(PROXY, mapping_slot(ALICE)),
+        ])
+    );
+    assert!(learned.contains(&Key::Account(IMPL)));
+
+    let proofs = fixture.log().proofs;
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    assert_eq!(fixture.log().proofs, proofs, "seeding is no longer due");
 }
 
 #[tokio::test]

@@ -179,7 +179,7 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) search: Search,
     /// Blocks holding located transactions whose receipts are not yet verified.
     pub(crate) unreceipted: Vec<VerifiedBody>,
-    /// Token seeding has not run at the current anchor's store yet.
+    /// Token seeding has not completed at the current anchor's store yet.
     pub(crate) seed_due: bool,
 }
 
@@ -987,9 +987,12 @@ impl<P: Peers> Shared<P> {
     /// Runs `balanceOf(holder)` and a zero `transfer` to the holder from the holder for every
     /// watched address and pinned token, and pins every key either run read, whether or not
     /// the transfer succeeds. That covers proxies, pause flags, fee parameters, blacklists,
-    /// and nonstandard layouts without per-token code.
-    pub(crate) async fn seed(&self) {
+    /// and nonstandard layouts without per-token code. When a run cannot complete, the
+    /// previous seeded pins are kept alongside the new reads and this returns false, so the
+    /// caller retries rather than demoting keys a peer could not serve.
+    pub(crate) async fn seed(&self) -> bool {
         let mut seeded = BTreeSet::new();
+        let mut complete = true;
         for holder in &self.watch.addresses {
             for token in &self.watch.tokens {
                 for request in [balance_of(token, *holder), transfer_to_self(token, *holder)] {
@@ -1006,16 +1009,25 @@ impl<P: Peers> Shared<P> {
                         .await;
                     match read {
                         Ok(read) => seeded.extend(read),
-                        Err(err) => warn!(
-                            target: "chibi::node",
-                            token = token.symbol, %holder, %err,
-                            "token seeding failed; its keys are fetched on demand",
-                        ),
+                        Err(err) => {
+                            complete = false;
+                            warn!(
+                                target: "chibi::node",
+                                token = token.symbol, %holder, %err,
+                                "token seeding failed; retrying at the next step",
+                            );
+                        }
                     }
                 }
             }
         }
-        self.update(|s| s.set_seeded(seeded));
+        self.update(|s| {
+            if !complete {
+                seeded.extend(s.working().pins());
+            }
+            s.set_seeded(seeded);
+        });
+        complete
     }
 
     /// The display snapshot at `store`, computed locally without fetching.

@@ -135,8 +135,7 @@ impl<P: Peers> Follower<P> {
             self.seed_due = true;
         }
         if self.seed_due {
-            shared.seed().await;
-            self.seed_due = false;
+            self.seed_due = !shared.seed().await;
         }
         shared.warm(self.heads.latest.clone()).await;
 
