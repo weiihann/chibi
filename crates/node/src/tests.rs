@@ -223,14 +223,177 @@ async fn a_block_with_a_bal_extends_without_reproving() {
         node.header(BlockSel::Number(genesis.number())).unwrap(),
         genesis
     );
-    assert!(matches!(
-        node.account(ALICE, BlockSel::Number(genesis.number())).await,
-        Err(NodeError::Unsupported { head: n, .. }) if n == head.number
-    ));
+    assert_eq!(
+        balance_at(&node, ALICE, BlockSel::Number(genesis.number())).await,
+        Some(eth(2))
+    );
     assert!(matches!(
         node.header(BlockSel::Number(head.number + 1)),
         Err(NodeError::Unsupported { .. })
     ));
+}
+
+async fn balance_at(node: &Node<FixturePeers>, address: Address, block: BlockSel) -> Option<U256> {
+    match node.account(address, block).await {
+        Ok(account) => account.map(|account| account.balance),
+        Err(err) => panic!("account at {block:?}: {err}"),
+    }
+}
+
+/// The head an `Unsupported` refusal names, or the value served instead.
+async fn refused_at(
+    node: &Node<FixturePeers>,
+    address: Address,
+    block: BlockSel,
+) -> Result<u64, String> {
+    match node.account(address, block).await {
+        Err(NodeError::Unsupported { head, .. }) => Ok(head),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+#[tokio::test]
+async fn the_block_before_the_head_serves_its_own_state_by_number_and_hash() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    let parent = node.head();
+
+    let hash = fixture.mine(BlockWrites::default().balance(ALICE, eth(1)));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+    let proofs = fixture.log().proofs;
+
+    for (block, expected) in [
+        (BlockSel::Number(parent.number()), eth(2)),
+        (BlockSel::Hash(parent.hash()), eth(2)),
+        (BlockSel::Number(head.number), eth(1)),
+        (BlockSel::Hash(head.hash), eth(1)),
+    ] {
+        assert_eq!(
+            balance_at(&node, ALICE, block).await,
+            Some(expected),
+            "{block:?}"
+        );
+    }
+    assert_eq!(fixture.log().proofs, proofs);
+}
+
+#[tokio::test]
+async fn blocks_skipped_inside_one_extend_serve_their_state() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    let genesis = node.head().number();
+
+    for n in 1..=3 {
+        fixture.mine_unseen(BlockWrites::default().balance(ALICE, eth(10 + n)));
+    }
+    let head = fixture.world(|w| w.verified(w.head())).num_hash();
+    fixture.publish(head.hash);
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+
+    for (number, expected) in [
+        (genesis, eth(2)),
+        (genesis + 1, eth(11)),
+        (genesis + 2, eth(12)),
+        (genesis + 3, eth(13)),
+    ] {
+        assert_eq!(
+            balance_at(&node, ALICE, BlockSel::Number(number)).await,
+            Some(expected),
+            "block {number}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_call_at_the_previous_block_proves_its_misses_there_and_keeps_them_out_of_the_head() {
+    let fixture = token_world(250);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    let parent = node.head().number();
+    let slot = Key::Slot(PROXY, mapping_slot(ALICE));
+    assert!(!node.holds(slot));
+
+    let hash =
+        fixture.mine(BlockWrites::default().slot(PROXY, mapping_slot(ALICE), U256::from(300)));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+    let proofs = fixture.log().proofs;
+
+    let request = CallRequest {
+        to: TxKind::Call(PROXY),
+        input: balance_of_calldata(ALICE),
+        ..CallRequest::default()
+    };
+    match node.call(request, BlockSel::Number(parent)).await.unwrap() {
+        ExecutionResult::Success { output, .. } => {
+            assert_eq!(U256::from_be_slice(output.data()), U256::from(250));
+        }
+        other @ (ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. }) => {
+            panic!("balanceOf at the parent failed: {other:?}")
+        }
+    }
+    assert!(fixture.log().proofs > proofs);
+    assert!(!node.holds(slot));
+    assert_eq!(token_balance(&node, ALICE).await, U256::from(300));
+}
+
+#[tokio::test]
+async fn state_older_than_the_retained_blocks_is_unsupported() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    let genesis = node.head().number();
+
+    for n in 1..=9 {
+        let hash = fixture.mine(BlockWrites::default().balance(ALICE, eth(10 + n)));
+        let head = fixture.world(|w| w.verified(hash)).num_hash();
+        assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+    }
+
+    assert_eq!(
+        balance_at(&node, ALICE, BlockSel::Number(genesis + 1)).await,
+        Some(eth(11))
+    );
+    assert_eq!(
+        refused_at(&node, ALICE, BlockSel::Number(genesis)).await,
+        Ok(genesis + 9)
+    );
+}
+
+#[tokio::test]
+async fn a_fork_switch_drops_the_retained_states() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    let genesis = node.head();
+
+    let abandoned = fixture.mine(BlockWrites::default().balance(ALICE, eth(1)));
+    let head = fixture.world(|w| w.verified(abandoned)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+    assert_eq!(
+        balance_at(&node, ALICE, BlockSel::Hash(genesis.hash())).await,
+        Some(eth(2))
+    );
+
+    let sibling = fixture.fork_head(BlockWrites::default().balance(ALICE, eth(5)));
+    let head = fixture.world(|w| w.verified(sibling)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
+
+    assert_eq!(
+        refused_at(&node, ALICE, BlockSel::Hash(abandoned)).await,
+        Ok(head.number)
+    );
+    assert_eq!(
+        refused_at(&node, ALICE, BlockSel::Number(genesis.number())).await,
+        Ok(head.number)
+    );
+    assert_eq!(
+        balance_at(&node, ALICE, BlockSel::Number(head.number)).await,
+        Some(eth(5))
+    );
 }
 
 #[tokio::test]

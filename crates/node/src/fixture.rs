@@ -183,6 +183,13 @@ impl Fixture {
         self.inner.world.lock().mine(writes)
     }
 
+    /// Mines a sibling of the head with a BAL and publishes it as the latest head.
+    pub fn fork_head(&self, writes: BlockWrites) -> B256 {
+        let hash = self.inner.world.lock().fork_head(writes);
+        self.publish(hash);
+        hash
+    }
+
     /// Publishes `hash` as the latest attested head.
     pub fn publish(&self, hash: B256) {
         self.sender

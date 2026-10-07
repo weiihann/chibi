@@ -334,3 +334,33 @@ async fn history_and_logs_name_the_held_head() {
         .unwrap_err();
     assert_eq!(earliest.code(), -32004, "{earliest}");
 }
+
+#[tokio::test]
+async fn a_balance_at_the_block_before_the_head_is_served_as_wallets_ask_for_it() {
+    let fixture = Fixture::genesis([(BOB, WorldAccount::eoa(eth(3)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, node, mut follower) = start(&fixture, dir.path(), &[BOB]).await;
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    let parent = node.head().number();
+
+    fixture.mine(BlockWrites::default().balance(BOB, eth(1)));
+    assert!(matches!(
+        follower.step().await.unwrap(),
+        Stepped::Extended(_)
+    ));
+    assert_eq!(node.head().number(), parent + 1);
+
+    for (block, expected) in [(parent, eth(3)), (parent + 1, eth(1))] {
+        assert_eq!(
+            call(
+                &rpc,
+                "eth_getBalance",
+                vec![json!(BOB), json!(U64::from(block))]
+            )
+            .await
+            .unwrap(),
+            json!(expected),
+            "block {block}"
+        );
+    }
+}
