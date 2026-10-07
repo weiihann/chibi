@@ -223,40 +223,43 @@ fn write_status<W: Write>(
 }
 
 /// Whether `name` prints as itself. ENS names are chain data anyone can set, so a name with a
-/// control character, a line or paragraph separator, a bidirectional override, another
-/// invisible format character, or a private-use character is dropped rather than shown. The
-/// zero-width joiner stays allowed because emoji names are joined by it.
+/// control character, a line or paragraph separator, a default-ignorable code point (which
+/// renders as nothing, so the name could pass for another), or a private-use character is
+/// dropped rather than shown.
 fn printable(name: &str) -> bool {
     name.chars().all(|c| {
         !c.is_control()
             && (c == ' ' || !c.is_whitespace())
-            && !matches!(
-                c,
-                '\u{ad}'
-                    | '\u{600}'..='\u{605}'
-                    | '\u{61c}'
-                    | '\u{6dd}'
-                    | '\u{70f}'
-                    | '\u{890}'..='\u{891}'
-                    | '\u{8e2}'
-                    | '\u{180e}'
-                    | '\u{200b}'..='\u{200c}'
-                    | '\u{200e}'..='\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2060}'..='\u{206f}'
-                    | '\u{e000}'..='\u{f8ff}'
-                    | '\u{feff}'
-                    | '\u{fff9}'..='\u{fffb}'
-                    | '\u{110bd}'
-                    | '\u{110cd}'
-                    | '\u{13430}'..='\u{1343f}'
-                    | '\u{1bca0}'..='\u{1bca3}'
-                    | '\u{1d173}'..='\u{1d17a}'
-                    | '\u{e0001}'..='\u{e007f}'
-                    | '\u{f0000}'..
-            )
+            && !matches!(c, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..)
+            && !DEFAULT_IGNORABLE
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&c))
     })
 }
+
+/// Default_Ignorable_Code_Point ranges from Unicode 16.0 DerivedCoreProperties.txt, adjacent
+/// ranges merged, less U+200D ZERO WIDTH JOINER and U+FE0F VARIATION SELECTOR-16, which emoji
+/// names need.
+const DEFAULT_IGNORABLE: &[(char, char)] = &[
+    ('\u{ad}', '\u{ad}'),
+    ('\u{34f}', '\u{34f}'),
+    ('\u{61c}', '\u{61c}'),
+    ('\u{115f}', '\u{1160}'),
+    ('\u{17b4}', '\u{17b5}'),
+    ('\u{180b}', '\u{180f}'),
+    ('\u{200b}', '\u{200c}'),
+    ('\u{200e}', '\u{200f}'),
+    ('\u{202a}', '\u{202e}'),
+    ('\u{2060}', '\u{206f}'),
+    ('\u{3164}', '\u{3164}'),
+    ('\u{fe00}', '\u{fe0e}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{ffa0}', '\u{ffa0}'),
+    ('\u{fff0}', '\u{fff8}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0000}', '\u{e0fff}'),
+];
 
 /// `value` base units as a decimal with `decimals` places, trailing zeros trimmed to two.
 fn format_units(value: U256, decimals: u8) -> String {
@@ -411,10 +414,20 @@ mod tests {
             "zero\u{200b}width.eth",
             "split\u{2028}.eth",
             "private\u{e000}.eth",
+            "cgj\u{34f}.eth",
+            "filler\u{3164}.eth",
+            "half\u{ffa0}width.eth",
+            "choseong\u{115f}.eth",
+            "tag\u{e0041}.eth",
         ] {
             assert_eq!(line(hostile), format!("{BOB}   ? ETH"), "{hostile:?}");
         }
-        for shown in ["ñandú.eth", "👨\u{200d}👩\u{200d}👧.eth", "名前.eth"] {
+        for shown in [
+            "ñandú.eth",
+            "👨\u{200d}👩\u{200d}👧.eth",
+            "❤\u{fe0f}.eth",
+            "名前.eth",
+        ] {
             assert_eq!(line(shown), format!("{BOB} {shown}   ? ETH"));
         }
     }
