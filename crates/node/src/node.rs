@@ -12,7 +12,7 @@ use alloy_consensus::transaction::SignerRecoverable as _;
 use alloy_eips::BlockNumHash;
 use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, TxKind, U256};
-use alloy_sol_types::SolCall as _;
+use alloy_sol_types::{SolCall as _, SolValue as _};
 use chibi_core::VerifiedHeader;
 use chibi_core::exec::{
     self, CallRequest, ChainEnv, EstimateError, ExecError, Executed, ExecutionResult, HaltReason,
@@ -1415,8 +1415,8 @@ fn reverse_name(resolver: Address, holder: Address) -> CallRequest {
 }
 
 /// The primary name `reverse` returns, run locally over held keys only; `None` if a key is
-/// missing, the call reverts or returns something else, or the name is empty. chibi never
-/// follows an `OffchainLookup` to a gateway.
+/// missing, the call reverts or returns something else, or the name is empty or not UTF-8.
+/// chibi never follows an `OffchainLookup` to a gateway.
 fn primary_name(
     store: &Store,
     env: &ChainEnv,
@@ -1427,7 +1427,9 @@ fn primary_name(
     let Ok(ExecutionResult::Success { output, .. }) = executed.result else {
         return None;
     };
-    let primary = reverseCall::abi_decode_returns(output.data()).ok()?.primary;
+    // Decoded as bytes: the string decoder replaces invalid UTF-8 rather than rejecting it.
+    let (primary, _, _) = <(Bytes, Address, Address)>::abi_decode_params(output.data()).ok()?;
+    let primary = String::from_utf8(primary.into()).ok()?;
     (!primary.is_empty()).then_some(primary)
 }
 

@@ -1290,9 +1290,11 @@ const NAME_RESOLVER: Address = address!("0x0000000000000000000000000000000000005
 /// Code answering `reverse` like the UniversalResolver: `name` for `named`, and the empty
 /// name every unnamed address gets for any other address. It returns a fixed ABI-encoded
 /// `(string, address, address)` chosen by comparing the calldata word holding the address.
-fn reverse_resolver_code(named: Address, name: &str) -> Bytes {
+fn reverse_resolver_code(named: Address, name: &[u8]) -> Bytes {
     let unnamed_reply = (String::new(), Address::ZERO, NAME_RESOLVER).abi_encode_params();
-    let named_reply = (name.to_owned(), NAME_RESOLVER, NAME_RESOLVER).abi_encode_params();
+    // `bytes` and `string` share an encoding, so a name need not be UTF-8.
+    let named_reply =
+        (Bytes::copy_from_slice(name), NAME_RESOLVER, NAME_RESOLVER).abi_encode_params();
     // Calldata is the selector, the bytes offset, the coin type, the bytes length, then the
     // address left-aligned in its word at 0x64.
     let mut code = vec![0x7f]; // push32 the expected word
@@ -1355,7 +1357,7 @@ async fn a_watched_address_shows_its_primary_name_and_bals_keep_it_current() {
         (BOB, WorldAccount::eoa(eth(3))),
         (
             RESOLVER,
-            WorldAccount::contract(reverse_resolver_code(ALICE, "alice.eth")),
+            WorldAccount::contract(reverse_resolver_code(ALICE, b"alice.eth")),
         ),
     ]);
     let dir = tempfile::tempdir().unwrap();
@@ -1368,13 +1370,28 @@ async fn a_watched_address_shows_its_primary_name_and_bals_keep_it_current() {
     assert_eq!(saved.holdings[1].name, None);
 
     let proofs = fixture.log().proofs;
-    fixture.mine(BlockWrites::default().code(RESOLVER, reverse_resolver_code(BOB, "bob.eth")));
+    fixture.mine(BlockWrites::default().code(RESOLVER, reverse_resolver_code(BOB, b"bob.eth")));
     assert!(matches!(
         follower.step().await.unwrap(),
         Stepped::Extended(_)
     ));
     assert_eq!(names(&node), vec![None, Some("bob.eth".to_owned())]);
     assert_eq!(fixture.log().proofs, proofs);
+}
+
+#[tokio::test]
+async fn a_name_that_is_not_utf8_is_no_name() {
+    let fixture = Fixture::genesis([
+        (ALICE, WorldAccount::eoa(eth(2))),
+        (
+            RESOLVER,
+            WorldAccount::contract(reverse_resolver_code(ALICE, b"\xff.eth")),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+
+    assert_eq!(names(&node), vec![None]);
 }
 
 #[tokio::test]
