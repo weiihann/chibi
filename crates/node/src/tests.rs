@@ -20,7 +20,7 @@ use chibi_core::verify::VerifyError;
 use chibi_core::wire::Transaction;
 
 use crate::disk::{Disk, read_state};
-use crate::fixture::{Fault, Fixture, FixturePeers, LIAR};
+use crate::fixture::{Fault, Fixture, FixturePeers, LIAR, Log};
 use crate::network::{MAINNET_ENS_RESOLVER, Token};
 use crate::node::{
     BlockSel, ContractSnapshot, Follower, Held, Node, NodeError, Stepped, TrackedContract,
@@ -985,7 +985,7 @@ async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_o
         })
         .collect();
     let fixture = Fixture::genesis(holders.clone());
-    fixture.serve_proofs_serially(Duration::from_millis(340));
+    fixture.serve_proofs(1, Duration::from_millis(340));
     let dir = tempfile::tempdir().unwrap();
     let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
 
@@ -997,6 +997,130 @@ async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_o
         (1..=100).map(|i| Some(eth(i))).collect::<Vec<_>>()
     );
     assert_eq!(fixture.log().proofs, 100);
+}
+
+const READER: Address = address!("0x0000000000000000000000000000000000005ead");
+const NOBODY: Address = address!("0x000000000000000000000000000000000000dead");
+
+/// Code that loads slots `0..count` of its own storage and stops.
+fn slots_reader_code(count: u8) -> Bytes {
+    let mut code: Vec<u8> = (0..count)
+        .flat_map(|slot| [0x60, slot, 0x54, 0x50]) // pop(sload(slot))
+        .collect();
+    code.push(0x00);
+    Bytes::from(code)
+}
+
+/// ALICE and a contract reading its six slots, two of them set.
+fn reader_world() -> Fixture {
+    Fixture::genesis([
+        (ALICE, WorldAccount::eoa(eth(2))),
+        (
+            READER,
+            WorldAccount::contract(slots_reader_code(6))
+                .with_slot(U256::from(1), U256::from(11))
+                .with_slot(U256::from(4), U256::from(44)),
+        ),
+    ])
+}
+
+fn reader_slots() -> Watchlist {
+    Watchlist {
+        addresses: Vec::new(),
+        tokens: Vec::new(),
+        contracts: vec![TrackedContract {
+            address: READER,
+            slots: (0..6u64).map(U256::from).collect(),
+        }],
+    }
+}
+
+/// Account and storage requests for `address` served between `before` and `after`.
+fn requests(before: &Log, after: &Log, address: Address) -> (usize, usize) {
+    let key = keccak256(address);
+    (
+        after.accounts[before.accounts.len()..]
+            .iter()
+            .filter(|account| **account == key)
+            .count(),
+        after.slots[before.slots.len()..]
+            .iter()
+            .filter(|(account, _)| *account == key)
+            .count(),
+    )
+}
+
+#[tokio::test]
+async fn a_call_reading_six_slots_of_one_contract_proves_its_account_once() {
+    let fixture = reader_world();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+    assert_eq!(balance(&node, ALICE).await, Some(eth(2)));
+    assert_eq!(
+        node.code(READER, BlockSel::Latest).await.unwrap(),
+        slots_reader_code(6)
+    );
+
+    let before = fixture.log();
+    let call = CallRequest {
+        from: Some(ALICE),
+        to: TxKind::Call(READER),
+        ..CallRequest::default()
+    };
+    assert!(matches!(
+        node.call(call, BlockSel::Latest).await.unwrap(),
+        ExecutionResult::Success { .. }
+    ));
+    assert_eq!(requests(&before, &fixture.log(), READER), (1, 6));
+}
+
+#[tokio::test]
+async fn slots_of_an_absent_account_or_of_empty_storage_need_no_storage_requests() {
+    let fixture = reader_world();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+
+    let before = fixture.log();
+    let storage = |address| node.storage(address, U256::from(1), BlockSel::Latest);
+    assert_eq!(storage(NOBODY).await.unwrap(), U256::ZERO);
+    assert_eq!(storage(ALICE).await.unwrap(), U256::ZERO);
+    let after = fixture.log();
+    assert_eq!(requests(&before, &after, NOBODY), (1, 0));
+    assert_eq!(requests(&before, &after, ALICE), (1, 0));
+}
+
+#[tokio::test]
+async fn warming_and_reanchoring_prove_a_contract_account_once_for_all_its_pinned_slots() {
+    let fixture = reader_world();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start_with(&fixture, dir.path(), &[], &reader_slots()).await;
+    assert_eq!(requests(&Log::default(), &fixture.log(), READER), (1, 6));
+    assert_eq!(
+        node.storage(READER, U256::from(4), BlockSel::Latest)
+            .await
+            .unwrap(),
+        U256::from(44)
+    );
+
+    let before = fixture.log();
+    let hash = fixture.mine_without_bal(BlockWrites::default().balance(ALICE, eth(5)));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
+    assert_eq!(requests(&before, &fixture.log(), READER), (1, 6));
+}
+
+#[tokio::test]
+async fn a_slot_no_peer_serves_leaves_the_other_slots_of_its_account_warm() {
+    let fixture = reader_world();
+    fixture.fault(Fault::WithholdSlot(READER, U256::from(1)));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start_with(&fixture, dir.path(), &[], &reader_slots()).await;
+
+    assert!(node.holds(Key::Account(READER)));
+    for slot in [0u64, 2, 3, 4, 5] {
+        assert!(node.holds(Key::Slot(READER, U256::from(slot))), "{slot}");
+    }
+    assert!(!node.holds(Key::Slot(READER, U256::from(1))));
 }
 
 #[tokio::test]

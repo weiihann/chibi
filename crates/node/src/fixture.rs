@@ -16,7 +16,7 @@ use chibi_core::wire::{
 };
 use chibi_core::{TrustedHash, VerifiedHeader};
 use parking_lot::Mutex;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 use crate::disk::read_state;
 use crate::heads::{Heads, HeadsSender};
@@ -36,6 +36,8 @@ pub enum Fault {
     DropProofNode(Address),
     /// Replies for this address come back empty, as from a peer outside its snap window.
     Unavailable(Address),
+    /// Storage replies for this slot of this address come back empty.
+    WithholdSlot(Address, U256),
     /// BAL requests get no lists.
     WithholdBals,
     /// Body requests fail.
@@ -60,18 +62,33 @@ pub struct Log {
     pub penalized: Vec<PeerKey>,
     /// Account, storage, and code requests served.
     pub proofs: usize,
+    /// `keccak256(address)` of every account request served, in order.
+    pub accounts: Vec<B256>,
     /// `(keccak256(address), keccak256(slot))` of every storage request served, in order.
     pub slots: Vec<(B256, B256)>,
+    /// Most proof requests sent and not yet answered at once, while [`Fixture::serve_proofs`]
+    /// is in effect.
+    pub most_in_flight: usize,
     /// Block bodies served.
     pub bodies: usize,
     /// Broadcasts, in order.
     pub broadcasts: Vec<Broadcast>,
 }
 
+/// How proof requests are served after [`Fixture::serve_proofs`].
+#[derive(Clone, Debug)]
+struct Wire {
+    /// How long each request takes once the peer works on it.
+    service: Duration,
+    /// One permit per request the peer works on at once, handed out in arrival order.
+    line: Arc<Semaphore>,
+}
+
 #[derive(Debug, Default)]
 struct Faults {
     drop_proof_node: HashSet<B256>,
     unavailable: HashSet<B256>,
+    withheld_slots: HashSet<(B256, B256)>,
     withhold_bals: bool,
     withhold_bodies: bool,
     lie: Option<(B256, U256)>,
@@ -87,10 +104,10 @@ struct Inner {
     holding: watch::Sender<bool>,
     /// Proof requests that have waited at the gate.
     parked: watch::Sender<usize>,
-    /// While set, proof requests are served one at a time, each taking this long.
-    serial: Mutex<Option<Duration>>,
-    /// The single serial peer; a request holds it while being served.
-    line: Arc<tokio::sync::Mutex<()>>,
+    /// While set, proof requests are served at most a few at a time, each taking a while.
+    wire: Mutex<Option<Wire>>,
+    /// Proof requests sent over the wire and not yet answered.
+    in_flight: Mutex<usize>,
 }
 
 /// An offline chain and the light client watching it.
@@ -118,8 +135,8 @@ impl Fixture {
                 outbox_dir: Mutex::new(None),
                 holding: watch::Sender::new(false),
                 parked: watch::Sender::new(0),
-                serial: Mutex::new(None),
-                line: Arc::new(tokio::sync::Mutex::new(())),
+                wire: Mutex::new(None),
+                in_flight: Mutex::new(0),
             }),
             sender,
             heads,
@@ -195,6 +212,11 @@ impl Fixture {
             Fault::Unavailable(address) => {
                 faults.unavailable.insert(keccak256(address));
             }
+            Fault::WithholdSlot(address, slot) => {
+                faults
+                    .withheld_slots
+                    .insert((keccak256(address), keccak256(B256::from(slot))));
+            }
             Fault::WithholdBals => faults.withhold_bals = true,
             Fault::WithholdBodies => faults.withhold_bodies = true,
             Fault::LieAboutBalance(address, balance) => {
@@ -239,11 +261,14 @@ impl Fixture {
         self.inner.holding.send_replace(false);
     }
 
-    /// Serves proof requests like the only snap/2 peer behind reth's fetcher: one at a time,
-    /// each taking `service`, and a request already queued is served even after its caller
-    /// stopped waiting.
-    pub fn serve_proofs_serially(&self, service: Duration) {
-        *self.inner.serial.lock() = Some(service);
+    /// Serves proof requests like one snap/2 peer working on up to `at_once` of them, each
+    /// taking `service`, in arrival order. A request already sent is served even after its
+    /// caller stopped waiting.
+    pub fn serve_proofs(&self, at_once: usize, service: Duration) {
+        *self.inner.wire.lock() = Some(Wire {
+            service,
+            line: Arc::new(Semaphore::new(at_once)),
+        });
     }
 }
 
@@ -277,22 +302,29 @@ impl FixturePeers {
         }
     }
 
-    /// Runs `serve` now, or, while proofs are served serially, after every earlier request
-    /// on the line and the service time, whether or not the caller is still waiting.
+    /// Runs `serve` now, or, while proofs are served over the wire, once the peer has room and
+    /// the service time has passed, whether or not the caller is still waiting.
     async fn on_the_wire<T: Send + 'static>(
         &self,
         serve: impl FnOnce(&Self) -> T + Send + 'static,
     ) -> Result<T, NetError> {
-        let Some(service) = *self.inner.serial.lock() else {
+        let Some(wire) = self.inner.wire.lock().clone() else {
             return Ok(serve(self));
         };
+        {
+            let mut in_flight = self.inner.in_flight.lock();
+            *in_flight += 1;
+            let mut log = self.inner.log.lock();
+            log.most_in_flight = log.most_in_flight.max(*in_flight);
+        }
         let (reply, answer) = oneshot::channel();
         let peers = self.clone();
-        let line = Arc::clone(&self.inner.line);
         let mut queued = Box::pin(async move {
-            let _turn = line.lock().await;
-            tokio::time::sleep(service).await;
-            reply.send(serve(&peers)).ok();
+            let _turn = wire.line.acquire().await;
+            tokio::time::sleep(wire.service).await;
+            let value = serve(&peers);
+            *peers.inner.in_flight.lock() -= 1;
+            reply.send(value).ok();
         });
         // Join the line before returning, so requests queue in the order they were made.
         if futures::poll!(queued.as_mut()).is_pending() {
@@ -306,6 +338,7 @@ impl FixturePeers {
         request: &AccountRangeRequest,
     ) -> Result<Reply<AccountReply>, NetError> {
         self.proof_served();
+        self.inner.log.lock().accounts.push(request.key);
         let mut faults = self.inner.faults.lock();
         if faults.unavailable.contains(&request.key) {
             return Self::honest(AccountReply::default());
@@ -337,13 +370,14 @@ impl FixturePeers {
             .lock()
             .slots
             .push((request.account, request.slot));
-        if self
-            .inner
-            .faults
-            .lock()
-            .unavailable
-            .contains(&request.account)
-        {
+        let withheld = {
+            let faults = self.inner.faults.lock();
+            faults.unavailable.contains(&request.account)
+                || faults
+                    .withheld_slots
+                    .contains(&(request.account, request.slot))
+        };
+        if withheld {
             return Self::honest(StorageReply::default());
         }
         Self::honest(self.inner.world.lock().storage_reply(request))
