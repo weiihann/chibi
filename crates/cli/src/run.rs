@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chibi_core::state::Key;
-use chibi_node::{Disk, Network, Node, NodeConfig, Status};
+use chibi_node::{Disk, Health, Network, Node, NodeConfig};
 use clap::Args;
 use eyre::{WrapErr, bail};
 use nix::errno::Errno;
@@ -198,34 +198,34 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
     }
 }
 
-/// Logs the node's status every [`STATUS_EVERY`], starting at once.
+/// Logs the node's health every [`STATUS_EVERY`], starting at once.
 async fn report(node: Node) -> Infallible {
     let mut ticks = tokio::time::interval(STATUS_EVERY);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut previous = BTreeSet::new();
     loop {
         ticks.tick().await;
-        let status = node.status();
-        log_status(&status, &previous);
-        previous = status.unheld_pins.into_iter().collect();
+        let health = node.health();
+        log_status(&health, &previous);
+        previous = health.unheld_pins.into_iter().collect();
     }
 }
 
 /// Logs one status line, and warnings for no snap/2 peer and for pins `previous`, the last
 /// line's unheld pins, also lacked.
-fn log_status(status: &Status, previous: &BTreeSet<Key>) {
+fn log_status(health: &Health, previous: &BTreeSet<Key>) {
     info!(
-        head = status.snapshot.block.number,
-        peers = status.peers,
-        snap_peers = status.snap_peers,
-        pins = %status.pins,
-        learned = %status.learned,
+        head = health.head.number,
+        peers = health.peers,
+        snap_peers = health.snap_peers,
+        pins = %health.pins,
+        learned = %health.learned,
         "status",
     );
-    if status.snap_peers == 0 {
+    if health.snap_peers == 0 {
         warn!("no snap/2 peer connected; the head and state requests stall until one returns");
     }
-    if let Some((count, named)) = persisting_unheld(previous, &status.unheld_pins) {
+    if let Some((count, named)) = persisting_unheld(previous, &health.unheld_pins) {
         warn!(count, pins = %named, "pins not held at the head for two status lines");
     }
 }

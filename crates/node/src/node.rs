@@ -290,6 +290,18 @@ pub struct Status {
     pub peers: usize,
     /// Connected sessions that negotiated snap/2.
     pub snap_peers: usize,
+}
+
+/// The anchor, the peers, and how much of the working set the anchor's store holds, read
+/// without executing anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Health {
+    /// The anchor.
+    pub head: BlockNumHash,
+    /// Connected devp2p sessions.
+    pub peers: usize,
+    /// Connected sessions that negotiated snap/2.
+    pub snap_peers: usize,
     /// Pinned keys, configured and seeded, the anchor's store holds.
     pub pins: Held,
     /// Learned keys the anchor's store holds.
@@ -894,10 +906,21 @@ impl<P: Peers> Node<P> {
         self.shared.read(|s| s.store().holds(key))
     }
 
-    /// Current status.
+    /// Current status, with the display snapshot computed in the local EVM.
     pub fn status(&self) -> Status {
-        let (store, pins, learned, unheld_pins) = self.shared.read(|s| {
-            let store = s.snapshot();
+        let store = self.shared.read(State::snapshot);
+        let census = self.shared.peers.census();
+        Status {
+            snapshot: self.shared.snapshot(&store),
+            peers: census.peers,
+            snap_peers: census.snap_peers,
+        }
+    }
+
+    /// Current health: counts read from the state, with no snapshot.
+    pub fn health(&self) -> Health {
+        let (head, pins, learned, unheld_pins) = self.shared.read(|s| {
+            let store = s.store();
             let working = s.working();
             let unheld_pins: Vec<Key> = working.pins().filter(|key| !store.holds(*key)).collect();
             let total = working.pins().count();
@@ -909,11 +932,11 @@ impl<P: Peers> Node<P> {
                 held: held.held + usize::from(store.holds(key)),
                 total: held.total + 1,
             });
-            (store, pins, learned, unheld_pins)
+            (store.anchor().num_hash(), pins, learned, unheld_pins)
         });
         let census = self.shared.peers.census();
-        Status {
-            snapshot: self.shared.snapshot(&store),
+        Health {
+            head,
             peers: census.peers,
             snap_peers: census.snap_peers,
             pins,
