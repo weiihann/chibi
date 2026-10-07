@@ -89,7 +89,7 @@ When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a
 | `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
 | `contracts` | none | Contract accounts and storage slots to track, see below |
 
-Data (light-client checkpoint, devp2p key, remembered peers, the state file, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
+Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, and remembered peers, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi run` and then deleted. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
 
 ### Tracking contracts and storage slots
 
