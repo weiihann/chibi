@@ -660,7 +660,6 @@ mod tests {
         assert_eq!(carried, Carried::default());
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.addresses, vec![BOB]);
-        assert!(config.tokens.is_empty());
         assert_eq!(config.rpc_url(), "http://chibi.local:9545");
         let output = String::from_utf8(lines.output).unwrap();
         assert!(!output.contains("Network"), "{output}");
@@ -707,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_keeps_data_dir_contracts_and_tokens_unless_replaced() {
+    fn overwrite_keeps_data_dir_and_contracts_unless_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let old_dir = dir.path().join("old");
@@ -716,7 +715,6 @@ mod tests {
             slots: vec![alloy_primitives::U256::from(1)],
         }];
         let mut existing = Config::new(Network::Mainnet, vec![BOB]);
-        existing.tokens = resolve_tokens(Network::Mainnet, &["WETH", "USDC"]).unwrap();
         existing.data_dir = Some(old_dir.clone());
         existing.contracts.clone_from(&contracts);
         let overwrite = |data_dir: Option<PathBuf>| {
@@ -741,15 +739,10 @@ mod tests {
         assert_eq!(config.contracts, contracts);
         assert_eq!(config.network, Network::Sepolia);
         assert_eq!(
-            config.tokens,
-            resolve_tokens(Network::Sepolia, &["WETH", "USDC"]).unwrap()
-        );
-        assert_eq!(
             carried,
             Carried {
                 data_dir: Some(old_dir.clone()),
                 contracts: 1,
-                tokens: vec!["WETH", "USDC"],
             }
         );
         let mut output = Vec::new();
@@ -758,10 +751,9 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "wrote {} (sepolia, 1 address, pinning WETH, USDC)\n\
+                "wrote {} (sepolia, 1 address)\n\
                  kept data_dir = {} from the existing config\n\
                  kept 1 [[contracts]] entry from the existing config\n\
-                 kept tokens = [WETH, USDC] from the existing config\n\
                  \n\
                  Next steps:\n\
                  \x20 1. Start chibi with `chibi run` (foreground) or `chibi run -b` (background).\n\
@@ -781,7 +773,6 @@ mod tests {
             Carried {
                 data_dir: None,
                 contracts: 1,
-                tokens: vec!["WETH", "USDC"],
             }
         );
 
@@ -789,15 +780,13 @@ mod tests {
         let (config, carried) = overwrite(None);
         assert_eq!(config.data_dir, None);
         assert!(config.contracts.is_empty());
-        assert!(config.tokens.is_empty());
         assert_eq!(carried, Carried::default());
     }
 
     #[test]
-    fn next_steps_list_pinned_tokens_url_and_how_to_start() {
+    fn next_steps_give_the_url_and_how_to_start() {
         let mut output = Vec::new();
         let mut config = Config::new(Network::Sepolia, vec![ALICE]);
-        config.tokens = resolve_tokens(Network::Sepolia, &["USDC", "WETH"]).unwrap();
         config.rpc_host = "chibi.local".parse().unwrap();
         config.rpc_port = port(8745);
         write_next_steps(
@@ -810,7 +799,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "wrote /cfg/config.toml (sepolia, 1 address, pinning USDC, WETH)\n\
+            "wrote /cfg/config.toml (sepolia, 1 address)\n\
              \n\
              Next steps:\n\
              \x20 1. Start chibi with `chibi run` (foreground) or `chibi run -b` (background).\n\

@@ -477,10 +477,10 @@ mod tests {
     }
 
     #[test]
-    fn network_override_tracks_the_tokens_of_the_network_run() {
+    fn network_override_runs_the_other_network_and_a_tokens_line_still_fails() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "tokens = [\"USDC\"]\n").unwrap();
+        fs::write(&path, "rpc_port = 9545\n").unwrap();
         let config = load(
             &path,
             true,
@@ -491,20 +491,13 @@ mod tests {
         .unwrap();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
-        let mainnet_usdc = Network::Mainnet.spec().token("USDC").unwrap();
-        assert_eq!(
-            config.node_config(PathBuf::from("/data")).watch.tokens,
-            vec![mainnet_usdc]
-        );
 
-        fs::write(&path, "network = \"mainnet\"\ntokens = [\"PEPE\"]\n").unwrap();
-        let error = load(&path, true, Some(Network::Sepolia), None, None)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("unknown token \"PEPE\" on sepolia"),
-            "{error}"
+        fs::write(&path, "tokens = [\"USDC\"]\n").unwrap();
+        let error = format!(
+            "{:#}",
+            load(&path, true, Some(Network::Mainnet), None, None).unwrap_err()
         );
+        assert!(error.contains("`tokens` was removed"), "{error}");
     }
 
     #[test]
@@ -514,7 +507,7 @@ mod tests {
         let config = load(&path, false, None, None, None).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, Vec::new()));
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
-        assert!(config.tokens.is_empty() && config.contracts.is_empty());
+        assert!(config.contracts.is_empty());
         assert_eq!(config.data_dir, None);
         assert!(!path.exists());
 

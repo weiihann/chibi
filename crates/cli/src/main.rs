@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn status_renders_unpinned_registry_tokens_with_registry_decimals() {
+    fn status_renders_registry_tokens_with_registry_decimals() {
         let snapshot = Snapshot {
             network: Network::Mainnet,
             block: BlockNumHash::new(21_000_000, B256::repeat_byte(1)),

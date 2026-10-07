@@ -684,10 +684,6 @@ mod tests {
     const ALICE: Address = address!("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063");
     const USDC: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 
-    fn token(network: Network, symbol: &str) -> Token {
-        network.spec().token(symbol).unwrap()
-    }
-
     fn port(port: u16) -> NonZeroU16 {
         NonZeroU16::new(port).unwrap()
     }
@@ -697,7 +693,6 @@ mod tests {
         let config =
             Config::parse(r#"addresses = ["0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"]"#).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, vec![ALICE]));
-        assert!(config.tokens.is_empty());
         assert_eq!(config.rpc_host, RpcHost::Ip(Ipv4Addr::LOCALHOST.into()));
         assert_eq!(config.rpc_port, port(8545));
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
@@ -724,7 +719,6 @@ mod tests {
             r#"
             network = "mainnet"
             addresses = ["0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"]
-            tokens = ["wbtc", "USDT", "WBTC"]
             beacon_url = "https://beacon.example/"
             checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
             rpc_host = "Chibi.Example"
@@ -745,10 +739,6 @@ mod tests {
             Config {
                 network: Network::Mainnet,
                 addresses: vec![ALICE],
-                tokens: vec![
-                    token(Network::Mainnet, "WBTC"),
-                    token(Network::Mainnet, "USDT")
-                ],
                 beacon_url: Some(Url::parse("https://beacon.example/").unwrap()),
                 checkpoint: Some(B256::repeat_byte(0x11)),
                 rpc_host: RpcHost::Name("chibi.example".to_owned()),
@@ -777,81 +767,58 @@ mod tests {
                 discovery: 30303
             }
         );
-        assert_eq!(node.watch.addresses, vec![ALICE]);
-        assert_eq!(node.watch.tokens, config.tokens);
-        assert_eq!(node.watch.contracts, config.contracts);
-    }
-
-    #[test]
-    fn unknown_token_is_rejected_naming_the_known_ones() {
-        let error = Config::parse(r#"tokens = ["USDC", "XYZ"]"#)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("\"XYZ\""), "{error}");
-        assert!(error.contains("known tokens: USDT, USDC"), "{error}");
-
-        let error = Config::parse(r#"tokens = ["PEPE"]"#)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("unknown token \"PEPE\" on sepolia"),
-            "{error}"
-        );
-        assert!(
-            Config::parse("network = \"mainnet\"\ntokens = [\"PEPE\"]").is_ok(),
-            "PEPE is in the mainnet registry"
-        );
-    }
-
-    #[test]
-    fn network_switch_pins_the_same_symbols_on_the_new_network() {
-        let mut config = Config::parse(r#"tokens = ["USDC", "WETH"]"#).unwrap();
-        config.set_network(Network::Mainnet).unwrap();
-        assert_eq!(config.network, Network::Mainnet);
         assert_eq!(
-            config.node_config(PathBuf::from("/data")).watch.tokens,
-            vec![
-                token(Network::Mainnet, "USDC"),
-                token(Network::Mainnet, "WETH")
-            ]
-        );
-
-        let mut mainnet = Config::parse("network = \"mainnet\"\ntokens = [\"PEPE\"]").unwrap();
-        let error = mainnet
-            .set_network(Network::Sepolia)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.starts_with("unknown token \"PEPE\" on sepolia; known tokens: USDT, USDC"),
-            "{error}"
-        );
-        assert_eq!(
-            mainnet.network,
-            Network::Mainnet,
-            "a failed switch changes nothing"
+            node.watch,
+            Watchlist {
+                addresses: vec![ALICE],
+                contracts: config.contracts.clone(),
+            }
         );
     }
 
     #[test]
-    fn config_without_tokens_pins_none_and_saves_no_tokens_line() {
-        let config = Config::parse("tokens = []").unwrap();
-        assert!(config.tokens.is_empty());
-        let config =
-            Config::parse(r#"addresses = ["0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"]"#).unwrap();
-        assert_eq!(config.tokens, Vec::<Token>::new());
-        assert!(
-            config
-                .node_config(PathBuf::from("/data"))
-                .watch
-                .tokens
-                .is_empty()
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        config.save(&path).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("tokens"), "{text}");
-        assert_eq!(Config::load(&path).unwrap(), Some(config));
+    fn a_tokens_line_is_rejected_naming_the_fix() {
+        for text in [
+            r#"tokens = ["USDC"]"#,
+            "tokens = []",
+            "addresses = [\"0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063\"]\ntokens = [\"DAI\"]",
+        ] {
+            let error = Config::parse(text).unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "`tokens` was removed: every registry token is now kept for watched \
+                     addresses; delete the `tokens` line or rerun `chibi init`"
+                ),
+                "{text}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_node_gets_the_watched_addresses_and_no_token_choice() {
+        for (text, addresses) in [
+            ("", Vec::new()),
+            (
+                r#"addresses = ["0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"]"#,
+                vec![ALICE],
+            ),
+        ] {
+            let config = Config::parse(text).unwrap();
+            assert_eq!(
+                config.node_config(PathBuf::from("/data")).watch,
+                Watchlist {
+                    addresses,
+                    contracts: Vec::new(),
+                },
+                "{text}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            config.save(&path).unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(!saved.contains("tokens"), "{saved}");
+            assert_eq!(Config::load(&path).unwrap(), Some(config));
+        }
     }
 
     #[test]
@@ -911,7 +878,6 @@ mod tests {
             r#"rpc_host = "http://localhost""#,
             "rpc_port = 0",
             "rpc_port = 70000",
-            r#"tokens = "USDC""#,
             r#"cors_origins = ["chrome-*-extension://"]"#,
             r#"cors_origins = [""]"#,
             r#"allowed_hosts = ["http://localhost"]"#,
@@ -1012,12 +978,11 @@ mod tests {
                 slots: Vec::new(),
             },
         ];
-        config.tokens = resolve_tokens(Network::Mainnet, &["dai", "WBTC"]).unwrap();
         config.rpc_host = "::1".parse().unwrap();
         config.rpc_port = port(9545);
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(r#"tokens = ["DAI", "WBTC"]"#), "{text}");
+        assert!(!text.contains("tokens"), "{text}");
         assert!(text.contains(r#"rpc_host = "::1""#), "{text}");
         assert!(text.contains("[[contracts]]"), "{text}");
         assert!(text.contains(r#"slots = ["0x1", "0xffff"#), "{text}");

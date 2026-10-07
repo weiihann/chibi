@@ -54,31 +54,20 @@ const TOKENS: &[Token] = &[TKN];
 
 const BOTH: &[Token] = &[TKN, PSE];
 
+/// Starts on a chain whose registry is `registry` and takes the first follower step, which
+/// seeds and warms.
 async fn start(
     fixture: &Fixture,
     dir: &Path,
     watch: &[Address],
-    tokens: &'static [Token],
-) -> (Node<FixturePeers>, Follower<FixturePeers>) {
-    start_watching(fixture, dir, watch, tokens, tokens).await
-}
-
-/// Starts on a chain whose registry is `registry`, pinning only `tokens` of it, and takes
-/// the first follower step, which seeds and warms.
-async fn start_watching(
-    fixture: &Fixture,
-    dir: &Path,
-    watch: &[Address],
     registry: &'static [Token],
-    tokens: &[Token],
 ) -> (Node<FixturePeers>, Follower<FixturePeers>) {
-    start_with(fixture, dir, registry, &watchlist(watch, tokens)).await
+    start_with(fixture, dir, registry, &watchlist(watch)).await
 }
 
-fn watchlist(addresses: &[Address], tokens: &[Token]) -> Watchlist {
+fn watchlist(addresses: &[Address]) -> Watchlist {
     Watchlist {
         addresses: addresses.to_vec(),
-        tokens: tokens.to_vec(),
         contracts: Vec::new(),
     }
 }
@@ -391,7 +380,6 @@ async fn a_configured_contract_slot_is_pinned_and_follows_bal_writes() {
     let dir = tempfile::tempdir().unwrap();
     let watch = Watchlist {
         addresses: vec![ALICE],
-        tokens: Vec::new(),
         contracts: vec![TrackedContract {
             address: IMPL,
             slots: vec![set, unset],
@@ -438,7 +426,7 @@ async fn a_configured_contract_slot_is_pinned_and_follows_bal_writes() {
 async fn seeding_pins_the_pause_flag_so_a_transfer_fetches_only_the_recipient() {
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[PSE]).await;
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE], &[PSE]).await;
 
     let seeded = node.working().0;
     assert!(seeded.contains(&Key::Slot(PAUSABLE, PAUSED_SLOT)));
@@ -487,21 +475,37 @@ async fn seeding_pins_the_pause_flag_so_a_transfer_fetches_only_the_recipient() 
 }
 
 #[tokio::test]
-async fn a_registry_token_that_is_not_pinned_is_not_seeded_or_reported() {
+async fn every_registry_token_is_pinned_for_every_watched_address() {
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[TKN]).await;
-
-    assert!(!working_set_has_key_of(&node, PAUSABLE));
-    assert!(!working_set_has_key_of(&node, PAUSABLE_IMPL));
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE, CAROL], BOTH).await;
     assert_eq!(
-        node.status().snapshot.holdings[0].tokens,
-        vec![("TKN".to_owned(), Some(U256::from(250)))]
+        node.working().0,
+        BTreeSet::from([
+            Key::Account(ALICE),
+            Key::Account(CAROL),
+            Key::Account(MAINNET_ENS_RESOLVER),
+            Key::Account(PROXY),
+            Key::Account(IMPL),
+            Key::Slot(PROXY, impl_slot()),
+            Key::Slot(PROXY, mapping_slot(ALICE)),
+            Key::Slot(PROXY, mapping_slot(CAROL)),
+            Key::Account(PAUSABLE),
+            Key::Account(PAUSABLE_IMPL),
+            Key::Slot(PAUSABLE, impl_slot()),
+            Key::Slot(PAUSABLE, PAUSED_SLOT),
+            Key::Slot(PAUSABLE, mapping_slot(ALICE)),
+            Key::Slot(PAUSABLE, mapping_slot(CAROL)),
+        ])
     );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start(&fixture, dir.path(), &[], BOTH).await;
+    assert_eq!(node.working().0, BTreeSet::new());
 }
 
 #[tokio::test]
-async fn a_restart_without_a_token_stops_pinning_it() {
+async fn a_restart_whose_registry_lacks_a_token_stops_pinning_it() {
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
     {
@@ -514,7 +518,7 @@ async fn a_restart_without_a_token_stops_pinning_it() {
         mapping_slot(ALICE),
         U256::from(999),
     ));
-    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[TKN]).await;
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE], TOKENS).await;
     assert!(!working_set_has_key_of(&node, PAUSABLE));
     assert!(!working_set_has_key_of(&node, PAUSABLE_IMPL));
     assert_eq!(
@@ -960,7 +964,7 @@ fn alice_and_bob() -> Fixture {
 async fn start_serves_reads_before_the_first_step_warms_the_pins() {
     let fixture = alice_and_bob();
     let dir = tempfile::tempdir().unwrap();
-    let (node, mut follower) = open(&fixture, dir.path(), &[], &watchlist(&[ALICE], &[])).await;
+    let (node, mut follower) = open(&fixture, dir.path(), &[], &watchlist(&[ALICE])).await;
     assert_eq!(fixture.log().proofs, 0);
     assert!(!node.holds(Key::Account(ALICE)));
     assert_eq!(node.status().snapshot.holdings[0].balance, None);
@@ -1053,7 +1057,6 @@ fn reader_world() -> Fixture {
 fn reader_slots() -> Watchlist {
     Watchlist {
         addresses: Vec::new(),
-        tokens: Vec::new(),
         contracts: vec![TrackedContract {
             address: READER,
             slots: (0..6u64).map(U256::from).collect(),
@@ -1246,7 +1249,7 @@ async fn health_counts_the_pins_and_learned_keys_the_head_holds() {
     let held = |held, total| Held { held, total };
     let fixture = alice_and_bob();
     let dir = tempfile::tempdir().unwrap();
-    let (node, mut follower) = open(&fixture, dir.path(), &[], &watchlist(&[ALICE], &[])).await;
+    let (node, mut follower) = open(&fixture, dir.path(), &[], &watchlist(&[ALICE])).await;
     assert_eq!(
         counts(&node),
         (held(0, 1), held(0, 0), vec![Key::Account(ALICE)])
@@ -1276,8 +1279,7 @@ async fn health_counts_the_pins_and_learned_keys_the_head_holds() {
 async fn health_counts_without_computing_token_balances() {
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) =
-        open(&fixture, dir.path(), BOTH, &watchlist(&[ALICE, CAROL], &[])).await;
+    let (node, _follower) = open(&fixture, dir.path(), BOTH, &watchlist(&[ALICE, CAROL])).await;
     let working = node.working();
 
     let health = node.health();
@@ -1303,35 +1305,17 @@ async fn health_counts_without_computing_token_balances() {
 }
 
 #[tokio::test]
-async fn status_lists_unpinned_tokens_only_when_nonzero_and_pinned_ones_always() {
+async fn status_lists_a_token_only_when_its_balance_is_nonzero() {
     let tokens = |node: &Node<FixturePeers>, holder: usize| {
         node.status().snapshot.holdings[holder].tokens.clone()
     };
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE, CAROL], BOTH, &[]).await;
+    let (node, mut follower) = open(&fixture, dir.path(), BOTH, &watchlist(&[ALICE, CAROL])).await;
     assert_eq!(tokens(&node, 0), vec![]);
-    assert_eq!(token_balance(&node, ALICE).await, U256::from(250));
-    assert_eq!(token_balance(&node, CAROL).await, U256::ZERO);
-    assert_eq!(
-        tokens(&node, 0),
-        vec![("TKN".to_owned(), Some(U256::from(250)))]
-    );
     assert_eq!(tokens(&node, 1), vec![]);
 
-    let fixture = two_token_world(250, 40);
-    let dir = tempfile::tempdir().unwrap();
-    let (node, mut follower) = open(
-        &fixture,
-        dir.path(),
-        BOTH,
-        &watchlist(&[ALICE, CAROL], &[PSE]),
-    )
-    .await;
-    assert_eq!(tokens(&node, 1), vec![("PSE".to_owned(), None)]);
     assert_eq!(follower.step().await.unwrap(), Stepped::Current);
-    assert_eq!(token_balance(&node, ALICE).await, U256::from(250));
-    assert_eq!(token_balance(&node, CAROL).await, U256::ZERO);
     assert_eq!(
         tokens(&node, 0),
         vec![
@@ -1339,7 +1323,9 @@ async fn status_lists_unpinned_tokens_only_when_nonzero_and_pinned_ones_always()
             ("PSE".to_owned(), Some(U256::from(40)))
         ]
     );
-    assert_eq!(tokens(&node, 1), vec![("PSE".to_owned(), Some(U256::ZERO))]);
+    assert_eq!(tokens(&node, 1), vec![]);
+    assert_eq!(token_balance(&node, CAROL).await, U256::ZERO);
+    assert_eq!(tokens(&node, 1), vec![]);
 }
 
 #[tokio::test]
