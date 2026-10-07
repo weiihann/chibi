@@ -1241,6 +1241,30 @@ async fn a_learned_key_that_cannot_be_proven_never_blocks_the_head() {
 }
 
 #[tokio::test]
+async fn a_pinned_key_that_cannot_be_proven_never_blocks_the_head() {
+    let fixture = token_world(250);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], TOKENS).await;
+    let held = Key::Slot(PROXY, mapping_slot(ALICE));
+    let pins = node.working().0;
+    assert!(pins.contains(&held));
+    assert!(node.holds(held));
+
+    fixture.fault(Fault::Unavailable(PROXY));
+    let hash = fixture.mine_without_bal(BlockWrites::default().balance(ALICE, eth(4)));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
+    assert_eq!(node.header(BlockSel::Latest).unwrap().num_hash(), head);
+    assert_eq!(balance(&node, ALICE).await, Some(eth(4)));
+    assert!(!node.holds(held));
+    assert_eq!(node.working().0, pins, "an unproven pin stays pinned");
+
+    fixture.heal();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    assert!(node.holds(held));
+}
+
+#[tokio::test]
 async fn health_counts_the_pins_and_learned_keys_the_head_holds() {
     let counts = |node: &Node<FixturePeers>| {
         let health = node.health();
