@@ -168,9 +168,11 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
     let data_dir = node_config.data_dir.clone();
     let (node, follower) = tokio::select! {
         started = Node::start(node_config, || {
-            if let Err(err) = found_state_peer(&mut io::stdout().lock()) {
-                warn!(%err, "cannot print to stdout");
-            }
+            tokio::task::spawn_blocking(|| {
+                if let Err(err) = found_state_peer(&mut io::stdout().lock()) {
+                    warn!(%err, "cannot print to stdout");
+                }
+            });
         }) => started?,
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
