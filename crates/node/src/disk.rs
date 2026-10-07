@@ -25,6 +25,8 @@ use crate::node::{NodeError, Snapshot};
 
 const LOCK_FILE: &str = "chibi.lock";
 const DB_FILE: &str = "chibi.db";
+/// How long the writer and `chibi status` wait for each other's lock on the database.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The JSON file that held the state before the database. [`Disk::open`] imports it once and
 /// deletes it.
 const LEGACY_STATE_FILE: &str = "state.json";
@@ -316,20 +318,28 @@ impl Disk {
     }
 }
 
-/// Reads the state saved in `dir` without taking the lock, alongside a running writer. Until
-/// a node has created the database, reads the legacy state file instead. `None` if there is
-/// neither.
+/// Reads the state saved in `dir` without taking the lock, alongside a running writer, and
+/// without creating files there. Until a node has created the database, reads the legacy
+/// state file instead. `None` if there is neither.
 pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
     let path = dir.join(DB_FILE);
     if !path.try_exists().map_err(|err| io_error(&path, &err))? {
         return read_legacy(dir);
     }
-    let fail = |err| db_error(&path, &err);
-    let mut conn = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(fail)?;
+    let fail = |err: rusqlite::Error| match err.sqlite_error() {
+        // A crashed writer left a hot journal, which a read-only connection cannot roll back.
+        Some(failure) if failure.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
+            NodeError::Disk(format!(
+                "{}: interrupted write; start the node once to recover the database",
+                path.display()
+            ))
+        }
+        _ => db_error(&path, &err),
+    };
+    // In the rollback-journal mode a reader only takes a shared lock on the database file.
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut conn = Connection::open_with_flags(&path, flags).map_err(fail)?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
     let tx = conn.transaction().map_err(fail)?;
     match schema_version(&tx).map_err(fail)? {
         0 => read_legacy(dir),
@@ -344,12 +354,15 @@ fn open_db(dir: &Path) -> Result<Db, NodeError> {
     let path = dir.join(DB_FILE);
     let fail = |err| db_error(&path, &err);
     let mut conn = Connection::open(&path).map_err(fail)?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
+    // The rollback journal, so readers create no files. Also switches a database an
+    // earlier build left in WAL mode.
     let mode: String = conn
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
         .map_err(fail)?;
-    if !mode.eq_ignore_ascii_case("wal") {
+    if !mode.eq_ignore_ascii_case("delete") {
         return Err(NodeError::Disk(format!(
-            "{}: journal mode is {mode}, not WAL",
+            "{}: journal mode is {mode}, not DELETE",
             path.display()
         )));
     }
@@ -764,6 +777,134 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(LEGACY_STATE_FILE)]);
+    }
+
+    fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Saves a snapshot in `dir`'s database and closes it as a stopping node does.
+    fn write_closed_database(dir: &Path) {
+        let disk = Disk::open(dir).unwrap();
+        let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
+        disk.save(|saved| saved.set_snapshot(snapshot)).unwrap();
+        drop(disk);
+        assert!(listing(dir).contains(&DB_FILE.into()));
+    }
+
+    #[test]
+    fn status_reads_a_closed_database_without_creating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_closed_database(dir.path());
+        let before = listing(dir.path());
+        assert_pre_contracts_snapshot(&read_snapshot(dir.path()).unwrap().unwrap());
+        assert_eq!(listing(dir.path()), before);
+    }
+
+    #[test]
+    fn status_refuses_a_database_with_a_hot_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        write_closed_database(dir.path());
+        // A transaction too big for the page cache spills to the database file after syncing
+        // its journal. Copy the files out then, as a crash would leave them.
+        let mut writer = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        writer.pragma_update(None, "cache_size", 2).unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute("DELETE FROM snapshot", []).unwrap();
+        for position in 0..64 {
+            tx.execute(
+                "INSERT INTO outbox VALUES (?1, zeroblob(4096), 0, x'')",
+                [position],
+            )
+            .unwrap();
+        }
+        let crashed = tempfile::tempdir().unwrap();
+        for name in [DB_FILE, "chibi.db-journal"] {
+            fs::copy(dir.path().join(name), crashed.path().join(name)).unwrap();
+        }
+        drop(tx);
+        let before = listing(crashed.path());
+        let err = read_state(crashed.path()).unwrap_err().to_string();
+        assert!(err.contains("start the node once"), "{err}");
+        assert_eq!(listing(crashed.path()), before);
+        // The writer rolls the journal back on open, and status reads the saved state again.
+        drop(Disk::open(crashed.path()).unwrap());
+        assert_pre_contracts_snapshot(&read_snapshot(crashed.path()).unwrap().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_reads_a_closed_database_in_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Makes the directory writable again, so the temporary directory can be removed.
+        struct Writable<'a>(&'a Path);
+        impl Drop for Writable<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_closed_database(dir.path());
+        let before = listing(dir.path());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let _writable = Writable(dir.path());
+        assert_pre_contracts_snapshot(&read_snapshot(dir.path()).unwrap().unwrap());
+        assert_eq!(listing(dir.path()), before);
+    }
+
+    #[test]
+    fn status_beside_a_writer_that_keeps_reopening_reads_each_saved_state_in_order() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        const SAVES: u8 = 40;
+        let dir = tempfile::tempdir().unwrap();
+        drop(Disk::open(dir.path()).unwrap());
+        let committed = Arc::new(AtomicU8::new(0));
+        let writer = {
+            let dir = dir.path().to_owned();
+            let committed = Arc::clone(&committed);
+            thread::spawn(move || {
+                for byte in 1..=SAVES {
+                    let disk = Disk::open(&dir).unwrap();
+                    disk.save(|saved| saved.set_outbox(vec![queued(byte, byte.into())]))
+                        .unwrap();
+                    committed.store(byte, Ordering::Release);
+                    drop(disk);
+                    // Leave the database closed for a while, so reads also find no writer.
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let mut last = 0;
+        while !writer.is_finished() {
+            let floor = committed.load(Ordering::Acquire);
+            let saved = read_state(dir.path()).unwrap().unwrap();
+            let byte = match saved.outbox() {
+                [] => 0,
+                [tx] => {
+                    assert_eq!(tx, &queued(tx.raw[0], tx.raw[0].into()));
+                    tx.raw[0]
+                }
+                more => panic!("one save holds one transaction, read {}", more.len()),
+            };
+            assert!(byte >= floor, "read {byte} after {floor} was committed");
+            assert!(byte >= last, "read {byte} after reading {last}");
+            last = byte;
+            thread::sleep(Duration::from_micros(300));
+        }
+        writer.join().unwrap();
+        assert_eq!(
+            read_state(dir.path()).unwrap().unwrap().outbox(),
+            &[queued(SAVES, SAVES.into())]
+        );
     }
 
     #[test]
