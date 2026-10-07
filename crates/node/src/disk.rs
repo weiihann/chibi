@@ -364,7 +364,9 @@ fn open_db(dir: &Path) -> Result<Db, NodeError> {
             path.display()
         )));
     }
-    conn.pragma_update(None, "synchronous", "FULL")
+    // With a rollback journal, FULL can lose a committed transaction to power loss: the
+    // journal's deletion is not synced, so it can come back as hot and roll the commit back.
+    conn.pragma_update(None, "synchronous", "EXTRA")
         .map_err(fail)?;
     match schema_version(&conn).map_err(fail)? {
         0 => create(&mut conn, dir).map_err(fail)?,
