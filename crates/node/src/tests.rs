@@ -1088,10 +1088,10 @@ async fn a_learned_key_that_cannot_be_proven_never_blocks_the_head() {
 }
 
 #[tokio::test]
-async fn status_counts_the_pins_and_learned_keys_the_head_holds() {
+async fn health_counts_the_pins_and_learned_keys_the_head_holds() {
     let counts = |node: &Node<FixturePeers>| {
-        let status = node.status();
-        (status.pins, status.learned, status.unheld_pins)
+        let health = node.health();
+        (health.pins, health.learned, health.unheld_pins)
     };
     let held = |held, total| Held { held, total };
     let fixture = alice_and_bob();
@@ -1120,6 +1120,36 @@ async fn status_counts_the_pins_and_learned_keys_the_head_holds() {
     let head = fixture.world(|w| w.verified(hash)).num_hash();
     assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
     assert_eq!(counts(&node), (held(2, 2), held(0, 1), vec![]));
+}
+
+#[tokio::test]
+async fn health_counts_without_computing_token_balances() {
+    let fixture = two_token_world(250, 40);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) =
+        open(&fixture, dir.path(), BOTH, &watchlist(&[ALICE, CAROL], &[])).await;
+    let working = node.working();
+
+    let health = node.health();
+    assert_eq!(
+        (
+            health.peers,
+            health.snap_peers,
+            health.pins,
+            health.learned,
+            health.unheld_pins
+        ),
+        (
+            1,
+            1,
+            Held { held: 0, total: 2 },
+            Held { held: 0, total: 0 },
+            vec![Key::Account(ALICE), Key::Account(CAROL)]
+        )
+    );
+    assert_eq!(fixture.log().proofs, 0);
+    assert_eq!(node.working(), working);
+    assert_eq!(health.head, node.status().snapshot.block);
 }
 
 #[tokio::test]
