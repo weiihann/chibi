@@ -19,7 +19,7 @@ use chibi_core::exec::{
     self, CallRequest, ChainEnv, EstimateError, ExecError, Executed, ExecutionResult, HaltReason,
     Misses,
 };
-use chibi_core::state::{Account, Key, Miss, State, StateError, Store};
+use chibi_core::state::{Account, Key, Miss, RECENT_STATES, State, StateError, Store};
 use chibi_core::tx::{self, FeeSample, Lookup, PendingTx, VerifiedReceipt};
 use chibi_core::verify::{VerifiedBody, VerifyError};
 use chibi_core::wire::Transaction;
@@ -155,8 +155,8 @@ pub enum BlockSel {
     Safe,
     /// The light client's finalized header. Block queries only.
     Finalized,
-    /// A block by number. Served only for headers chibi holds and only for block queries,
-    /// except the anchor's own number, which also serves state.
+    /// A block by number. Served for headers chibi holds; state is served only at the anchor
+    /// and the [`RECENT_STATES`] blocks before it.
     Number(BlockNumber),
     /// A block by hash, with the same limits as [`BlockSel::Number`].
     Hash(B256),
@@ -992,6 +992,8 @@ pub fn read_snapshot(data_dir: &Path) -> Result<Option<Snapshot>, NodeError> {
     Ok(crate::disk::read_state(data_dir)?.and_then(|file| file.snapshot().cloned()))
 }
 
+const _: () = assert!(RECENT_STATES == 8, "Shared::pin's refusal names 8 blocks");
+
 impl<P: Peers> Shared<P> {
     pub(crate) fn read<R>(&self, f: impl FnOnce(&State) -> R) -> R {
         f(&self.state.lock())
@@ -1001,30 +1003,28 @@ impl<P: Peers> Shared<P> {
         f(&mut self.state.lock())
     }
 
-    /// The store a state query at `block` reads. Only the anchor serves state.
+    /// The store a state query at `block` reads: the anchor's, or a retained recent one's.
     fn pin(&self, block: BlockSel) -> Result<Arc<Store>, NodeError> {
-        let store = self.read(State::snapshot);
-        let anchor = store.anchor();
-        let serves = match block {
-            BlockSel::Latest | BlockSel::Pending => true,
-            BlockSel::Number(number) => number == anchor.number(),
-            BlockSel::Hash(hash) => hash == anchor.hash(),
-            BlockSel::Safe | BlockSel::Finalized => false,
-        };
-        if serves {
-            Ok(store)
-        } else {
-            Err(NodeError::Unsupported {
-                what: "state at blocks other than the verified head",
-                head: anchor.number(),
-            })
-        }
+        self.read(|s| {
+            let hash = match block {
+                BlockSel::Latest | BlockSel::Pending => return Ok(s.snapshot()),
+                BlockSel::Number(number) => s.store().header(number).map(VerifiedHeader::hash),
+                BlockSel::Hash(hash) => Some(hash),
+                BlockSel::Safe | BlockSel::Finalized => None,
+            };
+            hash.and_then(|hash| s.snapshot_at(hash))
+                .ok_or(NodeError::Unsupported {
+                    what: "state at blocks other than the verified head and the 8 before it",
+                    head: s.anchor().number(),
+                })
+        })
     }
 
     /// Runs `step` on `store`, proving its misses at the same anchor between runs. Then, in
     /// one update, learns every key the run read or fetched, even when it failed or the
-    /// anchor moved, and folds the new facts into the canonical state unless the anchor
-    /// moved. Wakes the follower if any working-set key is left unheld.
+    /// anchor moved, and folds the new facts into the canonical state unless `store` is no
+    /// longer, or never was, the published one. Wakes the follower if any working-set key is
+    /// left unheld.
     pub(crate) async fn resolve<T>(
         &self,
         mut store: Arc<Store>,

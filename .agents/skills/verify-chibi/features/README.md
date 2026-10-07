@@ -13,7 +13,7 @@ This directory is the maintained source for verifying chibi's user-facing behavi
 ## Driving conventions
 
 - `C=http://127.0.0.1:$PORT` is chibi; `O=https://ethereum-sepolia-rpc.publicnode.com` is the oracle.
-- Pin every state comparison to chibi's head: read `cast block-number --rpc-url $C`, then query both sides with `--block <that number>`. chibi answers `-32004` for any other block; when the head moves between the two calls, read it again.
+- Pin every state comparison to chibi's head: read `cast block-number --rpc-url $C`, then query both sides with `--block <that number>`. chibi serves state at its head and the 8 blocks before it and answers `-32004` for older blocks; when the head moves between the two calls, read it again.
 - Sepolia USDC is `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` (6 decimals).
 - Send every artifact into `$RUN_DIR/evidence/`.
 

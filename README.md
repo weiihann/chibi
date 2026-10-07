@@ -165,7 +165,7 @@ Supported: `web3_clientVersion`, `net_version`, `eth_chainId`, `eth_blockNumber`
 
 Limits:
 
-- State is served only at the verified head (`latest` and `pending`). Older blocks, `eth_getLogs`, and filters return error `-32004`.
+- State is served only at the verified head (`latest` and `pending`) and the 8 blocks before it, by number or hash. Older blocks, `eth_getLogs`, and filters return error `-32004`.
 - Block responses carry header fields and an empty transaction list.
 - If every state peer disconnects, chibi keeps serving its last verified head as `latest` and logs `step failed` (`no connected peer serves state (snap/2)`) until one returns. `eth_syncing` still reports `false`.
 - Receipts and transaction lookups cover only transactions sent through chibi.

@@ -84,6 +84,8 @@ Dependencies point one way: `cli -> node -> core`. reth-network and helios compi
 
 `State` is the canonical value the follower owns. It wraps `Arc<Store>`, the `WorkingSet`, the finalized header, and the `TxBook` of submitted transactions. The `WorkingSet` (`core::working`) is the one source of truth for which keys chibi keeps; the store holds a key only if the working set does, and working-set keys the store lacks are unheld. Pins are the watched accounts, each configured `[[contracts]]` account with its listed raw storage slots, and every key the seeding runs read. Seeding runs ENS's `reverse(address, 60)` on the network's UniversalResolver once per watched address, sent from that address, and two calls per watched address and registry token: `balanceOf(holder)` and a simulated `transfer(holder, 0)` from the holder. Every token in the network's registry is seeded for every watched address, so balances are proven at start before any wallet asks, and nobody chooses tokens. The resolver call covers the reverse registrar, the name's resolver, and the forward check the UniversalResolver makes itself (ENSIP-19), so the primary name stays computable from held keys. The token calls cover proxy slots, pause flags, fee parameters, blacklist entries, and the holder's balance, so a send only has to fetch the recipient's slot. Every other key a request reads (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`, `eth_estimateGas`) is learned. Keys are accounts and storage slots. While pins plus learned keys exceed `WORKING_SET_CAP` = 1024, the least recently used learned key is evicted. Pins are never evicted, so a pinned set larger than the cap is kept whole and leaves no room for learned keys; the cap bounds learned keys, not the total. Evicting an account evicts its learned slots, and evicted values leave the store. `State::advance` and `State::reanchor` both return located transactions whose block left the held chain to pending, so a reorg cannot leave a stale receipt.
 
+`State` also keeps the stores it published before the current one, newest first, up to `RECENT_STATES` = 8, each as an `Arc<Store>` anchored at a block the current store holds as an ancestor. `advance` and `reanchor` push the replaced store and then drop every retained store whose anchor is not the current store's held header at that number, so a fork switch or a reanchor to a non-child drops them all; blocks applied together in one extend are each retained. Nothing is merged into a retained store.
+
 ### Trust boundary
 
 `core::verify` is the only code that reads peer bytes. Its inputs are a `TrustedHash` from the light client and chibi's own reply types (`AccountReply`, `StorageReply`, raw BAL bytes, `Header`, block bodies, receipts). The node adapter converts reth wire messages into those types, so reth's snap messages never reach core or the test seam. Its outputs are `VerifiedHeader`, `VerifiedBlock`, `Proven`, `VerifiedBody`, and `VerifiedReceipt`, whose fields are private and which have no public constructors. `AccountQuery`, `StorageQuery`, and `CodeQuery` each build one single-key request and verify the reply against the root they were built for, using `reth_trie_common::range_proof::verify_range_proof` with origin equal to limit. An empty reply without a proof means the peer lacks the root. It never means absence.
@@ -108,6 +110,8 @@ The follower warms after each step: it proves unheld keys at the current anchor,
 
 `Node` pins `Arc<Store>` and runs a pure step on it. `exec::execute` uses a revm `Database` whose error type cannot be constructed. A miss is recorded and reads as empty for the rest of that run only, and any recorded miss withholds the result (`Result<_, Misses>`, where `Misses` is non-empty by construction). One run can find several misses. The node proves them in one parallel batch at the pinned anchor, inserts them into the request's own copy (`Arc::make_mut`), and runs again, so round trips scale with dependency depth rather than key count. At the end `State::merge` learns every key the request read. It keeps the new values if the anchor has not moved; otherwise it drops them, except code, which is content-addressed, and the follower warms those keys at the current anchor, so the next identical call is warm. Gas estimation is reth's bisection as a pure function inside the same loop.
 
+A state query by number or hash pins the current store if its anchor matches, else the retained store whose anchor matches, and otherwise returns `Unsupported`. A request on a retained store runs the same loop: misses are proven against that store's state root, which snap peers still serve, and its keys are learned, but `State::merge` sees an anchor that is not the current one and keeps only code.
+
 Every batch of keys, whether a request round, a reanchor's pins, or a warm pass, is proven grouped by account: one account request per address, whose proof carries the storage root, then one storage request per wanted slot against that root. A slot of an absent account, or of an account whose storage root is empty, is a known zero and costs no storage request. A bad account reply penalizes its sender and fails every key of that account; a bad storage reply penalizes its sender and fails only its slot.
 
 ### Concurrency
@@ -116,6 +120,7 @@ Every batch of keys, whether a request round, a reanchor's pins, or a warm pass,
 |---|---|
 | Follower advance and RPC read | The read keeps its pinned `Arc<Store>`. It sees one head. |
 | Follower advance and a request's merge | Serialized by the mutex. A merge for an old anchor learns its keys and drops its values. |
+| Follower advance and a request at a retained block | The request keeps its pinned retained store, even if the advance drops it from the list. Its merge keeps only code. |
 | Warming and follower advance | Warming runs inside the follower, so its merges never straddle an anchor move. |
 | Two requests missing the same key | Both fetch. The second merge re-inserts an equal value. |
 | Reanchor and RPC reads | Reads use the old store until the swap. |
@@ -133,7 +138,7 @@ The state database is `chibi.db` in the per-network data directory, a SQLite fil
 
 ### Block tags and unsupported methods
 
-`latest` and `pending` resolve to the anchor. `safe` and `finalized` resolve to the finalized header for block queries. State queries at other blocks, history, and `eth_getLogs` return a JSON-RPC error that names the held head.
+`latest` and `pending` resolve to the anchor. `safe` and `finalized` resolve to the finalized header for block queries. A state query by number or hash is served at the anchor and the 8 blocks before it. Wallets need this: MetaMask's network client rewrites `latest` to the number its block tracker last polled, every 20 s, which on Sepolia's 12 s blocks is often one or two blocks behind chibi's head. State queries at older blocks, history, and `eth_getLogs` return a JSON-RPC error that names the held head.
 
 ### Networks
 
@@ -185,6 +190,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - We accept one mutex around the canonical value, in exchange for no actor. It guards only synchronous pure calls.
 - We accept receipts only for transactions submitted through chibi.
 - We accept that `eth_call` and `eth_estimateGas` with `pending` use the anchor's block environment.
+- We accept keeping 8 full copies of the store besides the current one, so a wallet that names a block up to about 96 s old reads state instead of `-32004`. Each copy holds up to 1024 entries of about 140 bytes plus their slot maps, and 257 headers of 800 bytes, so about 0.4 MB, and the 8 cost about 3 MB (estimated from the type sizes, not measured on a live node). `advance` copies the store once per block rather than mutating it in place.
 
 ## Alternatives considered
 

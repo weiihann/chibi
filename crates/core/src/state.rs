@@ -23,6 +23,10 @@ pub const MAX_BAL_GAP: u64 = 32;
 /// Ancestor headers held besides the anchor, so `BLOCKHASH` reaches its full 256 blocks.
 pub const HEADER_WINDOW: usize = 256;
 
+/// Stores kept besides the published one. Wallet block trackers rewrite `latest` to the last
+/// number they polled, up to about 20 s old; 8 Sepolia blocks cover 96 s.
+pub const RECENT_STATES: usize = 8;
+
 /// An account without its storage root. Storage roots are not held because BALs would leave
 /// them stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -399,6 +403,9 @@ pub enum Merge {
 #[derive(Clone, Debug)]
 pub struct State {
     store: Arc<Store>,
+    /// Stores published before `store`, newest first, each anchored at a held ancestor of its
+    /// anchor. At most [`RECENT_STATES`]. Nothing is folded into them.
+    recent: VecDeque<Arc<Store>>,
     working: WorkingSet,
     finalized: Option<VerifiedHeader>,
     txs: TxBook,
@@ -409,6 +416,7 @@ impl State {
     pub fn new(anchor: VerifiedHeader, working: WorkingSet) -> Self {
         Self {
             store: Arc::new(Store::new(anchor)),
+            recent: VecDeque::new(),
             working,
             finalized: None,
             txs: TxBook::default(),
@@ -423,6 +431,30 @@ impl State {
     /// Pins the current store.
     pub fn snapshot(&self) -> Arc<Store> {
         Arc::clone(&self.store)
+    }
+
+    /// Pins the store anchored at `hash`: the published one or a retained recent one.
+    pub fn snapshot_at(&self, hash: B256) -> Option<Arc<Store>> {
+        std::iter::once(&self.store)
+            .chain(&self.recent)
+            .find(|store| store.anchor().hash() == hash)
+            .map(Arc::clone)
+    }
+
+    /// Keeps `previous`, the store just replaced, and drops retained stores that are no
+    /// longer held ancestors of the anchor, then all but the newest [`RECENT_STATES`].
+    fn retain(&mut self, previous: Arc<Store>) {
+        self.recent.push_front(previous);
+        let store = &self.store;
+        let anchor = store.anchor().number();
+        self.recent.retain(|old| {
+            let at = old.anchor();
+            at.number() < anchor
+                && store
+                    .header(at.number())
+                    .is_some_and(|held| held.hash() == at.hash())
+        });
+        self.recent.truncate(RECENT_STATES);
     }
 
     /// The anchor header.
@@ -515,8 +547,9 @@ impl State {
         }
     }
 
-    /// Moves the anchor to its child and applies the child's BAL to held keys. Located
-    /// transactions whose block is no longer on the held chain return to pending.
+    /// Moves the anchor to its child and applies the child's BAL to held keys. The replaced
+    /// store stays readable through [`State::snapshot_at`]. Located transactions whose block
+    /// is no longer on the held chain return to pending.
     ///
     /// All or nothing: the parent check runs before any mutation.
     pub fn advance(&mut self, block: VerifiedBlock) -> Result<(), StateError> {
@@ -527,18 +560,22 @@ impl State {
                 child: block.header().hash(),
             });
         }
+        let previous = Arc::clone(&self.store);
         let store = Arc::make_mut(&mut self.store);
         let (header, bal) = block.into_parts();
         store.apply_bal(&bal);
         store.push_anchor(header);
+        self.retain(previous);
         self.txs.revalidate(&self.store);
         Ok(())
     }
 
     /// Replaces the store with one anchored at `target` holding `facts`, the proven pins.
     /// Every learned key becomes unheld. Code carries over because it is content-addressed.
-    /// The header window carries over when `target` is the anchor's child. Located
-    /// transactions whose block is no longer on the held chain return to pending.
+    /// The header window carries over when `target` is the anchor's child. The replaced store
+    /// is retained like [`State::advance`] retains it, and retained stores whose blocks are
+    /// not held ancestors of `target` are dropped. Located transactions whose block is no
+    /// longer on the held chain return to pending.
     ///
     /// All or nothing: every fact's block is checked before the store is replaced.
     pub fn reanchor(&mut self, target: VerifiedHeader, facts: &[Proven]) -> Result<(), StateError> {
@@ -574,14 +611,16 @@ impl State {
         for proven in facts {
             store.insert_unchecked(proven);
         }
-        self.store = Arc::new(store);
+        let previous = std::mem::replace(&mut self.store, Arc::new(store));
+        self.retain(previous);
         self.txs.revalidate(&self.store);
         Ok(())
     }
 
     /// Folds facts a request proved at `anchor` into the canonical store. Facts for keys
-    /// outside the working set are skipped. If the anchor moved, only code is kept: it is
-    /// valid at every block.
+    /// outside the working set are skipped. If `anchor` is not the current one, because the
+    /// anchor moved or the request read a retained store, only code is kept: it is valid at
+    /// every block.
     pub fn merge(&mut self, anchor: B256, facts: &[Proven]) -> Merge {
         let current = anchor == self.store.anchor().hash()
             && facts.iter().all(|proven| self.store.check(proven).is_ok());

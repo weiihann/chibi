@@ -9,6 +9,7 @@ A wallet reads balances, nonces, token balances, contract code, and storage thro
 - `read-code-storage` returns contract code and a raw storage slot.
 - `read-estimate` estimates gas for an ETH transfer and a token transfer.
 - `read-miss` fetches a key chibi never held, with a proof, instead of answering zero.
+- `read-recent` serves state at the 8 blocks before the head by number, as MetaMask asks for it, and refuses older blocks with `-32004`.
 
 ## How to get to it (user POV)
 
@@ -26,6 +27,7 @@ Preconditions:
 - **Bulk comparison.** Compare watched and unwatched addresses in one go. Run `CHIBI=$C scripts/oracle-check.sh 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29 0x662d80b69803cd79e3489d805c605cb3adecf4f1 | tee "$RUN_DIR/evidence/oracle-check.txt"`. Every line reads `MATCH` with a block number, the last line reads `0 difference(s)`, and the exit code is 0. This covers `read-account`, `read-token`, `read-estimate`, and `read-miss` (the third address is not watched).
 - **Code.** Read the USDC proxy code at chibi's head. Run `B=$(cast block-number --rpc-url $C); cast code 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238 --block $B --rpc-url $C | shasum` and the same with `--rpc-url $O`. Both digests are equal.
 - **Storage.** Read the USDC implementation slot. Run `cast storage 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238 0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3 --block $B --rpc-url $C` and the same with `--rpc-url $O`. Both return the same 32-byte word (an address in the low 20 bytes).
+- **Recent block.** Read a balance at the block before chibi's head, as MetaMask's block tracker asks for it. Run `B=$(cast block-number --rpc-url $C); cast balance 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 --block $((B-1)) --rpc-url $C` and the same with `--rpc-url $O`. Both return the same value. The same call with `--block $((B-9))` on chibi fails with `-32004` (read `B` again if the head moved in between). chibi keeps only blocks it followed, so wait for one head step after start.
 - **Raw call.** Read a token balance the way a wallet does. Run `.agents/skills/verify-chibi/scripts/rpc.sh "$RUN_DIR" eth_call '[{"to":"0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238","data":"0x70a082310000000000000000000000003d767bf85779e2b550ab5fcd7e3be39fb77a5ce6"},"latest"]'`. The result is a 32-byte word equal to `cast call 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238 'balanceOf(address)(uint256)' 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 --block <head> --rpc-url $O` at the same head.
 - **Proof.** Keep `oracle-check.txt` and `rpc.log`. Note the block numbers they name.
 
