@@ -673,6 +673,54 @@ mod tests {
         assert!(read_snapshot(&network_dir).unwrap().is_some());
     }
 
+    /// Output that, at the first write, records whether a node could take `dir`'s lock.
+    struct LockProbe {
+        dir: PathBuf,
+        node_could_start: Option<bool>,
+    }
+
+    impl Write for LockProbe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.node_could_start.is_none() {
+                self.node_could_start = Some(Disk::open(&self.dir).is_ok());
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn no_node_can_start_on_the_directory_while_init_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let saved = dir.path().join("saved").join("mainnet");
+        drop(node_with_saved_state(&alice_and_bob(), &saved).await);
+
+        for data_dir in ["saved", "fresh"] {
+            let mut config = Config::new(Network::Mainnet, vec![ALICE]);
+            config.data_dir = Some(dir.path().join(data_dir));
+            let network_dir = dir.path().join(data_dir).join("mainnet");
+            let mut probe = LockProbe {
+                dir: network_dir.clone(),
+                node_could_start: None,
+            };
+            apply(
+                &mut probe,
+                &path,
+                &config,
+                &Carried::default(),
+                None,
+                |_| None,
+            )
+            .unwrap();
+            assert_eq!(probe.node_could_start, Some(false), "{data_dir}");
+            assert!(Disk::open(&network_dir).is_ok(), "{data_dir}");
+        }
+    }
+
     #[test]
     fn network_prompt_defaults_to_sepolia() {
         let (network, output) = scripted("\n", |i, o| prompt_network(i, o));
