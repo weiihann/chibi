@@ -240,7 +240,8 @@ pub struct Holding {
     /// Account nonce, `None` if not yet proven.
     pub nonce: Option<u64>,
     /// Token balances in base units by token symbol: every pinned token, `None` until
-    /// computed, and every other registry token whose balance computes from held keys.
+    /// computed, and every other registry token whose balance computes from held keys and
+    /// is nonzero.
     pub tokens: Vec<(String, Option<U256>)>,
 }
 
@@ -1078,7 +1079,7 @@ impl<P: Peers> Shared<P> {
                         .filter_map(|token| {
                             let balance = token_balance(store, &self.env, token, *address);
                             let pinned = self.watch.tokens.contains(token);
-                            (pinned || balance.is_some())
+                            (pinned || balance.is_some_and(|balance| !balance.is_zero()))
                                 .then(|| (token.symbol.to_owned(), balance))
                         })
                         .collect(),

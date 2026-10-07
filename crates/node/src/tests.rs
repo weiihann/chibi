@@ -1060,29 +1060,43 @@ async fn a_learned_key_that_cannot_be_proven_never_blocks_the_head() {
 }
 
 #[tokio::test]
-async fn status_shows_every_registry_token_computable_from_held_keys() {
-    let tokens = |node: &Node<FixturePeers>| node.status().snapshot.holdings[0].tokens.clone();
+async fn status_lists_unpinned_tokens_only_when_nonzero_and_pinned_ones_always() {
+    let tokens = |node: &Node<FixturePeers>, holder: usize| {
+        node.status().snapshot.holdings[holder].tokens.clone()
+    };
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[]).await;
-    assert_eq!(tokens(&node), vec![]);
+    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE, CAROL], BOTH, &[]).await;
+    assert_eq!(tokens(&node, 0), vec![]);
     assert_eq!(token_balance(&node, ALICE).await, U256::from(250));
+    assert_eq!(token_balance(&node, CAROL).await, U256::ZERO);
     assert_eq!(
-        tokens(&node),
+        tokens(&node, 0),
         vec![("TKN".to_owned(), Some(U256::from(250)))]
     );
+    assert_eq!(tokens(&node, 1), vec![]);
 
     let fixture = two_token_world(250, 40);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[PSE]).await;
+    let (node, mut follower) = open(
+        &fixture,
+        dir.path(),
+        BOTH,
+        &watchlist(&[ALICE, CAROL], &[PSE]),
+    )
+    .await;
+    assert_eq!(tokens(&node, 1), vec![("PSE".to_owned(), None)]);
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
     assert_eq!(token_balance(&node, ALICE).await, U256::from(250));
+    assert_eq!(token_balance(&node, CAROL).await, U256::ZERO);
     assert_eq!(
-        tokens(&node),
+        tokens(&node, 0),
         vec![
             ("TKN".to_owned(), Some(U256::from(250))),
             ("PSE".to_owned(), Some(U256::from(40)))
         ]
     );
+    assert_eq!(tokens(&node, 1), vec![("PSE".to_owned(), Some(U256::ZERO))]);
 }
 
 #[tokio::test]
