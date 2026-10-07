@@ -19,7 +19,7 @@ Before 2026-10-06 13:53:36 UTC, Sepolia has no block access lists, so every head
 RUN_DIR=$(.agents/skills/verify-chibi/scripts/launch.sh --port 8645 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29 | tail -1)
 ```
 
-- Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config (tracking USDC) and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi run --rpc-host 127.0.0.1 --rpc-port <port>` in the foreground of a background shell job, so `$RUN_DIR/chibi.pid` is chibi's own pid.
+- Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config (init asks no token question, so the script appends `tokens = ["USDC"]` to pin USDC) and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi run --rpc-host 127.0.0.1 --rpc-port <port>` in the foreground of a background shell job, so `$RUN_DIR/chibi.pid` is chibi's own pid.
 - Ready when `$RUN_DIR/chibi.log` contains `JSON-RPC on http://127.0.0.1:<port>`. The script waits up to `--timeout` seconds (default 900). Most of that is waiting for a snap/2 peer; the log prints `waiting for a snap/2 peer` every 30 s.
 - `--network mainnet` is accepted but untested and has no pinned snap/2 peers.
 - The addresses above are active Sepolia USDC holders. Use any address; at least one is required.
@@ -38,7 +38,7 @@ Read-only. Exits 0 only when the pid in `$RUN_DIR/chibi.pid` runs this run's bin
 - JSON-RPC: `.agents/skills/verify-chibi/scripts/rpc.sh "$RUN_DIR" <method> '<params-json>'` prints the response and appends request and response to `$RUN_DIR/evidence/rpc.log`. `cast ... --rpc-url http://127.0.0.1:<port>` exercises the same calls a wallet makes.
 - Oracle comparison: `CHIBI=http://127.0.0.1:<port> scripts/oracle-check.sh <address>... | tee "$RUN_DIR/evidence/oracle-check.txt"` compares chibi with publicnode at chibi's own head and exits non-zero on any difference. The oracle is a test input only; chibi never uses it.
 - CLI: run the copied binary with the run's environment, for example `env -u CHIBI_CONFIG HOME="$RUN_DIR/home" XDG_CONFIG_HOME="$RUN_DIR/home/.config" XDG_DATA_HOME="$RUN_DIR/home/.local/share" "$RUN_DIR/bin/chibi" status`.
-- Node behaviour: `$RUN_DIR/chibi.log`. Stable strings are `anchored head=`, `head verified`, `stepped=Reanchored`, `stepped=Extended`, `step failed`, `transaction included`, `session established ... snap=true`.
+- Node behaviour: `$RUN_DIR/chibi.log`. Stable strings are `anchored head=` (with `keys=`, the pins at start), `head verified`, `stepped=Reanchored`, `stepped=Extended`, `step failed`, `transaction included`, `session established ... snap=true`.
 
 ## Evidence
 
