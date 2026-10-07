@@ -316,12 +316,13 @@ impl Disk {
     }
 }
 
-/// Reads the state saved in `dir` without taking the lock, alongside a running writer. `None`
-/// if there is none yet.
+/// Reads the state saved in `dir` without taking the lock, alongside a running writer. Until
+/// a node has created the database, reads the legacy state file instead. `None` if there is
+/// neither.
 pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
     let path = dir.join(DB_FILE);
     if !path.try_exists().map_err(|err| io_error(&path, &err))? {
-        return Ok(None);
+        return read_legacy(dir);
     }
     let fail = |err| db_error(&path, &err);
     let mut conn = Connection::open_with_flags(
@@ -331,7 +332,7 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
     .map_err(fail)?;
     let tx = conn.transaction().map_err(fail)?;
     match schema_version(&tx).map_err(fail)? {
-        0 => Ok(None),
+        0 => read_legacy(dir),
         SCHEMA_VERSION => load(&tx).map(Some).map_err(fail),
         newer => Err(newer_schema(&path, newer)),
     }
@@ -524,6 +525,7 @@ mod tests {
     use alloy_primitives::{B256, U256};
 
     use super::*;
+    use crate::node::read_snapshot;
 
     fn holder(endpoint: Option<&str>) -> Option<Holder> {
         Some(Holder {
@@ -733,6 +735,35 @@ mod tests {
             assert_eq!(saved.peers(), vec![record(1, 30303)]);
             assert_pre_contracts_snapshot(saved.snapshot().unwrap());
         });
+    }
+
+    #[test]
+    fn status_reads_the_snapshot_while_a_disk_holds_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_snapshot(dir.path()).unwrap(), None);
+        let disk = Disk::open(dir.path()).unwrap();
+        assert_eq!(read_snapshot(dir.path()).unwrap(), None);
+        let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
+        disk.save(|saved| saved.set_snapshot(snapshot)).unwrap();
+        assert_pre_contracts_snapshot(&read_snapshot(dir.path()).unwrap().unwrap());
+        disk.save(|saved| saved.set_outbox(vec![queued(1, 9)]))
+            .unwrap();
+        assert_eq!(
+            read_state(dir.path()).unwrap().unwrap().outbox(),
+            &[queued(1, 9)]
+        );
+    }
+
+    #[test]
+    fn status_reads_a_legacy_only_directory_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy_state(dir.path());
+        assert_pre_contracts_snapshot(&read_snapshot(dir.path()).unwrap().unwrap());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(LEGACY_STATE_FILE)]);
     }
 
     #[test]
