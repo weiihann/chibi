@@ -164,6 +164,17 @@ struct Db {
     saved: Saved,
 }
 
+/// The rows [`Disk::reset`] deleted from each table it clears.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reset {
+    /// Saved snapshots: zero or one.
+    pub snapshot: usize,
+    /// Pending transactions.
+    pub outbox: usize,
+    /// Learned keys.
+    pub keys: usize,
+}
+
 impl Disk {
     /// Creates `dir` if needed, takes its exclusive lock, records this process id in the lock
     /// file, and opens the database, importing a legacy state file into a new one.
@@ -236,6 +247,22 @@ impl Disk {
                 Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
             }
         }
+    }
+
+    /// Deletes the user state saved in `dir`'s database: the snapshot, the outbox and the
+    /// learned keys, in one transaction. Remembered snap/2 peers, the light-client checkpoint
+    /// and the devp2p key stay. Takes the lock, so it fails while a chibi runs there. `None`
+    /// when there is no database, which is left uncreated.
+    pub fn reset(dir: &Path) -> Result<Option<Reset>, NodeError> {
+        let path = dir.join(DB_FILE);
+        if !path.try_exists().map_err(|err| io_error(&path, &err))? {
+            return Ok(None);
+        }
+        let disk = Self::open(dir)?;
+        let mut db = disk.db.lock();
+        clear(&mut db.conn)
+            .map(Some)
+            .map_err(|err| db_error(&path, &err))
     }
 
     /// Records `endpoint` in `dir`'s lock file for [`Disk::running`] to report. Only the
@@ -554,6 +581,18 @@ fn write_keys(conn: &mut Connection, keys: &[Key]) -> rusqlite::Result<()> {
         }
     }
     tx.commit()
+}
+
+/// Deletes the snapshot, outbox and keys rows in one transaction.
+fn clear(conn: &mut Connection) -> rusqlite::Result<Reset> {
+    let tx = conn.transaction()?;
+    let reset = Reset {
+        snapshot: tx.execute("DELETE FROM snapshot", [])?,
+        outbox: tx.execute("DELETE FROM outbox", [])?,
+        keys: tx.execute("DELETE FROM keys", [])?,
+    };
+    tx.commit()?;
+    Ok(reset)
 }
 
 /// The key a `keys` row names: a 20-byte address and either no slot or a 32-byte one.

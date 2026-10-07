@@ -1,6 +1,7 @@
 //! `chibi init`: asks for whatever the flags leave out and writes the config. On a terminal the
 //! questions are interactive screens; otherwise they are plain lines, so scripts can answer them.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::TcpStream;
@@ -9,12 +10,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use chibi_node::Network;
+use chibi_node::disk::Reset;
+use chibi_node::{Disk, Network};
 use clap::Args;
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, InquireError, Select, Text};
 
-use crate::config::{Config, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, parse_address};
+use crate::config::{
+    Config, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, parse_address, process_env,
+};
 
 /// How long the port check waits for a listener to accept.
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -95,12 +99,68 @@ pub fn init(args: InitArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Re
     let mut output = io::stdout().lock();
     match config {
         Some((config, carried)) => {
-            config.save(path)?;
-            write_next_steps(&mut output, path, &config, &carried, config_flag)?;
+            apply(
+                &mut output,
+                path,
+                &config,
+                &carried,
+                config_flag,
+                process_env,
+            )?;
         }
         None => writeln!(output, "kept the existing config at {}", path.display())?,
     }
     Ok(())
+}
+
+/// Clears the saved state of the config's network, then writes the config to `path` and
+/// says what changed. Refuses, writing nothing, while a chibi runs on that network's data
+/// directory.
+fn apply<W: Write>(
+    output: &mut W,
+    path: &Path,
+    config: &Config,
+    carried: &Carried,
+    config_flag: Option<&Path>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> eyre::Result<()> {
+    let dir = config.network_dir(config.network, env)?;
+    if let Some(holder) = Disk::running(&dir)? {
+        eyre::bail!(
+            "chibi is running on {} (pid {}); stop it before rerunning chibi init. Nothing was written",
+            dir.display(),
+            holder.pid
+        );
+    }
+    if let Some(reset) = Disk::reset(&dir)? {
+        write_reset(output, config.network, &dir, reset)?;
+    }
+    config.save(path)?;
+    write_next_steps(output, path, config, carried, config_flag)?;
+    Ok(())
+}
+
+fn write_reset<W: Write>(
+    output: &mut W,
+    network: Network,
+    dir: &Path,
+    reset: Reset,
+) -> io::Result<()> {
+    let count = |n: usize, noun: &str| {
+        if n == 1 {
+            format!("1 {noun}")
+        } else {
+            format!("{n} {noun}s")
+        }
+    };
+    writeln!(
+        output,
+        "reset the saved {network} state in {}: deleted {}, {} and {}; kept remembered state peers, the light-client checkpoint and devp2p.key",
+        dir.join("chibi.db").display(),
+        count(reset.snapshot, "snapshot"),
+        count(reset.outbox, "pending transaction"),
+        count(reset.keys, "remembered key"),
+    )
 }
 
 /// What an overwritten config passed on to its replacement, since init never asks for it.
@@ -502,8 +562,15 @@ mod tests {
         let network_dir = dir.path().join("data").join("mainnet");
         let write = |config: &Config| {
             let mut output = Vec::new();
-            apply(&mut output, &path, config, &Carried::default(), None, |_| None)
-                .map(|()| String::from_utf8(output).unwrap())
+            apply(
+                &mut output,
+                &path,
+                config,
+                &Carried::default(),
+                None,
+                |_| None,
+            )
+            .map(|()| String::from_utf8(output).unwrap())
         };
 
         let fixture = Fixture::genesis([
