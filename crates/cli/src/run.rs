@@ -1,6 +1,8 @@
 //! `chibi run` in the foreground or background, and `chibi stop`.
 
+use std::convert::Infallible;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::net::TcpListener;
@@ -11,13 +13,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chibi_node::{Disk, Network, Node, NodeConfig};
+use chibi_node::{Disk, Network, Node, NodeConfig, Snapshot, Status};
 use clap::Args;
 use eyre::{WrapErr, bail};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +39,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Log lines shown when a background start fails.
 const LOG_TAIL_LINES: usize = 20;
+/// How often a run logs its peers and which tracked values it holds at the head.
+const STATUS_EVERY: Duration = Duration::from_secs(60);
 
 /// `chibi run` flags.
 #[derive(Debug, Default, Args)]
@@ -139,17 +144,110 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
             return Ok(());
         }
     };
+    let reporter = node.clone();
     let server = rpc::start(node, served.rpc, served.listener)?;
     if let Err(err) = Disk::announce(&data_dir, &served.url) {
         warn!(%err, "cannot record the JSON-RPC URL for `chibi status`");
     }
     tokio::select! {
         result = follower.run() => result.wrap_err("head follower stopped"),
+        never = report(reporter) => match never {},
         () = server.stopped() => bail!("JSON-RPC server stopped"),
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
             Ok(())
         }
+    }
+}
+
+/// Logs the node's status every [`STATUS_EVERY`], starting at once.
+async fn report(node: Node) -> Infallible {
+    let mut ticks = tokio::time::interval(STATUS_EVERY);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        log_status(&node.status());
+    }
+}
+
+fn log_status(status: &Status) {
+    let held = Held::of(&status.snapshot);
+    info!(
+        head = status.snapshot.block.number,
+        peers = status.peers,
+        snap_peers = status.snap_peers,
+        accounts = %held.accounts,
+        tokens = %held.tokens,
+        slots = %held.slots,
+        "status",
+    );
+    if status.snap_peers == 0 {
+        warn!("no snap/2 peer connected; the head and state requests stall until one returns");
+    }
+    if !held.missing.is_empty() {
+        warn!(missing = %held.missing.join(", "), "tracked values not downloaded at the head");
+    }
+}
+
+/// How many of a kind of tracked value the head holds, out of how many are tracked.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    held: usize,
+    tracked: usize,
+}
+
+impl Tally {
+    /// Counts one tracked value and passes `held` through.
+    fn count(&mut self, held: bool) -> bool {
+        self.tracked += 1;
+        self.held += usize::from(held);
+        held
+    }
+}
+
+impl fmt::Display for Tally {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.held, self.tracked)
+    }
+}
+
+/// Which tracked values a snapshot holds. `None` in a snapshot means the head's store lacks it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Held {
+    accounts: Tally,
+    tokens: Tally,
+    slots: Tally,
+    missing: Vec<String>,
+}
+
+impl Held {
+    fn of(snapshot: &Snapshot) -> Self {
+        let mut held = Self::default();
+        let Self {
+            accounts,
+            tokens,
+            slots,
+            missing,
+        } = &mut held;
+        for holding in &snapshot.holdings {
+            let address = holding.address;
+            if !accounts.count(holding.balance.is_some() && holding.nonce.is_some()) {
+                missing.push(format!("{address} account"));
+            }
+            for (symbol, balance) in &holding.tokens {
+                if !tokens.count(balance.is_some()) {
+                    missing.push(format!("{address} {symbol}"));
+                }
+            }
+        }
+        for contract in &snapshot.contracts {
+            for (slot, value) in &contract.slots {
+                if !slots.count(value.is_some()) {
+                    missing.push(format!("{} slot {slot:#x}", contract.address));
+                }
+            }
+        }
+        held
     }
 }
 
@@ -303,6 +401,57 @@ mod tests {
         argv.into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn status_names_every_tracked_value_the_head_lacks() {
+        use alloy_eips::BlockNumHash;
+        use alloy_primitives::{Address, U256};
+        use chibi_node::{ContractSnapshot, Holding};
+
+        let alice = Address::repeat_byte(0xaa);
+        let bob = Address::repeat_byte(0xbb);
+        let vault = Address::repeat_byte(0xcc);
+        let snapshot = Snapshot {
+            network: Network::Sepolia,
+            block: BlockNumHash::default(),
+            saved_at: 0,
+            holdings: vec![
+                Holding {
+                    address: alice,
+                    balance: Some(U256::from(1)),
+                    nonce: Some(0),
+                    tokens: vec![("USDC".to_owned(), Some(U256::ZERO))],
+                },
+                Holding {
+                    address: bob,
+                    balance: None,
+                    nonce: None,
+                    tokens: vec![("USDC".to_owned(), None)],
+                },
+            ],
+            contracts: vec![ContractSnapshot {
+                address: vault,
+                slots: vec![(U256::from(1), Some(U256::ZERO)), (U256::from(2), None)],
+            }],
+        };
+        let held = Held::of(&snapshot);
+        assert_eq!(
+            (
+                held.accounts.to_string(),
+                held.tokens.to_string(),
+                held.slots.to_string()
+            ),
+            ("1/2".to_owned(), "1/2".to_owned(), "1/2".to_owned())
+        );
+        assert_eq!(
+            held.missing,
+            [
+                format!("{bob} account"),
+                format!("{bob} USDC"),
+                format!("{vault} slot 0x2"),
+            ]
+        );
     }
 
     #[test]

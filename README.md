@@ -68,6 +68,8 @@ chibi then waits for a devp2p peer that serves snap/2, logging progress every 30
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
 
+Once serving, chibi logs a `status` line every minute. It gives the verified head, the connected peers and snap/2 peers, and how many tracked accounts, token balances, and contract slots the head holds, such as `accounts=2/2 tokens=2/2 slots=0/0`. A warning names any tracked value the head lacks, and another warns while no snap/2 peer is connected.
+
 `chibi status` reads the snapshot saved at the last verified head, so it works without a running node. Those values are labeled with their block and are not re-verified.
 
 ## Configuration
