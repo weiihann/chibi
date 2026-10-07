@@ -1,10 +1,8 @@
 //! Network fetches, each verified through `chibi_core::verify` before it is returned.
 //!
-//! Every call has a timeout, because reth queues header, body, and receipt requests while no
-//! peer is connected. Proofs get up to [`ATTEMPTS`] tries; a reply that proves its sender
-//! lied gets the sender penalized. A key that cannot be proven is an error, never a zero.
-
-use std::time::Duration;
+//! Requests go through [`crate::peers::Paced`], which times each one from when it is sent.
+//! Proofs get up to [`ATTEMPTS`] tries; a reply that proves its sender lied gets the sender
+//! penalized. A key that cannot be proven is an error, never a zero.
 
 use alloy_primitives::{Address, B256, U256};
 use chibi_core::state::{HEADER_WINDOW, Key, Miss, Store};
@@ -18,9 +16,6 @@ use tracing::debug;
 
 use crate::node::NodeError;
 use crate::peers::{NetError, PeerKey, Peers};
-
-/// How long one request may take.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Tries per proof before giving up.
 const ATTEMPTS: u32 = 3;
@@ -62,12 +57,8 @@ pub(crate) enum Fetched {
     Ancestors(Vec<VerifiedHeader>),
 }
 
-async fn timed<T>(request: impl Future<Output = Result<T, NetError>>) -> Result<T, Failure> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(Failure::Net(err)),
-        Err(_) => Err(Failure::Net(NetError::Timeout)),
-    }
+fn sent<T>(result: Result<T, NetError>) -> Result<T, Failure> {
+    result.map_err(Failure::Net)
 }
 
 /// Runs `attempt` until it succeeds, a retry cannot help, or attempts run out.
@@ -104,7 +95,7 @@ pub(crate) async fn header<P: Peers>(
     trusted: TrustedHash,
 ) -> Result<VerifiedHeader, NodeError> {
     retry(peers, || async {
-        let reply = timed(peers.headers(trusted.hash(), 1)).await?;
+        let reply = sent(peers.headers(trusted.hash(), 1).await)?;
         let header = reply
             .value
             .into_iter()
@@ -125,7 +116,7 @@ pub(crate) async fn ancestors<P: Peers>(
         return Ok(Vec::new());
     }
     retry(peers, || async {
-        let reply = timed(peers.headers(child.header().parent_hash, count)).await?;
+        let reply = sent(peers.headers(child.header().parent_hash, count).await)?;
         if reply.value.is_empty() {
             return Err(Failure::Net(NetError::Rejected));
         }
@@ -145,8 +136,7 @@ pub(crate) async fn chain<P: Peers>(
     let (peer, headers) = if between == 0 {
         (None, Vec::new())
     } else {
-        let reply = timed(peers.headers(target.header().parent_hash, between))
-            .await
+        let reply = sent(peers.headers(target.header().parent_hash, between).await)
             .map_err(Failure::into_error)?;
         (Some(reply.peer), reply.value)
     };
@@ -165,9 +155,7 @@ pub(crate) async fn bals<P: Peers>(
     headers: Vec<VerifiedHeader>,
 ) -> Result<Vec<VerifiedBlock>, NodeError> {
     let hashes = headers.iter().map(VerifiedHeader::hash).collect();
-    let reply = timed(peers.block_access_lists(hashes))
-        .await
-        .map_err(Failure::into_error)?;
+    let reply = sent(peers.block_access_lists(hashes).await).map_err(Failure::into_error)?;
     let mut raws = reply.value.into_iter();
     let mut blocks = Vec::with_capacity(headers.len());
     for header in headers {
@@ -197,7 +185,7 @@ pub(crate) async fn bodies<P: Peers>(
         let remaining = &headers[verified.len()..];
         let hashes = remaining.iter().map(VerifiedHeader::hash).collect();
         let before = verified.len();
-        match timed(peers.bodies(hashes)).await {
+        match sent(peers.bodies(hashes).await) {
             Ok(reply) => {
                 for (header, body) in remaining.iter().zip(reply.value) {
                     match verify::body(header.clone(), body) {
@@ -234,7 +222,7 @@ pub(crate) async fn receipts<P: Peers>(
     header: &VerifiedHeader,
 ) -> Result<VerifiedReceipts, NodeError> {
     retry(peers, || async {
-        let reply = timed(peers.receipts(header.hash())).await?;
+        let reply = sent(peers.receipts(header.hash()).await)?;
         verify::receipts(header.clone(), reply.value)
             .map_err(|err| Failure::verify(reply.peer, err))
     })
@@ -249,7 +237,7 @@ pub(crate) async fn account<P: Peers>(
 ) -> Result<Proven, NodeError> {
     let query = AccountQuery::new(at, address);
     retry(peers, || async {
-        let reply = timed(peers.account_range(query.request())).await?;
+        let reply = sent(peers.account_range(query.request()).await)?;
         query
             .verify(reply.value)
             .map_err(|err| Failure::verify(reply.peer, err))
@@ -267,11 +255,11 @@ pub(crate) async fn slot<P: Peers>(
     let query = StorageQuery::new(at, address, slot);
     retry(peers, || async {
         let (account, storage) = tokio::join!(
-            timed(peers.account_range(query.account_request())),
-            timed(peers.storage_range(query.storage_request())),
+            peers.account_range(query.account_request()),
+            peers.storage_range(query.storage_request()),
         );
-        let account = account?;
-        let (storage_peer, storage, storage_failure) = match storage {
+        let account = sent(account)?;
+        let (storage_peer, storage, storage_failure) = match sent(storage) {
             Ok(reply) => (Some(reply.peer), Some(reply.value), None),
             Err(failure) => (None, None, Some(failure)),
         };
@@ -298,7 +286,7 @@ pub(crate) async fn slot<P: Peers>(
 pub(crate) async fn code<P: Peers>(peers: &P, hash: B256) -> Result<Proven, NodeError> {
     let query = CodeQuery::new(hash);
     retry(peers, || async {
-        let reply = timed(peers.byte_codes(vec![query.request()])).await?;
+        let reply = sent(peers.byte_codes(vec![query.request()]).await)?;
         query
             .verify(reply.value.into_iter().next())
             .map_err(|err| Failure::verify(reply.peer, err))

@@ -1,6 +1,9 @@
 //! The network seam. [`Peers`] carries untrusted replies in [`chibi_core::wire`] shapes and
 //! verifies nothing. The devp2p adapter implements it over reth-network; the test fixture
 //! implements it over in-process tries, so offline tests run the production verifier.
+//! [`Paced`] wraps either one with the timeouts every request gets.
+
+use std::time::{Duration, Instant};
 
 use alloy_consensus::Header;
 use alloy_primitives::{B256, B512, Bytes};
@@ -9,7 +12,17 @@ use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
     Transaction,
 };
+use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
+use tokio::sync::Semaphore;
+use tracing::debug;
+
+/// How long a peer may take to answer one request, counted from when it is sent.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// snap/2 requests one peer works on at once. reth's fetcher sends a peer one request at a
+/// time and queues the rest.
+const SNAP_PER_PEER: usize = 1;
 
 /// Identifies the peer that sent a reply, so a failed verification can penalize it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,6 +112,130 @@ pub trait Peers: Send + Sync + 'static {
 
     /// The sessions connected now.
     fn census(&self) -> Census;
+}
+
+/// [`Peers`] with a timeout on every request, and snap/2 requests paced to what the connected
+/// snap/2 peers can work on at once. reth queues a request it cannot send yet, so a timeout
+/// started at submission would count time spent behind chibi's own requests: one busy peer
+/// would time out healthy requests, and their retries would queue behind the abandoned ones,
+/// which reth still sends.
+#[derive(Debug)]
+pub(crate) struct Paced<P> {
+    inner: P,
+    /// One permit per request the snap/2 peers can work on at once. Fair, so a retry cannot
+    /// jump ahead of a request that was already waiting, such as the follower's next BALs.
+    slots: Semaphore,
+    /// Permits the semaphore stands for, followed to the snap/2 peer count.
+    capacity: Mutex<usize>,
+}
+
+impl<P: Peers> Paced<P> {
+    pub(crate) fn new(inner: P) -> Self {
+        Self {
+            inner,
+            slots: Semaphore::new(SNAP_PER_PEER),
+            capacity: Mutex::new(SNAP_PER_PEER),
+        }
+    }
+
+    /// Follows the connected snap/2 peers, keeping at least one slot so that reth fails a
+    /// request at once when no snap/2 peer is connected. A slot held while shrinking is
+    /// retired when its request finishes.
+    fn resize(&self) {
+        let wanted = self.inner.census().snap_peers.max(1) * SNAP_PER_PEER;
+        let mut capacity = self.capacity.lock();
+        if wanted > *capacity {
+            self.slots.add_permits(wanted - *capacity);
+            *capacity = wanted;
+        } else if wanted < *capacity {
+            *capacity -= self.slots.forget_permits(*capacity - wanted);
+        }
+    }
+
+    async fn snap<T>(
+        &self,
+        kind: &'static str,
+        request: impl Future<Output = Result<T, NetError>>,
+    ) -> Result<T, NetError> {
+        let queued = Instant::now();
+        self.resize();
+        let _slot = self.slots.acquire().await.map_err(|_| NetError::Stopped)?;
+        let sent = Instant::now();
+        let result = timed(request).await;
+        debug!(
+            target: "chibi::peers",
+            kind,
+            waited_ms = sent.duration_since(queued).as_millis(),
+            took_ms = sent.elapsed().as_millis(),
+            ok = result.is_ok(),
+            "snap request",
+        );
+        result
+    }
+}
+
+async fn timed<T>(request: impl Future<Output = Result<T, NetError>>) -> Result<T, NetError> {
+    tokio::time::timeout(REQUEST_TIMEOUT, request)
+        .await
+        .unwrap_or(Err(NetError::Timeout))
+}
+
+impl<P: Peers> Peers for Paced<P> {
+    async fn headers(&self, start: B256, count: u64) -> Result<Reply<Vec<Header>>, NetError> {
+        timed(self.inner.headers(start, count)).await
+    }
+
+    async fn account_range(
+        &self,
+        request: AccountRangeRequest,
+    ) -> Result<Reply<AccountReply>, NetError> {
+        self.snap("account", self.inner.account_range(request))
+            .await
+    }
+
+    async fn storage_range(
+        &self,
+        request: StorageRangeRequest,
+    ) -> Result<Reply<StorageReply>, NetError> {
+        self.snap("storage", self.inner.storage_range(request))
+            .await
+    }
+
+    async fn byte_codes(&self, hashes: Vec<B256>) -> Result<Reply<Vec<Bytes>>, NetError> {
+        self.snap("code", self.inner.byte_codes(hashes)).await
+    }
+
+    async fn block_access_lists(
+        &self,
+        blocks: Vec<B256>,
+    ) -> Result<Reply<Vec<Option<Bytes>>>, NetError> {
+        self.snap("bal", self.inner.block_access_lists(blocks))
+            .await
+    }
+
+    async fn bodies(&self, blocks: Vec<B256>) -> Result<Reply<Vec<Body>>, NetError> {
+        timed(self.inner.bodies(blocks)).await
+    }
+
+    async fn receipts(&self, block: B256) -> Result<Reply<Vec<Receipt>>, NetError> {
+        timed(self.inner.receipts(block)).await
+    }
+
+    async fn broadcast(&self, transaction: Transaction) -> Result<usize, NetError> {
+        self.inner.broadcast(transaction).await
+    }
+
+    fn penalize(&self, peer: PeerKey) {
+        self.inner.penalize(peer);
+    }
+
+    fn announce(&self, head: &VerifiedHeader) {
+        self.inner.announce(head);
+    }
+
+    fn census(&self) -> Census {
+        self.inner.census()
+    }
 }
 
 /// A request could not be completed. None of these say anything about chain state.

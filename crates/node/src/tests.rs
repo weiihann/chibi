@@ -1017,7 +1017,7 @@ async fn a_read_joins_the_working_set_and_bals_keep_it_current() {
     assert_eq!(fixture.log().proofs, proofs);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_call_cut_by_a_head_move_leaves_the_next_call_warm() {
     let fixture = token_world(250);
     let dir = tempfile::tempdir().unwrap();

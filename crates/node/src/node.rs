@@ -37,7 +37,7 @@ use crate::fetch::{self, Fetched};
 use crate::follow::Search;
 use crate::heads::Heads;
 use crate::network::{Network, NetworkSpec, Token};
-use crate::peers::{NetError, Peers};
+use crate::peers::{NetError, Paced, Peers, REQUEST_TIMEOUT};
 
 /// Fetch rounds one request may need before it gives up. Each round proves the keys the last
 /// run missed, so this is the depth of a call's dependency chain. A cold ENS reverse lookup
@@ -307,7 +307,7 @@ pub enum Stepped {
 pub(crate) struct Shared<P> {
     pub(crate) spec: NetworkSpec,
     pub(crate) env: ChainEnv,
-    pub(crate) peers: P,
+    pub(crate) peers: Paced<P>,
     pub(crate) watch: Watchlist,
     pub(crate) disk: Disk,
     /// The canonical state. Reached only through [`Shared::read`] and [`Shared::update`],
@@ -488,6 +488,7 @@ impl<P: Peers> Node<P> {
         disk: Disk,
         watch: &Watchlist,
     ) -> Result<(Self, Follower<P>), NodeError> {
+        let peers = Paced::new(peers);
         let trusted = wait_latest(&mut heads).await?;
         let anchor = fetch::header(&peers, trusted).await?;
         let working = WorkingSet::new(WORKING_SET_CAP, watch.pins(), disk.load_keys()?);
@@ -1242,8 +1243,7 @@ impl<P: Peers> Shared<P> {
     /// Sends `transaction` to peers. Failure is logged: the follower re-broadcasts.
     pub(crate) async fn broadcast(&self, transaction: Transaction) {
         let hash = *transaction.tx_hash();
-        match tokio::time::timeout(fetch::REQUEST_TIMEOUT, self.peers.broadcast(transaction)).await
-        {
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.peers.broadcast(transaction)).await {
             Ok(Ok(sent)) => debug!(target: "chibi::node", %hash, sent, "broadcast"),
             Ok(Err(err)) => {
                 warn!(target: "chibi::node", %hash, %err, "broadcast reached no peer; will retry");
