@@ -35,7 +35,6 @@ const KEY_FILE: &str = "devp2p.key";
 
 /// The schema version recorded in `PRAGMA user_version`; 0 means no schema yet.
 const SCHEMA_VERSION: i32 = 2;
-/// Version 1's tables.
 const SCHEMA_V1: &str = "
 CREATE TABLE snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 0),

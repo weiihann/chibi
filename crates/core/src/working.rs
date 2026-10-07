@@ -27,9 +27,7 @@ pub struct WorkingSet {
     by_age: BTreeSet<(u64, Key)>,
     /// The next use's tick. Each `touch` is one use.
     tick: u64,
-    /// Counts changes to which keys are learned.
     membership: u64,
-    /// Counts uses that moved an already learned key ahead.
     recency: u64,
 }
 
