@@ -79,8 +79,8 @@ const HELIOS_CHECKPOINT: &str = "checkpoint";
 /// The length of a checkpoint helios can load; any other file makes it use its shipped default.
 const CHECKPOINT_BYTES: u64 = 32;
 
-/// How often `start` reports that it is still waiting for a snap/2 peer.
-const SNAP_PEER_PROGRESS: Duration = Duration::from_secs(30);
+/// How often `start` reports that it is still waiting for a state peer.
+const STATE_PEER_PROGRESS: Duration = Duration::from_secs(30);
 
 /// Fewest head moves between two saves of learned keys whose membership changed.
 const KEYS_SAVE_HEADS: u64 = 5;
@@ -288,8 +288,8 @@ pub struct Status {
     pub snapshot: Snapshot,
     /// Connected devp2p sessions.
     pub peers: usize,
-    /// Connected sessions that negotiated snap/2.
-    pub snap_peers: usize,
+    /// Connected state peers: sessions that negotiated snap/2.
+    pub state_peers: usize,
 }
 
 /// The anchor, the peers, and how much of the working set the anchor's store holds, read
@@ -300,14 +300,14 @@ pub struct Health {
     pub head: BlockNumHash,
     /// Connected devp2p sessions.
     pub peers: usize,
-    /// Connected sessions that negotiated snap/2.
-    pub snap_peers: usize,
+    /// Connected state peers: sessions that negotiated snap/2.
+    pub state_peers: usize,
     /// Pinned keys, configured and seeded, the anchor's store holds.
-    pub pins: Held,
+    pub pinned: Held,
     /// Learned keys the anchor's store holds.
     pub learned: Held,
     /// Pinned keys the anchor's store lacks, configured ones first.
-    pub unheld_pins: Vec<Key>,
+    pub unheld_pinned: Vec<Key>,
 }
 
 /// How many of a group of working-set keys the anchor's store holds, out of how many.
@@ -366,8 +366,12 @@ struct KeysSaved {
 impl Node<Devp2p> {
     /// Opens the data dir (taking its lock), starts the light client and devp2p, and returns
     /// once the state is anchored at a fresh verified head. Nothing is proven yet: the
-    /// follower warms pins and learned keys, and requests fetch what they miss.
-    pub async fn start(config: NodeConfig) -> Result<(Self, Follower<Devp2p>), NodeError> {
+    /// follower warms pinned and learned keys, and requests fetch what they miss.
+    /// `found_state_peer` runs once, when the first state peer connects, before anchoring.
+    pub async fn start(
+        config: NodeConfig,
+        found_state_peer: impl FnOnce(),
+    ) -> Result<(Self, Follower<Devp2p>), NodeError> {
         let spec = config.network.spec();
         let disk = Disk::open(&config.data_dir)?;
         let secret_key = disk.secret_key()?;
@@ -399,7 +403,8 @@ impl Node<Devp2p> {
         let net =
             Devp2p::start(&spec, secret_key, &config.net, HeadHint::Attested(trusted)).await?;
         net.add_peers(&known_peers);
-        wait_for_snap_peer(&net, known_peers.len() + config.net.trusted_peers.len()).await?;
+        wait_for_state_peer(&net, known_peers.len() + config.net.trusted_peers.len()).await?;
+        found_state_peer();
 
         let (node, mut follower) = Node::with_parts(spec, net, heads, disk, &config.watch).await?;
         follower.beacon = Some(beacon);
@@ -407,8 +412,9 @@ impl Node<Devp2p> {
     }
 }
 
-/// Waits until a snap/2 session is up, however long discovery takes, reporting progress.
-async fn wait_for_snap_peer(net: &Devp2p, dialed: usize) -> Result<(), NodeError> {
+/// Waits until a state peer (snap/2) is connected, however long discovery takes, reporting
+/// progress.
+async fn wait_for_state_peer(net: &Devp2p, dialed: usize) -> Result<(), NodeError> {
     let started = Instant::now();
     let mut sessions = net.sessions();
     loop {
@@ -416,13 +422,13 @@ async fn wait_for_snap_peer(net: &Devp2p, dialed: usize) -> Result<(), NodeError
         info!(
             target: "chibi::node",
             peers = census.peers,
-            snap_peers = census.snap_peers,
+            state_peers = census.state_peers,
             dialed,
             elapsed_s = started.elapsed().as_secs(),
-            "waiting for a snap/2 peer",
+            "waiting for a state peer (snap/2)",
         );
         let waited = tokio::time::timeout(
-            SNAP_PEER_PROGRESS,
+            STATE_PEER_PROGRESS,
             sessions.wait_for(|sessions| sessions.values().any(|session| session.snap)),
         )
         .await;
@@ -908,35 +914,35 @@ impl<P: Peers> Node<P> {
         Status {
             snapshot: self.shared.snapshot(&store),
             peers: census.peers,
-            snap_peers: census.snap_peers,
+            state_peers: census.state_peers,
         }
     }
 
     /// Current health: counts read from the state, with no snapshot.
     pub fn health(&self) -> Health {
-        let (head, pins, learned, unheld_pins) = self.shared.read(|s| {
+        let (head, pinned, learned, unheld_pinned) = self.shared.read(|s| {
             let store = s.store();
             let working = s.working();
-            let unheld_pins: Vec<Key> = working.pins().filter(|key| !store.holds(*key)).collect();
+            let unheld_pinned: Vec<Key> = working.pins().filter(|key| !store.holds(*key)).collect();
             let total = working.pins().count();
-            let pins = Held {
-                held: total - unheld_pins.len(),
+            let pinned = Held {
+                held: total - unheld_pinned.len(),
                 total,
             };
             let learned = working.learned().fold(Held::default(), |held, key| Held {
                 held: held.held + usize::from(store.holds(key)),
                 total: held.total + 1,
             });
-            (store.anchor().num_hash(), pins, learned, unheld_pins)
+            (store.anchor().num_hash(), pinned, learned, unheld_pinned)
         });
         let census = self.shared.peers.census();
         Health {
             head,
             peers: census.peers,
-            snap_peers: census.snap_peers,
-            pins,
+            state_peers: census.state_peers,
+            pinned,
             learned,
-            unheld_pins,
+            unheld_pinned,
         }
     }
 }

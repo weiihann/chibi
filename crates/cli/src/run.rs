@@ -44,8 +44,15 @@ const RPC_DRAIN: Duration = Duration::from_secs(5);
 const LOG_TAIL_LINES: usize = 20;
 /// How often a serving run logs its status.
 const STATUS_EVERY: Duration = Duration::from_secs(60);
-/// Most unheld pins one status warning names.
-const UNHELD_PINS_NAMED: usize = 5;
+/// Most unheld pinned keys one status warning names.
+const UNHELD_PINNED_NAMED: usize = 5;
+/// Printed to stdout when the first state peer connects.
+const FOUND_STATE_PEER: &str = concat!(
+    "  /\\_/\\\n",
+    " ( o.o )  found a state peer\n",
+    "  > ^ <\n",
+    " (\")_(\")\n",
+);
 
 /// `chibi run` flags.
 #[derive(Debug, Default, Args)]
@@ -160,7 +167,11 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
     );
     let data_dir = node_config.data_dir.clone();
     let (node, follower) = tokio::select! {
-        started = Node::start(node_config) => started?,
+        started = Node::start(node_config, || {
+            if let Err(err) = found_state_peer(&mut io::stdout().lock()) {
+                warn!(%err, "cannot print to stdout");
+            }
+        }) => started?,
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
             return Ok(());
@@ -198,31 +209,39 @@ async fn report(node: Node) -> Infallible {
         ticks.tick().await;
         let health = node.health();
         log_status(&health, &previous);
-        previous = health.unheld_pins.into_iter().collect();
+        previous = health.unheld_pinned.into_iter().collect();
     }
 }
 
-/// Logs one status line, and warnings for no snap/2 peer and for pins `previous`, the last
-/// line's unheld pins, also lacked.
+/// Writes the cat that greets the first state peer.
+fn found_state_peer(out: &mut impl io::Write) -> io::Result<()> {
+    out.write_all(FOUND_STATE_PEER.as_bytes())?;
+    out.flush()
+}
+
+/// Logs one status line, and warnings for no state peer and for pinned keys `previous`, the
+/// last line's unheld pinned keys, also lacked.
 fn log_status(health: &Health, previous: &BTreeSet<Key>) {
     info!(
         head = health.head.number,
         peers = health.peers,
-        snap_peers = health.snap_peers,
-        pins = %health.pins,
+        state_peers = health.state_peers,
+        pinned = %health.pinned,
         learned = %health.learned,
         "status",
     );
-    if health.snap_peers == 0 {
-        warn!("no snap/2 peer connected; the head and state requests stall until one returns");
+    if health.state_peers == 0 {
+        warn!(
+            "no state peer (snap/2) connected; the head and state requests stall until one returns"
+        );
     }
-    if let Some((count, named)) = persisting_unheld(previous, &health.unheld_pins) {
-        warn!(count, pins = %named, "pins not held at the head for two status lines");
+    if let Some((count, named)) = persisting_unheld(previous, &health.unheld_pinned) {
+        warn!(count, keys = %named, "pinned keys not held at the head for two status lines");
     }
 }
 
-/// The pins unheld at this status line and at the one before, counted, with the first
-/// [`UNHELD_PINS_NAMED`] named. A pin still warming after start is unheld at one line only.
+/// The pinned keys unheld at this status line and at the one before, counted, with the first
+/// [`UNHELD_PINNED_NAMED`] named. A key still warming after start is unheld at one line only.
 fn persisting_unheld(previous: &BTreeSet<Key>, current: &[Key]) -> Option<(usize, String)> {
     let persisting: Vec<Key> = current
         .iter()
@@ -234,7 +253,7 @@ fn persisting_unheld(previous: &BTreeSet<Key>, current: &[Key]) -> Option<(usize
     }
     let named: Vec<String> = persisting
         .iter()
-        .take(UNHELD_PINS_NAMED)
+        .take(UNHELD_PINNED_NAMED)
         .map(|key| match key {
             Key::Account(address) => format!("{address}"),
             Key::Slot(address, slot) => format!("{address} slot {slot:#x}"),

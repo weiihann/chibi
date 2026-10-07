@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         net: NetConfig::default(),
     };
 
-    let (node, mut follower) = Node::start(config).await?;
+    let (node, mut follower) = Node::start(config, || info!("found a state peer")).await?;
     info!(status = ?node.status(), "started");
     for step in 1..=2 {
         tokio::time::sleep(SLOT).await;

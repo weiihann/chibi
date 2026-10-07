@@ -20,8 +20,8 @@ RUN_DIR=$(.agents/skills/verify-chibi/scripts/launch.sh --port 8645 0x3d767bf857
 ```
 
 - Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config with `chibi init` (every registry token, USDC included, is pinned for each watched address) and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi run --rpc-host 127.0.0.1 --rpc-port <port>` in the foreground of a background shell job, so `$RUN_DIR/chibi.pid` is chibi's own pid.
-- Ready when `$RUN_DIR/chibi.log` contains `JSON-RPC on http://127.0.0.1:<port>`. The script waits up to `--timeout` seconds (default 900). Most of that is waiting for a snap/2 peer; the log prints `waiting for a snap/2 peer` every 30 s.
-- `--network mainnet` is accepted but untested and has no pinned snap/2 peers.
+- Ready when `$RUN_DIR/chibi.log` contains `JSON-RPC on http://127.0.0.1:<port>`. The script waits up to `--timeout` seconds (default 900). Most of that is waiting for a state peer (a peer that speaks snap/2); the log prints `waiting for a state peer (snap/2)` with `peers=` and `state_peers=` every 30 s.
+- `--network mainnet` is accepted but untested and has no known state peers.
 - The addresses above are active Sepolia USDC holders. Use any address; at least one is required.
 - Each launch is isolated by run dir and port, so several can run side by side. Never drive a chibi you did not start: the user's own instance (default port 8545, data in `~/.local/share/chibi`, or `~/Library/Application Support/chibi` from before the XDG switch) is off limits.
 
@@ -31,14 +31,14 @@ RUN_DIR=$(.agents/skills/verify-chibi/scripts/launch.sh --port 8645 0x3d767bf857
 .agents/skills/verify-chibi/scripts/doctor.sh "$RUN_DIR"
 ```
 
-Read-only. Exits 0 only when the pid in `$RUN_DIR/chibi.pid` runs this run's binary, holds the port, uses the scratch data dir, answers the expected `eth_chainId`, and is within 3 blocks of the public oracle's head. Run it before driving and whenever a result looks wrong. A `stale head` failure means no snap/2 peer is serving; the node keeps answering with an old block, so any comparison made then is invalid.
+Read-only. Exits 0 only when the pid in `$RUN_DIR/chibi.pid` runs this run's binary, holds the port, uses the scratch data dir, answers the expected `eth_chainId`, and is within 3 blocks of the public oracle's head. Run it before driving and whenever a result looks wrong. A `stale head` failure means no state peer (snap/2) is serving; the node keeps answering with an old block, so any comparison made then is invalid.
 
 ## Drive
 
 - JSON-RPC: `.agents/skills/verify-chibi/scripts/rpc.sh "$RUN_DIR" <method> '<params-json>'` prints the response and appends request and response to `$RUN_DIR/evidence/rpc.log`. `cast ... --rpc-url http://127.0.0.1:<port>` exercises the same calls a wallet makes.
 - Oracle comparison: `CHIBI=http://127.0.0.1:<port> scripts/oracle-check.sh <address>... | tee "$RUN_DIR/evidence/oracle-check.txt"` compares chibi with publicnode at chibi's own head and exits non-zero on any difference. The oracle is a test input only; chibi never uses it.
 - CLI: run the copied binary with the run's environment, for example `env -u CHIBI_CONFIG HOME="$RUN_DIR/home" XDG_CONFIG_HOME="$RUN_DIR/home/.config" XDG_DATA_HOME="$RUN_DIR/home/.local/share" "$RUN_DIR/bin/chibi" status`.
-- Node behaviour: `$RUN_DIR/chibi.log`. Stable strings are `anchored head=` (with `keys=`, the pins plus the learned keys the last run saved), `head verified`, `stepped=Reanchored`, `stepped=Extended`, `step failed`, `transaction included`, `session established ... snap=true`, `status head=` (every 60 s once JSON-RPC opens, with `snap_peers=`, and `pins=` and `learned=` as held/total), `no snap/2 peer connected`, `pins not held at the head for two status lines` (with `count=` and up to five `pins=`), and, without a config file, `no config at`.
+- Node behaviour: `$RUN_DIR/chibi.log`. Stable strings are `waiting for a state peer (snap/2)` (with `peers=` and `state_peers=`), `found a state peer` (once per process, on stdout under a small ASCII cat, before `anchored`), `anchored head=` (with `keys=`, the pinned keys plus the learned keys the last run saved), `head verified`, `stepped=Reanchored`, `stepped=Extended`, `step failed`, `no connected peer serves state (snap/2)`, `transaction included`, `session established ... snap=true`, `status head=` (every 60 s once JSON-RPC opens, with `peers=`, `state_peers=`, and `pinned=` and `learned=` as held/total), `no state peer (snap/2) connected`, `pinned keys not held at the head for two status lines` (with `count=` and up to five `keys=`), and, without a config file, `no config at`.
 
 ## Evidence
 
@@ -48,7 +48,7 @@ Everything goes in `$RUN_DIR/evidence/`, which cleanup keeps. Default root is `/
 - Pair every action with the resulting state: the RPC response and the oracle's answer at the same block, or the command and its output.
 - Check side effects too: the log line for the head step, the transaction found on chain by the oracle, the config file on disk, the snapshot in `chibi status`.
 - Record the block number with every state comparison. chibi serves state only at its head, so an answer without a block cannot be compared.
-- Report a skipped feature with the unmet precondition (no funded key, fork not active, no snap/2 peer). Never report it as verified through another path.
+- Report a skipped feature with the unmet precondition (no funded key, fork not active, no state peer). Never report it as verified through another path.
 
 ## Cleanup
 

@@ -65,7 +65,7 @@ const BROADCAST_FANOUT: usize = 8;
 const INBOUND_CAPACITY: usize = 256;
 
 const ETH: &str = "eth";
-const SNAP: &str = "snap/2";
+const SNAP: &str = "state (snap/2)";
 
 /// The capability named when neither BAL source is connected.
 const BAL_SOURCES: &str = "snap/2 or eth/71";
@@ -117,7 +117,7 @@ impl NetConfig {
         if self.trusted_only {
             return Vec::new();
         }
-        spec.snap_peers.iter().copied().chain(remembered).collect()
+        spec.state_peers.iter().copied().chain(remembered).collect()
     }
 
     fn peers_config(&self) -> PeersConfig {
@@ -628,7 +628,7 @@ impl Peers for Devp2p {
         let sessions = self.sessions.borrow();
         Census {
             peers: sessions.len(),
-            snap_peers: sessions.values().filter(|session| session.snap).count(),
+            state_peers: sessions.values().filter(|session| session.snap).count(),
             snap_records: sessions
                 .values()
                 .filter_map(|session| session.dialable)
@@ -1222,7 +1222,7 @@ mod tests {
         assert_eq!(net.boot_nodes(&spec), spec.boot_nodes.as_slice());
         assert_eq!(
             net.known_peers(&spec, vec![node(9)]),
-            spec.snap_peers
+            spec.state_peers
                 .iter()
                 .copied()
                 .chain([node(9)])
@@ -1255,7 +1255,7 @@ mod tests {
             ..NetConfig::default()
         };
         assert_eq!(net.boot_nodes(&spec), [node(3)]);
-        assert_eq!(net.known_peers(&spec, Vec::new()), spec.snap_peers);
+        assert_eq!(net.known_peers(&spec, Vec::new()), spec.state_peers);
         let peers = net.peers_config();
         assert_eq!(
             peers.trusted_nodes,

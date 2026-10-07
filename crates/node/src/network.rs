@@ -62,7 +62,7 @@ impl Network {
                 helios: helios_ethereum::config::networks::Network::Sepolia,
                 default_beacon: "https://beacon.sepolia.ethpandaops.io/nimbus",
                 boot_nodes: sepolia_nodes(),
-                snap_peers: parse_nodes(SEPOLIA_SNAP_PEERS),
+                state_peers: parse_nodes(SEPOLIA_SNAP_PEERS),
                 tokens: SEPOLIA_TOKENS,
                 ens_resolver: SEPOLIA_ENS_RESOLVER,
                 clock: BlockClock {
@@ -76,7 +76,7 @@ impl Network {
                 helios: helios_ethereum::config::networks::Network::Mainnet,
                 default_beacon: "https://ethereum-beacon-api.publicnode.com",
                 boot_nodes: mainnet_nodes(),
-                snap_peers: Vec::new(),
+                state_peers: Vec::new(),
                 tokens: MAINNET_TOKENS,
                 ens_resolver: MAINNET_ENS_RESOLVER,
                 clock: BlockClock {
@@ -125,9 +125,9 @@ pub struct NetworkSpec {
     pub default_beacon: &'static str,
     /// devp2p boot nodes.
     pub boot_nodes: Vec<NodeRecord>,
-    /// Known snap/2 peers, dialed as static peers at start because discovery can take minutes
-    /// to find one.
-    pub snap_peers: Vec<NodeRecord>,
+    /// Known state peers (snap/2), dialed as static peers at start because discovery can take
+    /// minutes to find one.
+    pub state_peers: Vec<NodeRecord>,
     /// Tokens chibi knows on this network. Every one is pinned for each watched address.
     pub tokens: &'static [Token],
     /// ENS's UniversalResolver, whose `reverse` gives each watched address's primary name

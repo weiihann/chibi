@@ -43,8 +43,8 @@ pub struct Reply<T> {
 pub struct Census {
     /// Connected sessions.
     pub peers: usize,
-    /// Connected sessions that negotiated snap/2.
-    pub snap_peers: usize,
+    /// Connected sessions that negotiated snap/2: the state peers, which serve proofs.
+    pub state_peers: usize,
     /// Addresses of the connected snap/2 peers, dialed first on the next start because
     /// discovery takes minutes to find one.
     pub snap_records: Vec<NodeRecord>,
@@ -140,7 +140,7 @@ impl<P: Peers> Paced<P> {
     }
 
     fn wanted(&self) -> usize {
-        self.inner.census().snap_peers.max(1) * SNAP_PER_PEER
+        self.inner.census().state_peers.max(1) * SNAP_PER_PEER
     }
 
     /// Follows the connected snap/2 peers, keeping at least one slot so that reth fails a
@@ -305,7 +305,7 @@ mod tests {
     /// sets.
     #[derive(Debug)]
     struct Stub {
-        snap_peers: AtomicUsize,
+        state_peers: AtomicUsize,
         arrived: mpsc::UnboundedSender<oneshot::Sender<()>>,
     }
 
@@ -363,7 +363,7 @@ mod tests {
 
         fn census(&self) -> Census {
             Census {
-                snap_peers: self.snap_peers.load(Ordering::SeqCst),
+                state_peers: self.state_peers.load(Ordering::SeqCst),
                 ..Census::default()
             }
         }
@@ -376,10 +376,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_snap_peers_drop_from_four_to_one_only_one_peers_slots_are_out_at_a_time() {
+    async fn after_state_peers_drop_from_four_to_one_only_one_peers_slots_are_out_at_a_time() {
         let (arrived, mut arrivals) = mpsc::unbounded_channel();
         let paced = Arc::new(Paced::new(Stub {
-            snap_peers: AtomicUsize::new(4),
+            state_peers: AtomicUsize::new(4),
             arrived,
         }));
         let request = AccountRangeRequest {
@@ -400,7 +400,7 @@ mod tests {
         }
         assert_eq!(first.len(), 4 * SNAP_PER_PEER);
 
-        paced.inner.snap_peers.store(1, Ordering::SeqCst);
+        paced.inner.state_peers.store(1, Ordering::SeqCst);
         for answer in first {
             answer.send(()).unwrap();
         }
@@ -425,10 +425,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_queued_before_snap_peers_grow_from_one_to_four_use_all_four_peers_slots() {
+    async fn requests_queued_before_state_peers_grow_from_one_to_four_use_all_four_peers_slots() {
         let (arrived, mut arrivals) = mpsc::unbounded_channel();
         let paced = Arc::new(Paced::new(Stub {
-            snap_peers: AtomicUsize::new(1),
+            state_peers: AtomicUsize::new(1),
             arrived,
         }));
         let request = AccountRangeRequest {
@@ -449,7 +449,7 @@ mod tests {
         }
         assert_eq!(first.len(), SNAP_PER_PEER);
 
-        paced.inner.snap_peers.store(4, Ordering::SeqCst);
+        paced.inner.state_peers.store(4, Ordering::SeqCst);
         for answer in first {
             answer.send(()).unwrap();
         }

@@ -70,7 +70,7 @@ while ! grep -q "JSON-RPC on http://127.0.0.1:$port" "$run_dir/chibi.log" 2>/dev
     fi
     if [ "$waited" -ge "$timeout" ]; then
         echo "no JSON-RPC after ${timeout}s; still running, inspect $run_dir/chibi.log or run cleanup.sh" >&2
-        grep "waiting for a snap/2 peer" "$run_dir/chibi.log" | tail -1 >&2 || true
+        grep "waiting for a state peer" "$run_dir/chibi.log" | tail -1 >&2 || true
         exit 1
     fi
     sleep 2

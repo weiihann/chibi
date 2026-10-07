@@ -1,10 +1,10 @@
 # Head following
 
-chibi moves to every new head the light client attests, so the wallet's `latest` is the chain tip. Before Glamsterdam it reanchors at each head: it proves the pins (watched addresses, `[[contracts]]`, and every registry token's keys for each watched address) again, swaps, then warms the learned keys requests read. After Glamsterdam it applies each block's access list instead, updating only keys it holds. `chibi status` shows the last verified head without a running node.
+chibi moves to every new head the light client attests, so the wallet's `latest` is the chain tip. Before Glamsterdam it reanchors at each head: it proves the pinned keys (watched addresses, `[[contracts]]`, and every registry token's keys for each watched address) again, swaps, then warms the learned keys requests read. After Glamsterdam it applies each block's access list instead, updating only keys it holds. `chibi status` shows the last verified head without a running node.
 
 ## Sub-features
 
-- `follow-reanchor` moves to each new head by proving the pins again and then warming learned keys (every head before the fork; after the fork, whenever a block access list is unavailable).
+- `follow-reanchor` moves to each new head by proving the pinned keys again and then warming learned keys (every head before the fork; after the fork, whenever a block access list is unavailable).
 - `follow-bal` moves to the next head by applying its block access list. Needs the Sepolia Glamsterdam fork (2026-10-06 13:53:36 UTC).
 - `follow-fresh` keeps `eth_blockNumber` within a few blocks of the chain tip.
 - `follow-status` prints the saved snapshot with its block number from `chibi status`.
@@ -30,7 +30,7 @@ Preconditions:
 
 ## Gotchas
 
-- `step failed ... no connected peer serves snap/2` followed by no new `head verified` lines is the stale-head state: chibi keeps serving its last head and `eth_syncing` still answers `false`. It is a real behaviour to report, not a harness fault.
+- `step failed ... no connected peer serves state (snap/2)` followed by no new `head verified` lines is the stale-head state: chibi keeps serving its last head and `eth_syncing` still answers `false`. It is a real behaviour to report, not a harness fault.
 - helios attests a head about 4 s into each slot, and under Gloas one slot late, so chibi's head trails the explorer by a block or two.
 - `chibi status` values are a display snapshot from disk. They prove persistence, not verification.
 - After the fork, an `Extended` step makes no proof requests for keys chibi holds; only unheld keys are warmed. Compare the values with `oracle-check.sh` anyway; that is the only check that the access list was applied correctly.

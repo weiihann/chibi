@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await
     .is_ok_and(|seen| seen.is_ok());
     if !found {
-        warn!(wait = ?SNAP_PEER_WAIT, "no snap/2 peer yet");
+        warn!(wait = ?SNAP_PEER_WAIT, "no state peer (snap/2) yet");
     }
     log_sessions(&sessions.borrow());
 
@@ -184,11 +184,11 @@ fn log_sessions(sessions: &Sessions) {
         entry.0 += 1;
         entry.1 += usize::from(session.snap);
     }
-    let snap = sessions.values().filter(|session| session.snap).count();
+    let state_peers = sessions.values().filter(|session| session.snap).count();
     info!(
         peers = sessions.len(),
-        snap_peers = snap,
+        state_peers,
         ?clients,
-        "sessions (client: (peers, snap/2))"
+        "sessions (client: (peers, state peers))"
     );
 }

@@ -323,7 +323,7 @@ impl Config {
         if self.trusted_only && self.trusted_peers.is_empty() {
             return Err(InvalidConfig::TrustedOnlyWithoutPeers);
         }
-        let built_in = !self.trusted_only && !self.network.spec().snap_peers.is_empty();
+        let built_in = !self.trusted_only && !self.network.spec().state_peers.is_empty();
         if self.disable_discovery && self.trusted_peers.is_empty() && !built_in {
             return Err(InvalidConfig::NothingToDial);
         }

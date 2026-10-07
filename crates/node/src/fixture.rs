@@ -480,7 +480,7 @@ impl Peers for FixturePeers {
     fn census(&self) -> Census {
         Census {
             peers: 1,
-            snap_peers: 1,
+            state_peers: 1,
             snap_records: Vec::new(),
         }
     }

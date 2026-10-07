@@ -8,13 +8,13 @@ Behind the RPC sits a partial-state node. The helios light client vouches for ex
 
 These constraints shape the design:
 
-- Snap peers serve only about the last 128 state roots, so every fetch targets a recent verified head, and one request pins one head from start to end.
+- State peers serve only about the last 128 state roots, so every fetch targets a recent verified head, and one request pins one head from start to end.
 - BALs carry post-values for balances, nonces, code, and slots, but no storage roots.
 - A key never fetched is a miss. A miss must never read as zero. A key proven absent is a known zero.
 - Sepolia has no BALs until 2026-10-06 13:53:36 UTC, and mainnet has none until its own Glamsterdam fork. Advancing without BALs is a first-class path.
 - Wallets send concurrent requests.
 - Peers drop clients that never answer, so chibi answers every inbound request with an empty response.
-- A census on 2026-10-05 found five Sepolia peers serving snap/2 in 12 minutes, all Nethermind. Discovery alone took from about one to several minutes to reach one.
+- Only peers that speak snap/2, called state peers, can serve the proofs chibi needs; most Sepolia nodes do not. A census on 2026-10-05 found five Sepolia state peers in 12 minutes, all Nethermind. Discovery alone took from about one to several minutes to reach one.
 
 ## Usage
 
@@ -27,7 +27,11 @@ wrote ~/.config/chibi/config.toml (sepolia, 1 address)
 
 $ chibi run
 INFO chibi::node: light client synced network=sepolia
-INFO chibi::node: waiting for a snap/2 peer peers=0 snap_peers=0 dialed=6 elapsed_s=0
+INFO chibi::node: waiting for a state peer (snap/2) peers=0 state_peers=0 dialed=6 elapsed_s=0
+  /\_/\
+ ( o.o )  found a state peer
+  > ^ <
+ (")_(")
 INFO chibi::node: anchored head=11848650 keys=1
 INFO chibi::rpc: JSON-RPC on http://127.0.0.1:8545, chain id 11155111
 INFO chibi::follow: head verified head=11848651 stepped=Reanchored(..)
@@ -88,7 +92,7 @@ Values enter a `Store` only through `Store::insert(Proven)` at the anchor, `Stat
 
 ### Start
 
-Once the trusted head's header is fetched and verified, `Node::start` builds an empty store at that anchor with the working set (the pins plus the learned keys the last run saved), restores the outbox, persists, and returns, and JSON-RPC opens. Nothing is proven before RPC opens. The follower's first step runs the seeding calls and warms everything unheld. Requests during warm-up fetch their misses on demand.
+Once the trusted head's header is fetched and verified, `Node::start` builds an empty store at that anchor with the working set (the pinned keys plus the learned keys the last run saved), restores the outbox, persists, and returns, and JSON-RPC opens. Nothing is proven before RPC opens. The follower's first step runs the seeding calls and warms everything unheld. Requests during warm-up fetch their misses on demand.
 
 ### Advancing to a new head
 
@@ -98,7 +102,7 @@ Once the trusted head's header is fetched and verified, `Node::start` builds an 
 
 ### Warming
 
-The follower warms after each step: it proves unheld keys at the current anchor, pins first, then learned keys most recently used first, with at most `WARM_IN_FLIGHT` = 8 requests in flight, merging every 64 proofs. chibi sends snap/2 requests itself rather than through reth's fetcher, which would send one at a time. Each request goes to the snap/2 session with the fewest in flight, and no session ever has more than 16 (reth's session buffers 32 and drops the rest). When every session is full, a request waits for one to free up. With no snap/2 session at all, it fails at once. A request counts against its session until reth resolves its reply, even after the caller stops waiting, because reth keeps it out at the peer until then. Warming therefore takes at most half of one peer's slots while it runs, leaving the rest to wallet requests and BAL fetches; warm requests abandoned at a new head hold their slots until the peer answers. It stops at once when a new head arrives. A key that fails stays unheld for the next pass and never blocks the head. Requests wake the follower when anything is unheld.
+The follower warms after each step: it proves unheld keys at the current anchor, pinned keys first, then learned keys most recently used first, with at most `WARM_IN_FLIGHT` = 8 requests in flight, merging every 64 proofs. chibi sends snap/2 requests itself rather than through reth's fetcher, which would send one at a time. Each request goes to the state peer with the fewest in flight, and no session ever has more than 16 (reth's session buffers 32 and drops the rest). When every session is full, a request waits for one to free up. With no state peer at all, it fails at once. A request counts against its session until reth resolves its reply, even after the caller stops waiting, because reth keeps it out at the peer until then. Warming therefore takes at most half of one peer's slots while it runs, leaving the rest to wallet requests and BAL fetches; warm requests abandoned at a new head hold their slots until the peer answers. It stops at once when a new head arrives. A key that fails stays unheld for the next pass and never blocks the head. Requests wake the follower when anything is unheld.
 
 ### Requests and misses
 
@@ -133,11 +137,11 @@ The state database is `chibi.db` in the per-network data directory, a SQLite fil
 
 ### Networks
 
-`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, pinned snap/2 peers, the ENS UniversalResolver, and the registry of known tokens. The UniversalResolver is `0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe` on both networks; on Sepolia it fronts ENSv2. The mainnet registry holds the 15 ERC-20s with the most transfer transactions on mainnet in the 30 days to 2026-10-07; the Sepolia registry holds the 9 of them with a Sepolia deployment. `scripts/registry-check.sh` checks every entry's code, symbol, and decimals against each chain, reading the registry through the `registry` example so there is one list. The registry labels tokens in `chibi status` and lists what the optional `tokens` config key accepts; `chibi init` never asks for tokens. `NodeConfig.watch` carries the addresses, the pinned tokens, and the configured contracts. On Sepolia, USDC is Circle's deployment, PYUSD is Paxos's, and LINK is Chainlink's. USDT, DAI, WBTC, and AAVE are the test tokens Aave's Sepolia faucet mints (owner `0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D`, listed as `FAUCET` in Aave's address book); Aave's own Sepolia USDC (`0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8`) is a different contract from Circle's and is not in the registry. Sepolia is the default. Its beacon default is `https://beacon.sepolia.ethpandaops.io/nimbus`. That host is ethPandaOps' dugtrio load balancer, which pins each client IP to one backend of any client type; the `/nimbus` path selects a Nimbus backend, the only client there that serves fresh Gloas light-client data and bootstraps for recent checkpoints (Teku and Prysm do not serve the light-client API, Lighthouse stopped at the fork, and Lodestar refuses older bootstraps). A beacon endpoint can stall chibi but cannot make it accept a wrong header.
+`node::network` keeps every chain fact in one `NetworkSpec` per `Network` variant: the reth `ChainSpec` (which drives both the devp2p fork id and the EVM fork schedule and blob parameters), the helios network config, the default beacon API URL, boot nodes, known state peers, the ENS UniversalResolver, and the registry of known tokens. The UniversalResolver is `0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe` on both networks; on Sepolia it fronts ENSv2. The mainnet registry holds the 15 ERC-20s with the most transfer transactions on mainnet in the 30 days to 2026-10-07; the Sepolia registry holds the 9 of them with a Sepolia deployment. `scripts/registry-check.sh` checks every entry's code, symbol, and decimals against each chain, reading the registry through the `registry` example so there is one list. The registry labels tokens in `chibi status` and lists what the optional `tokens` config key accepts; `chibi init` never asks for tokens. `NodeConfig.watch` carries the addresses, the pinned tokens, and the configured contracts. On Sepolia, USDC is Circle's deployment, PYUSD is Paxos's, and LINK is Chainlink's. USDT, DAI, WBTC, and AAVE are the test tokens Aave's Sepolia faucet mints (owner `0xC959483DBa39aa9E78757139af0e9a2EDEb3f42D`, listed as `FAUCET` in Aave's address book); Aave's own Sepolia USDC (`0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8`) is a different contract from Circle's and is not in the registry. Sepolia is the default. Its beacon default is `https://beacon.sepolia.ethpandaops.io/nimbus`. That host is ethPandaOps' dugtrio load balancer, which pins each client IP to one backend of any client type; the `/nimbus` path selects a Nimbus backend, the only client there that serves fresh Gloas light-client data and bootstraps for recent checkpoints (Teku and Prysm do not serve the light-client API, Lighthouse stopped at the fork, and Lodestar refuses older bootstraps). A beacon endpoint can stall chibi but cannot make it accept a wrong header.
 
 The light-client checkpoint follows one precedence: a user override, else the checkpoint helios saved in the data directory (a file of exactly 32 bytes), else the newest checkpoint from the community checkpoint services, logged as a warning. chibi never passes helios's shipped default, which is older than helios's 14-day limit. helios saves only checkpoints newer than the one it started from, so after a first-run sync chibi saves that checkpoint itself in helios's file format.
 
-At start chibi dials the pinned and remembered snap/2 peers as static peers and waits, with a progress log every 30 seconds, until one snap/2 session is up. It does not give up, because discovery of these rare peers has taken from under a minute to several minutes.
+At start chibi dials the known and remembered state peers as static peers and waits, logging `waiting for a state peer (snap/2)` every 30 seconds, until one state peer is connected. It does not give up, because discovery of these rare peers has taken from under a minute to several minutes. When the wait ends, `Node::start` runs the caller's `found_state_peer` callback once, before fetching the anchor header; the CLI prints a small ASCII cat with `found a state peer` to stdout. The library itself prints nothing.
 
 `NetConfig` carries the user's peer settings to the one reth `NetworkConfigBuilder` in `node::devp2p`: trusted peers (reth's `PeersConfig` trusted nodes, always dialed and kept), `trusted_only` (reth connects to and accepts trusted nodes only, and chibi then dials no built-in or remembered snap/2 peer and starts discovery from no network boot node), boot nodes replacing the network's, outbound and inbound session limits (reth's 100 and 30 by default), a discovery port apart from the RLPx port, and discovery off. The config refuses `trusted_only` without trusted peers, and discovery off when there is nothing else to dial: no trusted peer, and no built-in snap/2 peer (mainnet has none) or `trusted_only`.
 
@@ -173,7 +177,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - We accept that learned keys are cold after start and after a reanchor until warming reaches them, and that a pin no peer proves at a reanchor is unheld at the new head until warming proves it, so a read of it pays a fetch there, in exchange for reanchors that no key can block.
 - We accept warming inside the follower, so its merges never straddle an anchor move, at the cost of warming that pauses while the follower moves the head.
 - We accept discarding BAL post-states for unheld slots, so the store stays bounded and immune to other users' traffic; a dapp re-reading such a slot pays a fetch.
-- We accept a constant eviction budget of 1024 keys (pins plus learned, with pins exempt from eviction) and no config knob. Measured on Sepolia, one Nethermind snap/2 peer answered 64 to 80 requests a second with 16 in flight; warming uses 8, so re-warming a full set of learned keys takes roughly half a minute per peer (inferred).
+- We accept a constant eviction budget of 1024 keys (pinned plus learned, with pinned keys exempt from eviction) and no config knob. Measured on Sepolia, one Nethermind state peer answered 64 to 80 requests a second with 16 in flight; warming uses 8, so re-warming a full set of learned keys takes roughly half a minute per peer (inferred).
 - We accept warming with half of one peer's 16 snap slots, in exchange for wallet requests and BAL fetches that usually find the other half free. Warm requests abandoned at a new head keep their slots until the peer answers, and a request waiting for a slot spends its 10 s timeout while it waits.
 - We accept opening RPC before any proof, so the first reads pay a fetch, in exchange for a wallet that never sees the network as down while chibi proves.
 - We accept losing up to 5 heads of newly learned keys, and up to an hour of recency, on a crash, in exchange for not rewriting up to 1024 rows at every head.
@@ -194,8 +198,8 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 ## Open questions and risks
 
 - Some wallets send state queries tagged `finalized`. Should those serve the anchor instead of an error?
-- Should the RPC fail closed when the anchor falls behind the light client because no snap peer is reachable?
-- Will Nethermind peers serve BALs over snap/2 after the fork, and will geth and reth peers enable snap/2? Today only Nethermind does on Sepolia, and the five pinned peers are a single point of slowness.
+- Should the RPC fail closed when the anchor falls behind the light client because no state peer is reachable?
+- Will Nethermind peers serve BALs over snap/2 after the fork, and will geth and reth peers enable snap/2? Today only Nethermind does on Sepolia, and the five known state peers are a single point of slowness.
 - The first run trusts the community checkpoint services for weak subjectivity unless the user sets `checkpoint`. Should a release ship a recent checkpoint instead?
 - Does MetaMask's background page send an `Origin` header to a custom RPC? If it does not, the CORS allowlist never applies to it.
 
