@@ -12,6 +12,7 @@ use alloy_consensus::transaction::SignerRecoverable as _;
 use alloy_eips::BlockNumHash;
 use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, TxKind, U256};
+use alloy_sol_types::SolCall as _;
 use chibi_core::VerifiedHeader;
 use chibi_core::exec::{
     self, CallRequest, ChainEnv, EstimateError, ExecError, Executed, ExecutionResult, HaltReason,
@@ -230,11 +231,16 @@ pub struct TxReceipt {
     pub contract_address: Option<Address>,
 }
 
-/// A watched address and its token balances at one block.
+/// A watched address, its primary ENS name, and its token balances at one block.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holding {
     /// The watched address.
     pub address: Address,
+    /// The primary ENS name, checked by the resolver to resolve back to the address. `None`
+    /// when there is none, it does not compute from held keys, or the lookup reverts, which
+    /// includes names served offchain. Absent from snapshots saved before names.
+    #[serde(default)]
+    pub name: Option<String>,
     /// ETH balance in wei, `None` if not yet proven.
     pub balance: Option<U256>,
     /// Account nonce, `None` if not yet proven.
@@ -1014,39 +1020,43 @@ impl<P: Peers> Shared<P> {
         Ok(())
     }
 
-    /// Runs `balanceOf(holder)` and a zero `transfer` to the holder from the holder for every
-    /// watched address and pinned token, and pins every key either run read, whether or not
-    /// the transfer succeeds. That covers proxies, pause flags, fee parameters, blacklists,
-    /// and nonstandard layouts without per-token code. When a run cannot complete, the
-    /// previous seeded pins are kept alongside the new reads and this returns false, so the
-    /// caller retries rather than demoting keys a peer could not serve.
+    /// Runs ENS `reverse` for every watched address, and `balanceOf(holder)` and a zero
+    /// `transfer` to the holder from the holder for every watched address and pinned token,
+    /// and pins every key any run read, whether or not the run succeeds. That covers proxies,
+    /// pause flags, fee parameters, blacklists, nonstandard layouts, and the ENS registry and
+    /// resolvers without per-contract code. When a run cannot complete, the previous seeded
+    /// pins are kept alongside the new reads and this returns false, so the caller retries
+    /// rather than demoting keys a peer could not serve.
     pub(crate) async fn seed(&self) -> bool {
         let mut seeded = BTreeSet::new();
         let mut complete = true;
         for holder in &self.watch.addresses {
+            let mut requests = vec![("ENS name", reverse_name(self.spec.ens_resolver, *holder))];
             for token in &self.watch.tokens {
-                for request in [balance_of(token, *holder), transfer_to_self(token, *holder)] {
-                    let store = self.read(State::snapshot);
-                    let read = self
-                        .resolve(store, |s| {
-                            exec::execute(s, &self.env, &request)
-                                .map(|executed| Executed {
-                                    result: executed.read.clone(),
-                                    read: executed.read,
-                                })
-                                .map_err(misses)
-                        })
-                        .await;
-                    match read {
-                        Ok(read) => seeded.extend(read),
-                        Err(err) => {
-                            complete = false;
-                            warn!(
-                                target: "chibi::node",
-                                token = token.symbol, %holder, %err,
-                                "token seeding failed; retrying at the next step",
-                            );
-                        }
+                requests.push((token.symbol, balance_of(token, *holder)));
+                requests.push((token.symbol, transfer_to_self(token, *holder)));
+            }
+            for (what, request) in requests {
+                let store = self.read(State::snapshot);
+                let read = self
+                    .resolve(store, |s| {
+                        exec::execute(s, &self.env, &request)
+                            .map(|executed| Executed {
+                                result: executed.read.clone(),
+                                read: executed.read,
+                            })
+                            .map_err(misses)
+                    })
+                    .await;
+                match read {
+                    Ok(read) => seeded.extend(read),
+                    Err(err) => {
+                        complete = false;
+                        warn!(
+                            target: "chibi::node",
+                            what, %holder, %err,
+                            "seeding failed; retrying at the next step",
+                        );
                     }
                 }
             }
@@ -1070,6 +1080,7 @@ impl<P: Peers> Shared<P> {
                 let account = store.account(*address).ok();
                 Holding {
                     address: *address,
+                    name: primary_name(store, &self.env, self.spec.ens_resolver, *address),
                     balance: account.map(|a| a.map_or(U256::ZERO, |a| a.balance)),
                     nonce: account.map(|a| a.map_or(0, |a| a.nonce)),
                     tokens: self
@@ -1374,6 +1385,50 @@ fn token_balance(store: &Store, env: &ChainEnv, token: &Token, holder: Address) 
         return (data.len() == 32).then(|| U256::from_be_slice(data));
     }
     None
+}
+
+alloy_sol_types::sol! {
+    /// ENS UniversalResolver: the primary name of `lookupAddress` for `coinType`, verified
+    /// to resolve back to it (ENSIP-19). Reverts on a mismatch and with `OffchainLookup`
+    /// for names served through CCIP-read.
+    function reverse(bytes lookupAddress, uint256 coinType)
+        external
+        view
+        returns (string primary, address resolver, address reverseResolver);
+}
+
+/// SLIP-44 coin type of Ether, for the address's Ethereum primary name.
+const ETH_COIN_TYPE: u64 = 60;
+
+/// `reverse(holder, 60)` sent by the holder, so the run reads no other sender account.
+fn reverse_name(resolver: Address, holder: Address) -> CallRequest {
+    let call = reverseCall {
+        lookupAddress: Bytes::copy_from_slice(holder.as_slice()),
+        coinType: U256::from(ETH_COIN_TYPE),
+    };
+    CallRequest {
+        from: Some(holder),
+        to: TxKind::Call(resolver),
+        input: Bytes::from(call.abi_encode()),
+        ..CallRequest::default()
+    }
+}
+
+/// The primary name `reverse` returns, run locally over held keys only; `None` if a key is
+/// missing, the call reverts or returns something else, or the name is empty. chibi never
+/// follows an `OffchainLookup` to a gateway.
+fn primary_name(
+    store: &Store,
+    env: &ChainEnv,
+    resolver: Address,
+    holder: Address,
+) -> Option<String> {
+    let executed = exec::execute(store, env, &reverse_name(resolver, holder)).ok()?;
+    let Ok(ExecutionResult::Success { output, .. }) = executed.result else {
+        return None;
+    };
+    let primary = reverseCall::abi_decode_returns(output.data()).ok()?.primary;
+    (!primary.is_empty()).then_some(primary)
 }
 
 fn unix_now() -> u64 {
