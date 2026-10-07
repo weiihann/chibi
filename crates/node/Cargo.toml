@@ -49,6 +49,7 @@ url.workspace = true
 [dev-dependencies]
 chibi-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 alloy-signer = "2.5"
 alloy-signer-local = "2.5"

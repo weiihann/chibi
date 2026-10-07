@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use alloy_consensus::{SignableTransaction as _, TxEip4844, TxLegacy};
 use alloy_eips::eip1559::BaseFeeParams;
@@ -973,6 +974,29 @@ async fn start_serves_reads_before_the_first_step_warms_the_pins() {
     assert_eq!(balance(&node, ALICE).await, Some(eth(2)));
     assert_eq!(balance(&node, BOB).await, Some(eth(3)));
     assert_eq!(fixture.log().proofs, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_out() {
+    let holders: Vec<(Address, WorldAccount)> = (1..=100u64)
+        .map(|i| {
+            let address = Address::left_padding_from(&(0x1000 + i).to_be_bytes());
+            (address, WorldAccount::eoa(eth(i)))
+        })
+        .collect();
+    let fixture = Fixture::genesis(holders.clone());
+    fixture.serve_proofs_serially(Duration::from_millis(340));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+
+    let balances =
+        futures::future::join_all(holders.iter().map(|(address, _)| balance(&node, *address)))
+            .await;
+    assert_eq!(
+        balances,
+        (1..=100).map(|i| Some(eth(i))).collect::<Vec<_>>()
+    );
+    assert_eq!(fixture.log().proofs, 100);
 }
 
 #[tokio::test]

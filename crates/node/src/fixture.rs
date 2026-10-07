@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_consensus::Header;
 use alloy_eips::eip2718::Encodable2718 as _;
@@ -15,7 +16,7 @@ use chibi_core::wire::{
 };
 use chibi_core::{TrustedHash, VerifiedHeader};
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::disk::read_state;
 use crate::heads::{Heads, HeadsSender};
@@ -86,6 +87,10 @@ struct Inner {
     holding: watch::Sender<bool>,
     /// Proof requests that have waited at the gate.
     parked: watch::Sender<usize>,
+    /// While set, proof requests are served one at a time, each taking this long.
+    serial: Mutex<Option<Duration>>,
+    /// The single serial peer; a request holds it while being served.
+    line: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// An offline chain and the light client watching it.
@@ -113,6 +118,8 @@ impl Fixture {
                 outbox_dir: Mutex::new(None),
                 holding: watch::Sender::new(false),
                 parked: watch::Sender::new(0),
+                serial: Mutex::new(None),
+                line: Arc::new(tokio::sync::Mutex::new(())),
             }),
             sender,
             heads,
@@ -231,6 +238,13 @@ impl Fixture {
     pub fn release_proofs(&self) {
         self.inner.holding.send_replace(false);
     }
+
+    /// Serves proof requests like the only snap/2 peer behind reth's fetcher: one at a time,
+    /// each taking `service`, and a request already queued is served even after its caller
+    /// stopped waiting.
+    pub fn serve_proofs_serially(&self, service: Duration) {
+        *self.inner.serial.lock() = Some(service);
+    }
 }
 
 /// [`Peers`] over a [`Fixture`]'s world.
@@ -262,6 +276,84 @@ impl FixturePeers {
                 .unwrap_or_default();
         }
     }
+
+    /// Runs `serve` now, or, while proofs are served serially, after every earlier request
+    /// on the line and the service time, whether or not the caller is still waiting.
+    async fn on_the_wire<T: Send + 'static>(
+        &self,
+        serve: impl FnOnce(&Self) -> T + Send + 'static,
+    ) -> Result<T, NetError> {
+        let Some(service) = *self.inner.serial.lock() else {
+            return Ok(serve(self));
+        };
+        let (reply, answer) = oneshot::channel();
+        let peers = self.clone();
+        let line = Arc::clone(&self.inner.line);
+        let mut queued = Box::pin(async move {
+            let _turn = line.lock().await;
+            tokio::time::sleep(service).await;
+            reply.send(serve(&peers)).ok();
+        });
+        // Join the line before returning, so requests queue in the order they were made.
+        if futures::poll!(queued.as_mut()).is_pending() {
+            tokio::spawn(queued);
+        }
+        answer.await.map_err(|_| NetError::Stopped)
+    }
+
+    fn account_reply(
+        &self,
+        request: &AccountRangeRequest,
+    ) -> Result<Reply<AccountReply>, NetError> {
+        self.proof_served();
+        let mut faults = self.inner.faults.lock();
+        if faults.unavailable.contains(&request.key) {
+            return Self::honest(AccountReply::default());
+        }
+        let mut reply = self.inner.world.lock().account_reply(request);
+        if faults.drop_proof_node.contains(&request.key) && !reply.proof.is_empty() {
+            reply.proof.remove(0);
+        }
+        if let Some((key, balance)) = faults.lie.filter(|(key, _)| *key == request.key) {
+            faults.lie = None;
+            if let Some((_, account)) = reply.accounts.iter_mut().find(|(k, _)| *k == key) {
+                account.balance = balance;
+            }
+            return Ok(Reply {
+                peer: LIAR,
+                value: reply,
+            });
+        }
+        Self::honest(reply)
+    }
+
+    fn storage_reply(
+        &self,
+        request: &StorageRangeRequest,
+    ) -> Result<Reply<StorageReply>, NetError> {
+        self.proof_served();
+        self.inner
+            .log
+            .lock()
+            .slots
+            .push((request.account, request.slot));
+        if self
+            .inner
+            .faults
+            .lock()
+            .unavailable
+            .contains(&request.account)
+        {
+            return Self::honest(StorageReply::default());
+        }
+        Self::honest(self.inner.world.lock().storage_reply(request))
+    }
+
+    fn code_reply(&self, hashes: &[B256]) -> Result<Reply<Vec<Bytes>>, NetError> {
+        self.proof_served();
+        let world = self.inner.world.lock();
+        Self::honest(hashes.iter().filter_map(|hash| world.code(*hash)).collect())
+    }
 }
 
 impl Peers for FixturePeers {
@@ -289,26 +381,8 @@ impl Peers for FixturePeers {
         request: AccountRangeRequest,
     ) -> Result<Reply<AccountReply>, NetError> {
         self.pass_gate().await;
-        self.proof_served();
-        let mut faults = self.inner.faults.lock();
-        if faults.unavailable.contains(&request.key) {
-            return Self::honest(AccountReply::default());
-        }
-        let mut reply = self.inner.world.lock().account_reply(&request);
-        if faults.drop_proof_node.contains(&request.key) && !reply.proof.is_empty() {
-            reply.proof.remove(0);
-        }
-        if let Some((key, balance)) = faults.lie.filter(|(key, _)| *key == request.key) {
-            faults.lie = None;
-            if let Some((_, account)) = reply.accounts.iter_mut().find(|(k, _)| *k == key) {
-                account.balance = balance;
-            }
-            return Ok(Reply {
-                peer: LIAR,
-                value: reply,
-            });
-        }
-        Self::honest(reply)
+        self.on_the_wire(move |peers| peers.account_reply(&request))
+            .await?
     }
 
     async fn storage_range(
@@ -316,29 +390,14 @@ impl Peers for FixturePeers {
         request: StorageRangeRequest,
     ) -> Result<Reply<StorageReply>, NetError> {
         self.pass_gate().await;
-        self.proof_served();
-        self.inner
-            .log
-            .lock()
-            .slots
-            .push((request.account, request.slot));
-        if self
-            .inner
-            .faults
-            .lock()
-            .unavailable
-            .contains(&request.account)
-        {
-            return Self::honest(StorageReply::default());
-        }
-        Self::honest(self.inner.world.lock().storage_reply(&request))
+        self.on_the_wire(move |peers| peers.storage_reply(&request))
+            .await?
     }
 
     async fn byte_codes(&self, hashes: Vec<B256>) -> Result<Reply<Vec<Bytes>>, NetError> {
         self.pass_gate().await;
-        self.proof_served();
-        let world = self.inner.world.lock();
-        Self::honest(hashes.iter().filter_map(|hash| world.code(*hash)).collect())
+        self.on_the_wire(move |peers| peers.code_reply(&hashes))
+            .await?
     }
 
     async fn block_access_lists(
