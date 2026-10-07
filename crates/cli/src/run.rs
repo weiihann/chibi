@@ -34,6 +34,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long blocking tasks get to finish once the node has stopped.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long shutdown waits for in-flight JSON-RPC requests, so the keys they learn are saved.
+const RPC_DRAIN: Duration = Duration::from_secs(5);
 /// Log lines shown when a background start fails.
 const LOG_TAIL_LINES: usize = 20;
 
@@ -145,9 +147,14 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
     }
     tokio::select! {
         result = follower.run() => result.wrap_err("head follower stopped"),
-        () = server.stopped() => bail!("JSON-RPC server stopped"),
+        () = server.clone().stopped() => bail!("JSON-RPC server stopped"),
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
+            if server.stop().is_ok()
+                && tokio::time::timeout(RPC_DRAIN, server.stopped()).await.is_err()
+            {
+                warn!("JSON-RPC requests still running at shutdown; keys they learn are not saved");
+            }
             if let Err(err) = node.save_keys().await {
                 warn!(%err, "cannot save the learned keys");
             }
