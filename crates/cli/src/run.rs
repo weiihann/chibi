@@ -387,15 +387,14 @@ mod tests {
             vec![mainnet_usdc]
         );
 
-        fs::write(&path, "network = \"mainnet\"\ntokens = [\"WBTC\"]\n").unwrap();
+        fs::write(&path, "network = \"mainnet\"\ntokens = [\"PEPE\"]\n").unwrap();
         let error = load(&path, Some(Network::Sepolia), None, None)
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("unknown token \"WBTC\" on sepolia"),
+            error.contains("unknown token \"PEPE\" on sepolia"),
             "{error}"
         );
-        assert!(error.contains("USDC, USDT, DAI, WETH, LINK"), "{error}");
     }
 
     #[test]

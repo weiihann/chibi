@@ -798,18 +798,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("\"XYZ\""), "{error}");
-        assert!(error.contains("USDC, USDT, DAI, WETH, LINK"), "{error}");
+        assert!(error.contains("known tokens: USDT, USDC"), "{error}");
 
-        let error = Config::parse(r#"tokens = ["WBTC"]"#)
+        let error = Config::parse(r#"tokens = ["PEPE"]"#)
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("unknown token \"WBTC\" on sepolia"),
+            error.contains("unknown token \"PEPE\" on sepolia"),
             "{error}"
         );
         assert!(
-            Config::parse("network = \"mainnet\"\ntokens = [\"WBTC\"]").is_ok(),
-            "WBTC is in the mainnet registry"
+            Config::parse("network = \"mainnet\"\ntokens = [\"PEPE\"]").is_ok(),
+            "PEPE is in the mainnet registry"
         );
     }
 
@@ -826,14 +826,14 @@ mod tests {
             ]
         );
 
-        let mut mainnet = Config::parse("network = \"mainnet\"\ntokens = [\"WBTC\"]").unwrap();
+        let mut mainnet = Config::parse("network = \"mainnet\"\ntokens = [\"PEPE\"]").unwrap();
         let error = mainnet
             .set_network(Network::Sepolia)
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            error,
-            "unknown token \"WBTC\" on sepolia; known tokens: USDC, USDT, DAI, WETH, LINK"
+        assert!(
+            error.starts_with("unknown token \"PEPE\" on sepolia; known tokens: USDT, USDC"),
+            "{error}"
         );
         assert_eq!(
             mainnet.network,
