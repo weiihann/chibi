@@ -28,7 +28,9 @@ fi
 listener=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
 [ "$listener" = "$pid" ] && ok "port $PORT is held by pid $pid" || fail "port $PORT is held by '${listener:-nobody}', not $pid"
 
-grep -q "data_dir=$run_dir/home" "$run_dir/chibi.log" && ok "data dir is inside $run_dir/home" \
+esc=$(printf '\033')
+log=$(sed "s/${esc}\[[0-9;]*m//g" "$run_dir/chibi.log")
+printf '%s\n' "$log" | grep -q "data_dir=$run_dir/home" && ok "data dir is inside $run_dir/home" \
     || fail "log does not show a data dir under $run_dir/home"
 
 head_rev=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
@@ -51,12 +53,12 @@ if [ -n "$ours" ] && [ -n "$theirs" ]; then
         ok "head $(printf '%d' "$ours") is $lag block(s) behind the oracle"
     else
         fail "head $(printf '%d' "$ours") is $lag blocks behind the oracle (stale head)"
-        grep "step failed" "$run_dir/chibi.log" | tail -2
+        printf '%s\n' "$log" | grep "step failed" | tail -2
     fi
 else
     fail "could not read eth_blockNumber (chibi '${ours}', oracle '${theirs}')"
 fi
 
-last=$(grep -o 'stepped=[A-Za-z]*' "$run_dir/chibi.log" | tail -1)
+last=$(printf '%s\n' "$log" | grep -o 'stepped=[A-Za-z]*' | tail -1)
 echo "INFO  last head step: ${last:-none yet (anchored only)}"
 [ "$failures" -eq 0 ]
