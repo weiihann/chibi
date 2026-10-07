@@ -388,16 +388,15 @@ mod tests {
     }
 
     #[test]
-    fn detached_child_gets_the_absolute_config_and_repeats_the_run_flags() {
+    fn detached_child_gets_the_named_config_and_repeats_the_run_flags() {
         let path = Path::new("/cfg/chibi.toml");
+        let background = RunArgs {
+            background: true,
+            ..RunArgs::default()
+        };
+        assert_eq!(strings(detached_args(&background, None)), ["run", "--detached"]);
         assert_eq!(
-            strings(detached_args(
-                &RunArgs {
-                    background: true,
-                    ..RunArgs::default()
-                },
-                path
-            )),
+            strings(detached_args(&background, Some(path))),
             ["--config", "/cfg/chibi.toml", "run", "--detached"]
         );
         let args = RunArgs {
@@ -408,7 +407,7 @@ mod tests {
             detached: false,
         };
         assert_eq!(
-            strings(detached_args(&args, path)),
+            strings(detached_args(&args, Some(path))),
             [
                 "--config",
                 "/cfg/chibi.toml",
@@ -436,16 +435,19 @@ mod tests {
             detached: false,
         };
         let path = Path::new("/cfg/chibi.toml");
-        let argv = std::iter::once(OsString::from("chibi")).chain(detached_args(&args, path));
-        let cli = crate::Cli::try_parse_from(argv).unwrap();
-        assert_eq!(cli.config.as_deref(), Some(path));
-        let crate::Command::Run(parsed) = cli.command else {
-            panic!("detached args parse to a command other than run");
-        };
-        assert!(parsed.detached && !parsed.background);
-        assert_eq!(parsed.network, args.network);
-        assert_eq!(parsed.rpc_host, args.rpc_host);
-        assert_eq!(parsed.rpc_port, args.rpc_port);
+        for named in [Some(path), None] {
+            let argv =
+                std::iter::once(OsString::from("chibi")).chain(detached_args(&args, named));
+            let cli = crate::Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.config.as_deref(), named);
+            let crate::Command::Run(parsed) = cli.command else {
+                panic!("detached args parse to a command other than run");
+            };
+            assert!(parsed.detached && !parsed.background);
+            assert_eq!(parsed.network, args.network);
+            assert_eq!(parsed.rpc_host, args.rpc_host);
+            assert_eq!(parsed.rpc_port, args.rpc_port);
+        }
     }
 
     #[test]
@@ -460,7 +462,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "tokens = [\"USDC\"]\n").unwrap();
-        let config = load(&path, Some(Network::Mainnet), None, NonZeroU16::new(8745)).unwrap();
+        let config = load(
+            &path,
+            true,
+            Some(Network::Mainnet),
+            None,
+            NonZeroU16::new(8745),
+        )
+        .unwrap();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
         let mainnet_usdc = Network::Mainnet.spec().token("USDC").unwrap();
@@ -470,7 +479,7 @@ mod tests {
         );
 
         fs::write(&path, "network = \"mainnet\"\ntokens = [\"PEPE\"]\n").unwrap();
-        let error = load(&path, Some(Network::Sepolia), None, None)
+        let error = load(&path, true, Some(Network::Sepolia), None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -480,23 +489,46 @@ mod tests {
     }
 
     #[test]
-    fn run_without_a_config_file_uses_the_defaults() {
+    fn run_without_a_config_at_the_default_path_uses_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let config = load(&path, None, None, None).unwrap();
+        let config = load(&path, false, None, None, None).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, Vec::new()));
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
         assert!(config.tokens.is_empty() && config.contracts.is_empty());
         assert_eq!(config.data_dir, None);
         assert!(!path.exists());
 
-        let config = load(&path, Some(Network::Mainnet), None, NonZeroU16::new(8745)).unwrap();
+        let config = load(
+            &path,
+            false,
+            Some(Network::Mainnet),
+            None,
+            NonZeroU16::new(8745),
+        )
+        .unwrap();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
 
         fs::write(&path, "network = \"goerli\"\n").unwrap();
-        let error = load(&path, None, None, None).unwrap_err().to_string();
+        let error = load(&path, false, None, None, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.starts_with("invalid config "), "{error}");
+    }
+
+    #[test]
+    fn a_named_config_that_does_not_exist_is_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typo.toml");
+        let error = load(&path, true, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        let error = config(&path, true).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert_eq!(config(&path, false).unwrap(), Config::default());
+        assert!(!path.exists());
     }
 
     #[test]

@@ -535,6 +535,40 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_chibi_config_is_an_error_and_a_missing_default_is_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("typo.toml");
+        let xdg = dir.path().join("xdg");
+        let env = |chibi_config: Option<PathBuf>| {
+            let xdg = xdg.clone();
+            move |key: &str| match key {
+                "CHIBI_CONFIG" => chibi_config.clone().map(PathBuf::into_os_string),
+                "XDG_CONFIG_HOME" => Some(xdg.clone().into_os_string()),
+                _ => None,
+            }
+        };
+
+        let (path, flag) = config_paths(None, env(Some(named.clone()))).unwrap();
+        assert_eq!((&path, flag.as_deref()), (&named, Some(named.as_path())));
+        let error = run::config(&path, flag.is_some())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&named.display().to_string()), "{error}");
+
+        let (path, flag) = config_paths(Some(named.clone()), env(None)).unwrap();
+        assert_eq!((&path, flag.as_deref()), (&named, Some(named.as_path())));
+        assert!(run::config(&path, flag.is_some()).is_err());
+
+        let (path, flag) = config_paths(None, env(None)).unwrap();
+        assert_eq!(path, xdg.join("chibi").join("config.toml"));
+        assert_eq!(flag, None);
+        assert_eq!(
+            run::config(&path, flag.is_some()).unwrap(),
+            Config::default()
+        );
+    }
+
+    #[test]
     fn age_uses_largest_whole_unit() {
         let shown = [0, 59, 60, 3_599, 3_600, 86_399, 86_400, 200_000]
             .map(|seconds| Age(seconds).to_string());
