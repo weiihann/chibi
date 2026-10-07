@@ -25,7 +25,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, RpcHost, process_env};
+use crate::config::{Config, ConfigArgs, RpcHost, process_env};
 use crate::rpc::{self, RpcConfig};
 
 /// The background chibi's log, in its data directory.
@@ -59,6 +59,8 @@ pub struct RunArgs {
     /// JSON-RPC port instead of the configured one.
     #[arg(long)]
     pub rpc_port: Option<NonZeroU16>,
+    #[command(flatten)]
+    pub keys: ConfigArgs,
     /// Run in the background, logging to chibi.log in the data directory.
     #[arg(short = 'b', long)]
     pub background: bool,
@@ -84,23 +86,18 @@ pub fn config(path: &Path, named: bool) -> eyre::Result<Config> {
 }
 
 /// [`config`] with the command-line overrides applied.
-pub fn load(
-    path: &Path,
-    named: bool,
-    network: Option<Network>,
-    rpc_host: Option<RpcHost>,
-    rpc_port: Option<NonZeroU16>,
-) -> eyre::Result<Config> {
+pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
     let mut config = config(path, named)?;
-    if let Some(network) = network {
+    if let Some(network) = args.network {
         config.network = network;
     }
-    if let Some(host) = rpc_host {
-        config.rpc_host = host;
+    if let Some(host) = &args.rpc_host {
+        config.rpc_host = host.clone();
     }
-    if let Some(port) = rpc_port {
+    if let Some(port) = args.rpc_port {
         config.rpc_port = port;
     }
+    args.keys.apply(&mut config);
     Ok(config)
 }
 
@@ -116,13 +113,7 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
             .with_ansi(!args.detached)
             .init();
     }
-    let config = load(
-        path,
-        config_flag.is_some(),
-        args.network,
-        args.rpc_host.clone(),
-        args.rpc_port,
-    )?;
+    let config = load(path, config_flag.is_some(), args)?;
     let data_dir = config.network_dir(config.network, process_env)?;
     if args.background {
         return start_background(args, &config, &data_dir, config_flag);
@@ -279,10 +270,12 @@ pub fn detached_args(args: &RunArgs, config_flag: Option<&Path>) -> Vec<OsString
     if let Some(port) = args.rpc_port {
         argv.extend(["--rpc-port".into(), port.to_string().into()]);
     }
+    argv.extend(args.keys.to_args());
     argv
 }
 
-/// The `--config` and `--network` a `run` was given, for the `status` and `stop` it suggests.
+/// The `--config`, `--network` and `--data-dir` a `run` was given, for the `status` and `stop`
+/// it suggests.
 fn hint_flags(args: &RunArgs, config_flag: Option<&Path>) -> String {
     let mut flags = String::new();
     if let Some(path) = config_flag {
@@ -290,6 +283,9 @@ fn hint_flags(args: &RunArgs, config_flag: Option<&Path>) -> String {
     }
     if let Some(network) = args.network {
         flags.push_str(&format!(" --network {network}"));
+    }
+    if let Some(dir) = &args.keys.data_dir {
+        flags.push_str(&format!(" --data-dir {}", dir.display()));
     }
     flags
 }
@@ -398,7 +394,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::ConfigArgs;
 
     fn strings(argv: Vec<OsString>) -> Vec<String> {
         argv.into_iter()
@@ -410,7 +405,6 @@ mod tests {
         ConfigArgs {
             beacon_url: Some(beacon.parse().unwrap()),
             data_dir: Some(PathBuf::from(data_dir)),
-            ..ConfigArgs::default()
         }
     }
 

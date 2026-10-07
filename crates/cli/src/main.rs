@@ -23,7 +23,7 @@ use chibi_node::{Disk, Network, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 use eyre::WrapErr;
 
-use crate::config::{default_config_path, process_env};
+use crate::config::{absolute_path, default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::run::RunArgs;
 
@@ -52,17 +52,20 @@ enum Command {
     /// Follow the chain and serve JSON-RPC to the wallet.
     Run(RunArgs),
     /// Stop the chibi running in the background.
-    Stop {
-        /// Network whose chibi to stop instead of the configured one.
-        #[arg(long)]
-        network: Option<Network>,
-    },
+    Stop(Target),
     /// Show whether chibi runs and the balances saved at the last verified head.
-    Status {
-        /// Network to show instead of the configured one.
-        #[arg(long)]
-        network: Option<Network>,
-    },
+    Status(Target),
+}
+
+/// Which chibi `status` and `stop` act on, when it is not the configured one.
+#[derive(Debug, Default, PartialEq, Eq, clap::Args)]
+struct Target {
+    /// Network to act on instead of the configured one.
+    #[arg(long)]
+    network: Option<Network>,
+    /// Data directory root the chibi was started with, instead of the configured one.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    data_dir: Option<PathBuf>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -71,12 +74,11 @@ fn main() -> eyre::Result<()> {
     match cli.command {
         Command::Init(answers) => init::init(answers, &path, named.as_deref()),
         Command::Run(args) => run::run(&args, &path, named.as_deref()),
-        Command::Stop { network } => {
-            let config = run::config(&path, named.is_some())?;
-            let network = network.unwrap_or(config.network);
-            run::stop(network, &config.network_dir(network, process_env)?)
+        Command::Stop(target) => {
+            let (network, dir) = target_dir(&target, &path, named.is_some())?;
+            run::stop(network, &dir)
         }
-        Command::Status { network } => status(network, &path, named.is_some()),
+        Command::Status(target) => status(&target, &path, named.is_some()),
     }
 }
 
@@ -105,20 +107,19 @@ fn named_config(flag: Option<PathBuf>, env: impl Fn(&str) -> Option<OsString>) -
     })
 }
 
-/// The network to show and its data directory, from the defaults when there is no config file
-/// at the default path.
-fn status_target(
-    network: Option<Network>,
-    path: &Path,
-    named: bool,
-) -> eyre::Result<(Network, PathBuf)> {
-    let config = run::config(path, named)?;
-    let network = network.unwrap_or(config.network);
+/// The network `target` names and its data directory, from the defaults when there is no
+/// config file at the default path.
+fn target_dir(target: &Target, path: &Path, named: bool) -> eyre::Result<(Network, PathBuf)> {
+    let mut config = run::config(path, named)?;
+    if let Some(dir) = &target.data_dir {
+        config.data_dir = Some(dir.clone());
+    }
+    let network = target.network.unwrap_or(config.network);
     Ok((network, config.network_dir(network, process_env)?))
 }
 
-fn status(network: Option<Network>, path: &Path, named: bool) -> eyre::Result<()> {
-    let (network, data_dir) = status_target(network, path, named)?;
+fn status(target: &Target, path: &Path, named: bool) -> eyre::Result<()> {
+    let (network, data_dir) = target_dir(target, path, named)?;
     let running = Disk::running(&data_dir)?;
     let snapshot = read_snapshot(&data_dir)?;
     let written = write_full_status(
@@ -569,7 +570,9 @@ mod tests {
             let keys = match cli.command {
                 Command::Init(args) => args.keys,
                 Command::Run(args) => args.keys,
-                Command::Stop(_) | Command::Status(_) => panic!("{command} parsed to another command"),
+                Command::Stop(_) | Command::Status(_) => {
+                    panic!("{command} parsed to another command")
+                }
             };
             assert_eq!(
                 keys.beacon_url.map(String::from).as_deref(),

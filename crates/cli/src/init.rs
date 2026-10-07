@@ -17,7 +17,7 @@ use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, InquireError, Select, Text};
 
 use crate::config::{
-    Config, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, parse_address, process_env,
+    Config, ConfigArgs, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, parse_address, process_env,
 };
 
 /// How long the port check waits for a listener to accept.
@@ -38,14 +38,8 @@ pub struct InitArgs {
     /// JSON-RPC port.
     #[arg(long)]
     pub rpc_port: Option<NonZeroU16>,
-    /// Directory to keep per-network data in instead of $XDG_DATA_HOME/chibi.
-    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
-    pub data_dir: Option<PathBuf>,
-}
-
-/// `text` as an absolute path, resolved against the working directory.
-fn absolute_path(text: &str) -> Result<PathBuf, String> {
-    std::path::absolute(text).map_err(|err| format!("cannot resolve {text:?}: {err}"))
+    #[command(flatten)]
+    pub keys: ConfigArgs,
 }
 
 /// Why `chibi init` wrote nothing.
@@ -206,7 +200,7 @@ fn collect<A: Ask>(
     let mut config = Config::new(network, addresses);
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
-    config.data_dir = args.data_dir;
+    args.keys.apply(&mut config);
     let mut carried = Carried::default();
     if let Some(existing) = existing {
         if config.data_dir.is_none() {
@@ -821,7 +815,6 @@ mod tests {
         let custom = answered(ConfigArgs {
             beacon_url: Some("http://127.0.0.1:5052".parse().unwrap()),
             data_dir: Some(dir.path().join("data")),
-            ..ConfigArgs::default()
         });
         assert_eq!(custom.data_dir, Some(dir.path().join("data")));
         custom.save(&path).unwrap();

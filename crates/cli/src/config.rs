@@ -11,6 +11,7 @@ use std::str::FromStr;
 use alloy_primitives::{Address, B256, U256};
 use chibi_node::devp2p::Ports;
 use chibi_node::{Network, NodeConfig, TrackedContract, Watchlist};
+use clap::Args;
 use serde::de::{Error as _, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
@@ -61,6 +62,48 @@ pub struct Config {
         serialize_with = "serialize_contracts"
     )]
     pub contracts: Vec<TrackedContract>,
+}
+
+/// Config keys given on the command line: `chibi init` writes them into the config, and
+/// `chibi run` overrides the config with them for that run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Args)]
+pub struct ConfigArgs {
+    /// Beacon (consensus) API the light client reads sync-committee updates from, instead of
+    /// the network's default.
+    #[arg(long, value_name = "URL")]
+    pub beacon_url: Option<Url>,
+    /// Directory to keep per-network data in instead of $XDG_DATA_HOME/chibi.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    pub data_dir: Option<PathBuf>,
+}
+
+impl ConfigArgs {
+    /// Sets every key given on `config`.
+    pub fn apply(&self, config: &mut Config) {
+        if let Some(url) = &self.beacon_url {
+            config.beacon_url = Some(url.clone());
+        }
+        if let Some(dir) = &self.data_dir {
+            config.data_dir = Some(dir.clone());
+        }
+    }
+
+    /// The flags that give the same keys again.
+    pub fn to_args(&self) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = Vec::new();
+        if let Some(url) = &self.beacon_url {
+            argv.extend(["--beacon-url".into(), url.as_str().into()]);
+        }
+        if let Some(dir) = &self.data_dir {
+            argv.extend(["--data-dir".into(), dir.as_os_str().to_owned()]);
+        }
+        argv
+    }
+}
+
+/// `text` as an absolute path, resolved against the working directory.
+pub fn absolute_path(text: &str) -> Result<PathBuf, String> {
+    std::path::absolute(text).map_err(|err| format!("cannot resolve {text:?}: {err}"))
 }
 
 /// `config.toml` as written, before its values are checked.
@@ -720,7 +763,7 @@ mod tests {
             node.watch,
             Watchlist {
                 addresses: vec![ALICE],
-                contracts: config.contracts.clone(),
+                contracts: config.contracts,
             }
         );
     }
