@@ -83,8 +83,7 @@ pub fn config(path: &Path, named: bool) -> eyre::Result<Config> {
     }
 }
 
-/// [`config`] with the command-line overrides applied. A network override tracks the same
-/// token symbols at that network's addresses.
+/// [`config`] with the command-line overrides applied.
 pub fn load(
     path: &Path,
     named: bool,
@@ -94,7 +93,7 @@ pub fn load(
 ) -> eyre::Result<Config> {
     let mut config = config(path, named)?;
     if let Some(network) = network {
-        config.set_network(network)?;
+        config.network = network;
     }
     if let Some(host) = rpc_host {
         config.rpc_host = host;
@@ -162,7 +161,7 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
     info!(
         network = %node_config.network,
         watched = node_config.watch.addresses.len(),
-        tokens = node_config.watch.tokens.len(),
+        tokens = node_config.network.spec().tokens.len(),
         contracts = node_config.watch.contracts.len(),
         data_dir = %node_config.data_dir.display(),
         "starting"
@@ -394,8 +393,6 @@ pub fn stop(network: Network, dir: &Path) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     fn strings(argv: Vec<OsString>) -> Vec<String> {

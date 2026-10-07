@@ -995,7 +995,7 @@ async fn reads_queued_behind_one_busy_snap_peer_are_proven_once_and_never_time_o
     let fixture = Fixture::genesis(holders.clone());
     fixture.serve_proofs(1, Duration::from_millis(340));
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[])).await;
 
     let balances =
         futures::future::join_all(holders.iter().map(|(address, _)| balance(&node, *address)))
@@ -1013,7 +1013,7 @@ async fn reads_pipeline_sixteen_deep_to_one_snap_peer_and_never_exceed_that() {
     let fixture = Fixture::genesis(holders.clone());
     fixture.serve_proofs(16, Duration::from_millis(200));
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[])).await;
 
     let started = tokio::time::Instant::now();
     let balances =
@@ -1083,7 +1083,7 @@ fn requests(before: &Log, after: &Log, address: Address) -> (usize, usize) {
 async fn a_call_reading_six_slots_of_one_contract_proves_its_account_once() {
     let fixture = reader_world();
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[])).await;
     assert_eq!(balance(&node, ALICE).await, Some(eth(2)));
     assert_eq!(
         node.code(READER, BlockSel::Latest).await.unwrap(),
@@ -1107,7 +1107,7 @@ async fn a_call_reading_six_slots_of_one_contract_proves_its_account_once() {
 async fn slots_of_an_absent_account_or_of_empty_storage_need_no_storage_requests() {
     let fixture = reader_world();
     let dir = tempfile::tempdir().unwrap();
-    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[], &[])).await;
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watchlist(&[])).await;
 
     let before = fixture.log();
     let storage = |address| node.storage(address, U256::from(1), BlockSel::Latest);
@@ -1377,7 +1377,7 @@ fn slot_hashes(address: Address, slots: &[u64]) -> Vec<(B256, B256)> {
 async fn a_restart_opens_with_nothing_proven_then_warms_remembered_keys_newest_first() {
     let fixture = token_world(250);
     let dir = tempfile::tempdir().unwrap();
-    let watch = watchlist(&[ALICE], &[]);
+    let watch = watchlist(&[ALICE]);
     {
         let (node, _follower) = start_with(&fixture, dir.path(), &[], &watch).await;
         for slot in [1, 2, 3] {
@@ -1457,7 +1457,7 @@ async fn learned_keys_are_saved_only_when_membership_changes() {
 async fn recency_survives_a_restart_so_eviction_takes_the_key_oldest_before_it() {
     let fixture = token_world(250);
     let dir = tempfile::tempdir().unwrap();
-    let watch = watchlist(&[], &[]);
+    let watch = watchlist(&[]);
     {
         let (node, _follower) = open(&fixture, dir.path(), &[], &watch).await;
         for slot in 0..1023 {

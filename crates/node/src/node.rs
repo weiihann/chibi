@@ -98,19 +98,18 @@ pub struct NodeConfig {
     pub beacon_url: Option<Url>,
     /// Weak-subjectivity checkpoint override (a finalized beacon block root).
     pub checkpoint: Option<B256>,
-    /// Pins: watched addresses, tokens, and contracts kept proven at every head.
+    /// Pins: watched addresses and contracts kept proven at every head.
     pub watch: Watchlist,
     /// devp2p listen ports.
     pub ports: Ports,
 }
 
-/// What the user pinned. Everything else chibi keeps is learned from requests.
+/// What the user pinned. Everything else chibi keeps is learned from requests, except the
+/// keys seeding reads for every registry token of every watched address.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Watchlist {
-    /// Watch-only addresses whose accounts are kept proven.
+    /// Watch-only addresses whose accounts and registry token balances are kept proven.
     pub addresses: Vec<Address>,
-    /// Tokens whose balance keys are kept proven for every watched address.
-    pub tokens: Vec<Token>,
     /// Contract accounts and raw storage slots kept proven.
     pub contracts: Vec<TrackedContract>,
 }
@@ -249,9 +248,9 @@ pub struct Holding {
     pub balance: Option<U256>,
     /// Account nonce, `None` if not yet proven.
     pub nonce: Option<u64>,
-    /// Token balances in base units by token symbol: every pinned token, `None` until
-    /// computed, and every other registry token whose balance computes from held keys and
-    /// is nonzero.
+    /// Token balances in base units by token symbol: every registry token whose balance
+    /// computes from held keys and is nonzero. Snapshots saved before every registry token
+    /// was pinned may hold `None` for a pinned token not yet computed.
     pub tokens: Vec<(String, Option<U256>)>,
 }
 
@@ -1090,7 +1089,7 @@ impl<P: Peers> Shared<P> {
     }
 
     /// Runs ENS `reverse` for every watched address, and `balanceOf(holder)` and a zero
-    /// `transfer` to the holder from the holder for every watched address and pinned token,
+    /// `transfer` to the holder from the holder for every watched address and registry token,
     /// and pins every key any run read, whether or not the run succeeds. That covers proxies,
     /// pause flags, fee parameters, blacklists, nonstandard layouts, and the ENS registry and
     /// resolvers without per-contract code. When a run cannot complete, the previous seeded
@@ -1101,7 +1100,7 @@ impl<P: Peers> Shared<P> {
         let mut complete = true;
         for holder in &self.watch.addresses {
             let mut requests = vec![("ENS name", reverse_name(self.spec.ens_resolver, *holder))];
-            for token in &self.watch.tokens {
+            for token in self.spec.tokens {
                 requests.push((token.symbol, balance_of(token, *holder)));
                 requests.push((token.symbol, transfer_to_self(token, *holder)));
             }
@@ -1157,10 +1156,8 @@ impl<P: Peers> Shared<P> {
                         .tokens
                         .iter()
                         .filter_map(|token| {
-                            let balance = token_balance(store, &self.env, token, *address);
-                            let pinned = self.watch.tokens.contains(token);
-                            (pinned || balance.is_some_and(|balance| !balance.is_zero()))
-                                .then(|| (token.symbol.to_owned(), balance))
+                            let balance = token_balance(store, &self.env, token, *address)?;
+                            (!balance.is_zero()).then(|| (token.symbol.to_owned(), Some(balance)))
                         })
                         .collect(),
                 }

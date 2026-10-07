@@ -10,8 +10,8 @@ use std::str::FromStr;
 
 use alloy_primitives::{Address, B256, U256};
 use chibi_node::devp2p::Ports;
-use chibi_node::{Network, NodeConfig, Token, TrackedContract, Watchlist};
-use serde::de::Error as _;
+use chibi_node::{Network, NodeConfig, TrackedContract, Watchlist};
+use serde::de::{Error as _, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
@@ -32,15 +32,9 @@ const DEFAULT_CORS_ORIGINS: [&str; 2] = ["chrome-extension://*", "moz-extension:
 pub struct Config {
     /// The chain to follow.
     pub network: Network,
-    /// Watch-only addresses whose balances are tracked.
+    /// Watch-only addresses whose balances, and every registry token's, are tracked.
     #[serde(serialize_with = "serialize_addresses")]
     pub addresses: Vec<Address>,
-    /// Registry tokens pinned for every watched address: kept proven at every head.
-    #[serde(
-        skip_serializing_if = "Vec::is_empty",
-        serialize_with = "serialize_tokens"
-    )]
-    pub tokens: Vec<Token>,
     /// Beacon API endpoint; the network's default when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub beacon_url: Option<Url>,
@@ -69,7 +63,7 @@ pub struct Config {
     pub contracts: Vec<TrackedContract>,
 }
 
-/// `config.toml` as written, before token symbols are resolved against the network.
+/// `config.toml` as written, before its values are checked.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -77,8 +71,9 @@ struct ConfigFile {
     network: Network,
     #[serde(default, deserialize_with = "deserialize_addresses")]
     addresses: Vec<Address>,
+    /// A key earlier versions read, kept only to name the fix when a file still has it.
     #[serde(default)]
-    tokens: Vec<String>,
+    tokens: Option<IgnoredAny>,
     #[serde(default)]
     beacon_url: Option<Url>,
     #[serde(default)]
@@ -112,11 +107,13 @@ impl TryFrom<ConfigFile> for Config {
     type Error = InvalidConfig;
 
     fn try_from(file: ConfigFile) -> Result<Self, InvalidConfig> {
+        if file.tokens.is_some() {
+            return Err(InvalidConfig::RemovedTokens);
+        }
         if let Some(dir) = file.data_dir.as_ref().filter(|dir| !dir.is_absolute()) {
             return Err(InvalidConfig::RelativeDataDir(dir.clone()));
         }
         Ok(Self {
-            tokens: resolve_tokens(file.network, &file.tokens)?,
             contracts: parse_contracts(&file.contracts)?,
             network: file.network,
             addresses: file.addresses,
@@ -138,7 +135,6 @@ impl Config {
         Self {
             network,
             addresses,
-            tokens: Vec::new(),
             beacon_url: None,
             checkpoint: None,
             rpc_host: RpcHost::default(),
@@ -189,14 +185,6 @@ impl Config {
         std::fs::write(path, text).map_err(write_error)
     }
 
-    /// Switches to `network`, pinning the same token symbols at that network's addresses.
-    pub fn set_network(&mut self, network: Network) -> Result<(), UnknownToken> {
-        let symbols: Vec<&str> = self.tokens.iter().map(|token| token.symbol).collect();
-        self.tokens = resolve_tokens(network, &symbols)?;
-        self.network = network;
-        Ok(())
-    }
-
     /// The root of the per-network data directories: `data_dir`, else the user data directory.
     pub fn data_root(
         &self,
@@ -227,7 +215,6 @@ impl Config {
             checkpoint: self.checkpoint,
             watch: Watchlist {
                 addresses: self.addresses.clone(),
-                tokens: self.tokens.clone(),
                 contracts: self.contracts.clone(),
             },
             ports: Ports {
@@ -402,22 +389,14 @@ pub enum ResolveError {
     NoAddress(String),
 }
 
-/// A token symbol that is not in the network's registry.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("unknown token {symbol:?} on {network}; known tokens: {}", known_symbols(.network))]
-pub struct UnknownToken {
-    /// The network whose registry was searched.
-    pub network: Network,
-    /// The symbol as given.
-    pub symbol: String,
-}
-
 /// Why a config file's values were rejected after parsing.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidConfig {
-    /// A token symbol not in the network's registry.
-    #[error(transparent)]
-    Token(#[from] UnknownToken),
+    /// A `tokens` line from before every registry token was kept for watched addresses.
+    #[error(
+        "`tokens` was removed: every registry token is now kept for watched addresses; delete the `tokens` line or rerun `chibi init`"
+    )]
+    RemovedTokens,
     /// A malformed `[[contracts]]` entry.
     #[error(transparent)]
     Contract(#[from] InvalidContract),
@@ -492,32 +471,6 @@ fn parse_slot(text: &str) -> Option<U256> {
         return None;
     }
     U256::from_str_radix(hex, 16).ok()
-}
-
-fn known_symbols(network: &Network) -> String {
-    let spec = network.spec();
-    let symbols: Vec<&str> = spec.tokens.iter().map(|token| token.symbol).collect();
-    symbols.join(", ")
-}
-
-/// The registry tokens named by `symbols`, ignoring case, deduplicated in order.
-pub fn resolve_tokens<S: AsRef<str>>(
-    network: Network,
-    symbols: &[S],
-) -> Result<Vec<Token>, UnknownToken> {
-    let spec = network.spec();
-    let mut tokens = Vec::with_capacity(symbols.len());
-    for symbol in symbols {
-        let symbol = symbol.as_ref().trim();
-        let token = spec.token(symbol).ok_or_else(|| UnknownToken {
-            network,
-            symbol: symbol.to_owned(),
-        })?;
-        if !tokens.contains(&token) {
-            tokens.push(token);
-        }
-    }
-    Ok(tokens)
 }
 
 /// Reads one variable from the process environment, for the path functions below.
@@ -645,10 +598,6 @@ fn serialize_addresses<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.collect_seq(addresses.iter().map(|a| a.to_checksum(None)))
-}
-
-fn serialize_tokens<S: Serializer>(tokens: &[Token], serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.collect_seq(tokens.iter().map(|token| token.symbol))
 }
 
 fn serialize_contracts<S: Serializer>(

@@ -14,9 +14,7 @@ use clap::Args;
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, InquireError, Select, Text};
 
-use crate::config::{
-    Config, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, UnknownToken, parse_address, resolve_tokens,
-};
+use crate::config::{Config, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, parse_address};
 
 /// How long the port check waits for a listener to accept.
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -55,8 +53,6 @@ pub enum InitError {
     Ended(&'static str),
     #[error("init cancelled; nothing was written")]
     Cancelled,
-    #[error(transparent)]
-    Token(#[from] UnknownToken),
     #[error(transparent)]
     Host(#[from] InvalidRpcHost),
     #[error("prompt failed: {0}")]
@@ -112,13 +108,11 @@ pub fn init(args: InitArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Re
 struct Carried {
     data_dir: Option<PathBuf>,
     contracts: usize,
-    tokens: Vec<&'static str>,
 }
 
 /// The config to write and what it carried over, or `None` when the user keeps the existing
-/// one. An existing config that parses passes on its `tokens`, re-resolved on the chosen
-/// network, its `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`; one that
-/// does not parse is replaced outright.
+/// one. An existing config that parses passes on its `[[contracts]]` and, unless `--data-dir`
+/// is given, its `data_dir`; one that does not parse is replaced outright.
 fn collect<A: Ask>(
     ask: &mut A,
     args: InitArgs,
@@ -161,9 +155,6 @@ fn collect<A: Ask>(
         }
         carried.contracts = existing.contracts.len();
         config.contracts = existing.contracts;
-        let symbols: Vec<&str> = existing.tokens.iter().map(|token| token.symbol).collect();
-        config.tokens = resolve_tokens(network, &symbols)?;
-        carried.tokens = config.tokens.iter().map(|token| token.symbol).collect();
     }
     Ok(Some((config, carried)))
 }
@@ -426,18 +417,12 @@ fn write_next_steps<W: Write>(
 ) -> io::Result<()> {
     let count = config.addresses.len();
     let plural = if count == 1 { "" } else { "es" };
-    write!(
+    writeln!(
         output,
-        "wrote {} ({}, {count} address{plural}",
+        "wrote {} ({}, {count} address{plural})",
         path.display(),
         config.network
     )?;
-    let symbols: Vec<&str> = config.tokens.iter().map(|token| token.symbol).collect();
-    if symbols.is_empty() {
-        writeln!(output, ")")?;
-    } else {
-        writeln!(output, ", pinning {})", symbols.join(", "))?;
-    }
     if let Some(dir) = &carried.data_dir {
         writeln!(
             output,
@@ -455,13 +440,6 @@ fn write_next_steps<W: Write>(
             output,
             "kept {} [[contracts]] {entries} from the existing config",
             carried.contracts
-        )?;
-    }
-    if !carried.tokens.is_empty() {
-        writeln!(
-            output,
-            "kept tokens = [{}] from the existing config",
-            carried.tokens.join(", ")
         )?;
     }
     let flag = config_flag

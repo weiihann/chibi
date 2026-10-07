@@ -128,7 +128,7 @@ pub struct NetworkSpec {
     /// Known snap/2 peers, dialed as static peers at start because discovery can take minutes
     /// to find one.
     pub snap_peers: Vec<NodeRecord>,
-    /// Tokens chibi knows on this network. The user picks which of them to track.
+    /// Tokens chibi knows on this network. Every one is pinned for each watched address.
     pub tokens: &'static [Token],
     /// ENS's UniversalResolver, whose `reverse` gives each watched address's primary name
     /// after checking that the name resolves back to the address.

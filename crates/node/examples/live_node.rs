@@ -29,15 +29,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("usage: live_node <address>")?
         .parse()?;
     let data_dir = tempfile::tempdir()?;
-    let network = Network::Sepolia;
     let config = NodeConfig {
-        network,
+        network: Network::Sepolia,
         data_dir: data_dir.path().to_path_buf(),
         beacon_url: None,
         checkpoint: None,
         watch: Watchlist {
             addresses: vec![watched],
-            tokens: network.spec().tokens.to_vec(),
             contracts: Vec::new(),
         },
         ports: Ports {
