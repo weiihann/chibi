@@ -182,8 +182,9 @@ impl<P: Peers> Paced<P> {
     }
 }
 
-/// A held snap slot. On release it goes back to the semaphore, unless the snap/2 peers have
-/// shrunk below the slots in use, in which case it is retired.
+/// A held snap slot. On release the slots follow the snap/2 peers in both directions: the slot
+/// is retired if peers have dropped below the slots in use, and slots are added if peers have
+/// connected, so requests already queued use them without waiting for a new request.
 struct Slot<'a, P: Peers> {
     paced: &'a Paced<P>,
     permit: Option<SemaphorePermit<'a>>,
@@ -194,10 +195,14 @@ impl<P: Peers> Drop for Slot<'_, P> {
         let Some(permit) = self.permit.take() else {
             return;
         };
+        let wanted = self.paced.wanted();
         let mut capacity = self.paced.capacity.lock();
-        if *capacity > self.paced.wanted() {
+        if *capacity > wanted {
             permit.forget();
             *capacity -= 1;
+        } else if wanted > *capacity {
+            self.paced.slots.add_permits(wanted - *capacity);
+            *capacity = wanted;
         }
     }
 }
