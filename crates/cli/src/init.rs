@@ -793,10 +793,10 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_is_written_only_when_given_and_made_absolute() {
+    fn data_dir_and_beacon_url_flags_are_written_only_when_given() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let answered = |data_dir: Option<PathBuf>| {
+        let answered = |keys: ConfigArgs| {
             let mut lines = Lines {
                 input: Cursor::new(&b""[..]),
                 output: Vec::new(),
@@ -806,24 +806,35 @@ mod tests {
                 addresses: vec![ALICE],
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
-                data_dir,
+                keys,
             };
             collect(&mut lines, args, &path).unwrap().unwrap().0
         };
 
-        let plain = answered(None);
+        let plain = answered(ConfigArgs::default());
         plain.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("data_dir"), "{text}");
+        assert!(!text.contains("beacon_url"), "{text}");
         std::fs::remove_file(&path).unwrap();
 
-        let custom = answered(Some(dir.path().join("data")));
+        let custom = answered(ConfigArgs {
+            beacon_url: Some("http://127.0.0.1:5052".parse().unwrap()),
+            data_dir: Some(dir.path().join("data")),
+            ..ConfigArgs::default()
+        });
         assert_eq!(custom.data_dir, Some(dir.path().join("data")));
         custom.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("beacon_url = \"http://127.0.0.1:5052/\""),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("data_dir = {:?}", dir.path().join("data"))),
+            "{text}"
+        );
         assert_eq!(Config::load(&path).unwrap(), Some(custom));
-
-        let relative = absolute_path("data").unwrap();
-        assert!(relative.is_absolute() && relative.ends_with("data"));
     }
 
     #[test]
@@ -848,7 +859,10 @@ mod tests {
                 addresses: vec![ALICE],
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
-                data_dir,
+                keys: ConfigArgs {
+                    data_dir,
+                    ..ConfigArgs::default()
+                },
             };
             collect(&mut lines, args, &path).unwrap().unwrap()
         };

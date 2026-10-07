@@ -525,10 +525,63 @@ mod tests {
         let cli = Cli::try_parse_from(["chibi", "stop", "--network", "mainnet"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Stop {
-                network: Some(Network::Mainnet)
-            }
+            Command::Stop(Target {
+                network: Some(Network::Mainnet),
+                data_dir: None,
+            })
         ));
+    }
+
+    #[test]
+    fn status_and_stop_find_the_instance_a_data_dir_flag_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for command in ["status", "stop"] {
+            let cli = Cli::try_parse_from(["chibi", command, "--data-dir", "/srv/chibi"]).unwrap();
+            let (Command::Status(target) | Command::Stop(target)) = cli.command else {
+                panic!("{command} parsed to another command");
+            };
+            assert_eq!(
+                target_dir(&target, &path, false).unwrap(),
+                (Network::Sepolia, PathBuf::from("/srv/chibi/sepolia"))
+            );
+        }
+        let cli = Cli::try_parse_from(["chibi", "status", "--data-dir", "data"]).unwrap();
+        let Command::Status(target) = cli.command else {
+            panic!("status parsed to another command");
+        };
+        let data_dir = target.data_dir.unwrap();
+        assert!(data_dir.is_absolute() && data_dir.ends_with("data"));
+    }
+
+    #[test]
+    fn beacon_url_and_data_dir_flags_are_checked_like_the_config() {
+        for command in ["init", "run"] {
+            let cli = Cli::try_parse_from([
+                "chibi",
+                command,
+                "--beacon-url",
+                "http://127.0.0.1:5052",
+                "--data-dir",
+                "data",
+            ])
+            .unwrap();
+            let keys = match cli.command {
+                Command::Init(args) => args.keys,
+                Command::Run(args) => args.keys,
+                Command::Stop(_) | Command::Status(_) => panic!("{command} parsed to another command"),
+            };
+            assert_eq!(
+                keys.beacon_url.map(String::from).as_deref(),
+                Some("http://127.0.0.1:5052/")
+            );
+            let data_dir = keys.data_dir.unwrap();
+            assert!(data_dir.is_absolute() && data_dir.ends_with("data"));
+            let error = Cli::try_parse_from(["chibi", command, "--beacon-url", "not a url"])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a url"), "{error}");
+        }
     }
 
     #[test]

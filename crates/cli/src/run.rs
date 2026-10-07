@@ -393,12 +393,25 @@ pub fn stop(network: Network, dir: &Path) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use url::Url;
+
     use super::*;
+    use crate::config::ConfigArgs;
 
     fn strings(argv: Vec<OsString>) -> Vec<String> {
         argv.into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect()
+    }
+
+    fn keys(beacon: &str, data_dir: &str) -> ConfigArgs {
+        ConfigArgs {
+            beacon_url: Some(beacon.parse().unwrap()),
+            data_dir: Some(PathBuf::from(data_dir)),
+            ..ConfigArgs::default()
+        }
     }
 
     #[test]
@@ -420,6 +433,7 @@ mod tests {
             network: Some(Network::Mainnet),
             rpc_host: Some("chibi.local".parse().unwrap()),
             rpc_port: NonZeroU16::new(8745),
+            keys: keys("http://127.0.0.1:5052/", "/srv/chibi"),
             background: true,
             detached: false,
         };
@@ -435,7 +449,11 @@ mod tests {
                 "--rpc-host",
                 "chibi.local",
                 "--rpc-port",
-                "8745"
+                "8745",
+                "--beacon-url",
+                "http://127.0.0.1:5052/",
+                "--data-dir",
+                "/srv/chibi"
             ]
         );
     }
@@ -448,6 +466,7 @@ mod tests {
             network: Some(Network::Sepolia),
             rpc_host: Some("::1".parse().unwrap()),
             rpc_port: NonZeroU16::new(9545),
+            keys: keys("https://beacon.example/", "/srv/chibi"),
             background: true,
             detached: false,
         };
@@ -463,6 +482,7 @@ mod tests {
             assert_eq!(parsed.network, args.network);
             assert_eq!(parsed.rpc_host, args.rpc_host);
             assert_eq!(parsed.rpc_port, args.rpc_port);
+            assert_eq!(parsed.keys, args.keys);
         }
     }
 
@@ -474,26 +494,39 @@ mod tests {
     }
 
     #[test]
-    fn network_override_runs_the_other_network_and_a_tokens_line_still_fails() {
+    fn run_flags_override_the_config_for_that_run_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "rpc_port = 9545\n").unwrap();
-        let config = load(
-            &path,
-            true,
-            Some(Network::Mainnet),
-            None,
-            NonZeroU16::new(8745),
-        )
-        .unwrap();
+        let text = "rpc_port = 9545\nbeacon_url = \"https://a.example/\"\ndata_dir = \"/srv/a\"\n";
+        fs::write(&path, text).unwrap();
+        let args = RunArgs {
+            network: Some(Network::Mainnet),
+            rpc_port: NonZeroU16::new(8745),
+            keys: keys("http://127.0.0.1:5052/", "/srv/b"),
+            ..RunArgs::default()
+        };
+        let config = load(&path, true, &args).unwrap();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
+        assert_eq!(
+            config.beacon_url.as_ref().map(Url::as_str),
+            Some("http://127.0.0.1:5052/")
+        );
+        assert_eq!(
+            config.network_dir(config.network, |_| None).unwrap(),
+            PathBuf::from("/srv/b/mainnet")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+
+        let config = load(&path, true, &RunArgs::default()).unwrap();
+        assert_eq!(
+            config.beacon_url.as_ref().map(Url::as_str),
+            Some("https://a.example/")
+        );
+        assert_eq!(config.data_dir, Some(PathBuf::from("/srv/a")));
 
         fs::write(&path, "tokens = [\"USDC\"]\n").unwrap();
-        let error = format!(
-            "{:#}",
-            load(&path, true, Some(Network::Mainnet), None, None).unwrap_err()
-        );
+        let error = format!("{:#}", load(&path, true, &args).unwrap_err());
         assert!(error.contains("`tokens` was removed"), "{error}");
     }
 
@@ -501,26 +534,24 @@ mod tests {
     fn run_without_a_config_at_the_default_path_uses_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let config = load(&path, false, None, None, None).unwrap();
+        let config = load(&path, false, &RunArgs::default()).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, Vec::new()));
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
         assert!(config.contracts.is_empty());
         assert_eq!(config.data_dir, None);
         assert!(!path.exists());
 
-        let config = load(
-            &path,
-            false,
-            Some(Network::Mainnet),
-            None,
-            NonZeroU16::new(8745),
-        )
-        .unwrap();
+        let args = RunArgs {
+            network: Some(Network::Mainnet),
+            rpc_port: NonZeroU16::new(8745),
+            ..RunArgs::default()
+        };
+        let config = load(&path, false, &args).unwrap();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
 
         fs::write(&path, "network = \"goerli\"\n").unwrap();
-        let error = load(&path, false, None, None, None)
+        let error = load(&path, false, &RunArgs::default())
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("invalid config "), "{error}");
@@ -530,7 +561,9 @@ mod tests {
     fn a_named_config_that_does_not_exist_is_an_error_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("typo.toml");
-        let error = load(&path, true, None, None, None).unwrap_err().to_string();
+        let error = load(&path, true, &RunArgs::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
         let error = config(&path, true).unwrap_err().to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
@@ -572,16 +605,17 @@ mod tests {
     }
 
     #[test]
-    fn hints_repeat_the_config_and_network_flags() {
+    fn hints_repeat_the_config_network_and_data_dir_flags() {
         assert_eq!(hint_flags(&RunArgs::default(), None), "");
         let args = RunArgs {
             network: Some(Network::Mainnet),
+            keys: keys("http://127.0.0.1:5052/", "/srv/chibi"),
             background: true,
             ..RunArgs::default()
         };
         assert_eq!(
             hint_flags(&args, Some(Path::new("/cfg/chibi.toml"))),
-            " --config /cfg/chibi.toml --network mainnet"
+            " --config /cfg/chibi.toml --network mainnet --data-dir /srv/chibi"
         );
     }
 }
