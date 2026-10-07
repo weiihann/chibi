@@ -881,6 +881,36 @@ mod tests {
         assert_eq!(failed, SNAP_PER_PEER, "only the requests out at B fail");
     }
 
+    #[tokio::test]
+    async fn requests_whose_callers_gave_up_keep_their_peer_slots_until_the_peer_answers() {
+        let sessions = snap_sessions(&[A]);
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let abandoned: Vec<_> = (0..SNAP_PER_PEER)
+            .map(|_| wire.request(&load, &sessions))
+            .collect();
+        settle().await;
+        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+        for call in abandoned {
+            call.abort();
+        }
+        settle().await;
+
+        let calls: Vec<_> = (0..SNAP_PER_PEER)
+            .map(|_| wire.request(&load, &sessions))
+            .collect();
+        settle().await;
+        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+        for _ in 0..2 * SNAP_PER_PEER / 4 {
+            wire.answer(A, 4);
+            settle().await;
+            assert!(wire.outstanding(A) <= SNAP_PER_PEER);
+        }
+        for call in calls {
+            assert!(call.await.unwrap().is_ok());
+        }
+    }
+
     async fn settle() {
         for _ in 0..64 {
             tokio::task::yield_now().await;
