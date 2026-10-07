@@ -46,7 +46,7 @@ The user adds `http://127.0.0.1:8545` as a custom network in the wallet. Balance
 `chibi run` in the binary:
 
 ```rust
-let (node, follower) = Node::start(node_config).await?; // returns at a freshly verified head
+let (node, follower) = Node::start(node_config, found_state_peer).await?; // returns at a freshly verified head
 tokio::select! {
     result = follower.run() => result.wrap_err("head follower stopped"),
     result = rpc::serve(node, rpc_config) => result.wrap_err("JSON-RPC server stopped"),

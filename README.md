@@ -27,9 +27,9 @@ JSON-RPC opens as soon as the head is verified. Pinned and learned keys are prov
 
 A peer is any devp2p node chibi is connected to. A state peer is a peer that speaks snap/2, the protocol that serves the account and storage proofs chibi needs. Most Sepolia nodes do not, so chibi can have many peers and no state peer; without one, the head and state requests stall.
 
-Pinned keys come from the config: each watched address's account and its token balance slots, the keys ENS lookups read, and the slots of `[[contracts]]`. chibi proves them at start, keeps them current at every head, and never evicts them. Learned keys are the accounts and slots your wallet's requests read. chibi keeps them current too, but only the 1024 most recently used, evicting the rest.
+Pinned keys come from the config: each watched address's account and its token balance slots, the keys ENS lookups read, and the slots of `[[contracts]]`. chibi proves them at start, keeps them current at every head, and never evicts them. Learned keys are the accounts and slots your wallet's requests read. chibi keeps them current too, but the 1024 budget counts pinned and learned keys together: while the total is over 1024, the least recently used learned key is evicted. Pinned keys are never evicted, so a large pinned set leaves less room for learned keys.
 
-A key is held when it is proven at the current head. The status line counts each group as held/total, such as `pinned=3/3 learned=41/42`: 41 of the 42 learned keys are proven at the head, and the last one is still being proven.
+A key is held when it is proven at the current head. The status line counts each group as held/total, such as `pinned=3/3 learned=41/42`: 41 of the 42 learned keys are proven at the head, and one is not, because its proof failed, it is waiting for a retry, or it is not yet warmed.
 
 ## Requirements
 
