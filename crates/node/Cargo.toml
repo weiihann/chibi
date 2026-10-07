@@ -20,6 +20,7 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 alloy-trie.workspace = true
+alloy-sol-types.workspace = true
 
 helios-ethereum.workspace = true
 helios-core.workspace = true

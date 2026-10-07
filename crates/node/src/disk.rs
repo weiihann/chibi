@@ -781,6 +781,13 @@ mod tests {
         assert!(snapshot.contracts.is_empty());
     }
 
+    #[test]
+    fn a_snapshot_saved_before_names_loads_with_no_names() {
+        let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
+        assert_pre_contracts_snapshot(&snapshot);
+        assert_eq!(snapshot.holdings[0].name, None);
+    }
+
     /// Writes a legacy state file holding the pre-contracts snapshot, one outbox entry equal
     /// to `queued(1, 9)`, and `record(1, 30303)`.
     fn write_legacy_state(dir: &Path) {

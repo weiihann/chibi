@@ -23,6 +23,13 @@ const SEPOLIA_SNAP_PEERS: [&str; 5] = [
 /// Seconds per slot on every supported network.
 const SLOT_SECONDS: u64 = 12;
 
+/// ENS's UniversalResolver on Sepolia, where it fronts ENSv2.
+const SEPOLIA_ENS_RESOLVER: Address = address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
+
+/// ENS's UniversalResolver on mainnet.
+pub(crate) const MAINNET_ENS_RESOLVER: Address =
+    address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
+
 /// A supported network, as named in `config.toml` and on the command line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +64,7 @@ impl Network {
                 boot_nodes: sepolia_nodes(),
                 snap_peers: parse_nodes(SEPOLIA_SNAP_PEERS),
                 tokens: SEPOLIA_TOKENS,
+                ens_resolver: SEPOLIA_ENS_RESOLVER,
                 clock: BlockClock {
                     number: sepolia::SEPOLIA_OSAKA_BLOCK,
                     timestamp: sepolia::SEPOLIA_OSAKA_TIMESTAMP,
@@ -70,6 +78,7 @@ impl Network {
                 boot_nodes: mainnet_nodes(),
                 snap_peers: Vec::new(),
                 tokens: MAINNET_TOKENS,
+                ens_resolver: MAINNET_ENS_RESOLVER,
                 clock: BlockClock {
                     number: mainnet::MAINNET_OSAKA_BLOCK,
                     timestamp: mainnet::MAINNET_OSAKA_TIMESTAMP,
@@ -121,6 +130,9 @@ pub struct NetworkSpec {
     pub snap_peers: Vec<NodeRecord>,
     /// Tokens chibi knows on this network. The user picks which of them to track.
     pub tokens: &'static [Token],
+    /// ENS's UniversalResolver, whose `reverse` gives each watched address's primary name
+    /// after checking that the name resolves back to the address.
+    pub ens_resolver: Address,
     /// A block with a known number and timestamp, for estimating the head from the wall clock.
     pub clock: BlockClock,
 }

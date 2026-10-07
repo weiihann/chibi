@@ -58,6 +58,7 @@ alloy-consensus = { version = "2.5", features = ["k256", "serde"] }
 alloy-eips = { version = "2.5", features = ["serde"] }
 alloy-rlp = "0.3.16"
 alloy-trie = "0.9.8"
+alloy-sol-types = "1.7"
 alloy-rpc-types-eth = { version = "2.5", features = ["serde"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }

@@ -441,7 +441,7 @@ impl State {
         self.forget(evicted);
     }
 
-    /// Replaces the keys pinned by token seeding with `keys`.
+    /// Replaces the keys pinned by seeding with `keys`.
     pub fn set_seeded(&mut self, keys: BTreeSet<Key>) {
         let evicted = self.working.set_seeded(keys);
         self.forget(evicted);
