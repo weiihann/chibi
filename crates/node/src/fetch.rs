@@ -400,18 +400,6 @@ fn account_keys<'a, P: Peers>(
         .boxed()
 }
 
-/// Proves every key at `at`. Fails if any key fails.
-pub(crate) async fn keys<P: Peers>(
-    peers: &P,
-    at: &VerifiedHeader,
-    keys: Vec<Key>,
-) -> Result<Vec<Proven>, NodeError> {
-    proofs(peers, at, keys, Arc::new(Semaphore::new(CONCURRENCY)))
-        .map_err(|unproven| *unproven.error)
-        .try_collect()
-        .await
-}
-
 /// Proves each key at `at` with at most `in_flight` requests at once, yielding every proof
 /// and every failure with the keys it sank, so a key that cannot be proven never sinks the
 /// keys it does not depend on.

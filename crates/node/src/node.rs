@@ -24,6 +24,7 @@ use chibi_core::tx::{self, FeeSample, Lookup, PendingTx, VerifiedReceipt};
 use chibi_core::verify::{VerifiedBody, VerifyError};
 use chibi_core::wire::Transaction;
 use chibi_core::working::{WORKING_SET_CAP, WorkingSet};
+use futures::{StreamExt as _, future};
 use parking_lot::Mutex;
 use reth_chainspec::EthChainSpec as _;
 use serde::{Deserialize, Serialize};
@@ -1075,10 +1076,26 @@ impl<P: Peers> Shared<P> {
     }
 
     /// Proves the pins at `target` into a fresh store while the old one stays published, and
-    /// swaps. Learned keys are left to [`Shared::warm`], so none can block or abort the move.
+    /// swaps. Pins that cannot be proven stay unheld and learned keys are left to
+    /// [`Shared::warm`], so no key can block or abort the move.
     pub(crate) async fn reanchor(&self, target: VerifiedHeader) -> Result<(), NodeError> {
         let pins: Vec<Key> = self.read(|s| s.working().pins().collect());
-        let facts = fetch::keys(&self.peers, &target, pins).await?;
+        let facts: Vec<_> = fetch::each(&self.peers, &target, pins, fetch::CONCURRENCY)
+            .filter_map(|proof| {
+                future::ready(
+                    proof
+                        .inspect_err(|unproven| {
+                            debug!(
+                                target: "chibi::node",
+                                keys = ?unproven.keys, err = %unproven.error,
+                                "pins unproven at the new head; warming retries them",
+                            );
+                        })
+                        .ok(),
+                )
+            })
+            .collect()
+            .await;
         self.update(|s| s.reanchor(target, &facts))?;
         Ok(())
     }
