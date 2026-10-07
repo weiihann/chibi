@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use chibi_node::disk::Reset;
+use chibi_node::disk::{Lock, Reset};
 use chibi_node::{Disk, Network};
 use clap::Args;
 use inquire::validator::Validation;
@@ -110,9 +110,9 @@ pub fn init(args: InitArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Re
     Ok(())
 }
 
-/// Writes the config to `path`, then clears the saved state of the config's network and says
-/// what changed. Refuses, writing nothing, while a chibi runs on that network's data
-/// directory.
+/// Takes the network data directory's lock, writes the config to `path`, then clears the
+/// saved state of the config's network and says what changed, all under the lock, so no
+/// chibi starts there meanwhile. Refuses, writing nothing, while a chibi runs there.
 fn apply<W: Write>(
     output: &mut W,
     path: &Path,
@@ -129,8 +129,9 @@ fn apply<W: Write>(
             holder.pid
         );
     }
+    let lock = Lock::take(&dir)?;
     config.save(path)?;
-    let reset = Disk::reset(&dir).map_err(|err| {
+    let reset = lock.reset().map_err(|err| {
         eyre::eyre!(
             "wrote {}, but resetting the saved {} state in {} failed: {err}",
             path.display(),
@@ -645,7 +646,13 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("reset"), "{output}");
-        assert!(!dir.path().join("fresh").exists());
+        assert!(
+            !dir.path()
+                .join("fresh")
+                .join("mainnet")
+                .join("chibi.db")
+                .exists()
+        );
     }
 
     #[tokio::test]

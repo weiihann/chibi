@@ -65,7 +65,7 @@ CREATE TABLE keys (
 const REMEMBERED_PEERS: usize = 16;
 
 /// How long lock-file readers and openers retry. [`Disk::running`] briefly holds a shared lock
-/// to probe, and [`Disk::open`] writes the pid just after taking the lock.
+/// to probe, and [`Lock::take`] writes the pid just after taking the lock.
 const LOCK_RETRY: Duration = Duration::from_millis(100);
 const LOCK_POLL: Duration = Duration::from_millis(5);
 
@@ -152,9 +152,16 @@ impl Saved {
 /// An open, locked data directory. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct Disk {
-    dir: PathBuf,
     db: Mutex<Db>,
-    _lock: File,
+    lock: Lock,
+}
+
+/// The exclusive lock on a data directory, the one a running chibi holds. The lock file
+/// records the holder's process id. Dropping it releases the lock.
+#[derive(Debug)]
+pub struct Lock {
+    dir: PathBuf,
+    _file: File,
 }
 
 /// The writer's connection and what it last committed.
@@ -164,7 +171,7 @@ struct Db {
     saved: Saved,
 }
 
-/// The rows [`Disk::reset`] deleted from each table it clears.
+/// The rows [`Lock::reset`] deleted from each table it clears.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reset {
     /// Saved snapshots: zero or one.
@@ -175,13 +182,13 @@ pub struct Reset {
     pub keys: usize,
 }
 
-impl Disk {
-    /// Creates `dir` if needed, takes its exclusive lock, records this process id in the lock
-    /// file, and opens the database, importing a legacy state file into a new one.
-    pub fn open(dir: &Path) -> Result<Self, NodeError> {
+impl Lock {
+    /// Creates `dir` if needed, takes its exclusive lock, and records this process id in the
+    /// lock file. Fails while another process holds it.
+    pub fn take(dir: &Path) -> Result<Self, NodeError> {
         fs::create_dir_all(dir).map_err(|err| io_error(dir, &err))?;
         let lock_path = dir.join(LOCK_FILE);
-        let mut lock = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -190,7 +197,7 @@ impl Disk {
             .map_err(|err| io_error(&lock_path, &err))?;
         let deadline = Instant::now() + LOCK_RETRY;
         loop {
-            match lock.try_lock() {
+            match file.try_lock() {
                 Ok(()) => break,
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(LOCK_POLL);
@@ -205,15 +212,41 @@ impl Disk {
             }
         }
         let pid = std::process::id().to_string();
-        lock.set_len(0)
-            .and_then(|()| lock.write_all(pid.as_bytes()))
-            .and_then(|()| lock.sync_all())
+        file.set_len(0)
+            .and_then(|()| file.write_all(pid.as_bytes()))
+            .and_then(|()| file.sync_all())
             .map_err(|err| io_error(&lock_path, &err))?;
-        let db = open_db(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            _file: file,
+        })
+    }
+
+    /// Deletes the user state saved in the directory's database: the snapshot, the outbox
+    /// and the learned keys, in one transaction. Remembered snap/2 peers, the light-client
+    /// checkpoint and the devp2p key stay. `None` when there is no database, which is left
+    /// uncreated.
+    pub fn reset(&self) -> Result<Option<Reset>, NodeError> {
+        let path = self.dir.join(DB_FILE);
+        if !path.try_exists().map_err(|err| io_error(&path, &err))? {
+            return Ok(None);
+        }
+        let mut db = open_db(&self.dir)?;
+        clear(&mut db.conn)
+            .map(Some)
+            .map_err(|err| db_error(&path, &err))
+    }
+}
+
+impl Disk {
+    /// Takes `dir`'s [`Lock`] and opens the database, importing a legacy state file into a
+    /// new one.
+    pub fn open(dir: &Path) -> Result<Self, NodeError> {
+        let lock = Lock::take(dir)?;
+        let db = open_db(dir)?;
+        Ok(Self {
             db: Mutex::new(db),
-            _lock: lock,
+            lock,
         })
     }
 
@@ -247,22 +280,6 @@ impl Disk {
                 Err(TryLockError::Error(err)) => return Err(io_error(&lock_path, &err)),
             }
         }
-    }
-
-    /// Deletes the user state saved in `dir`'s database: the snapshot, the outbox and the
-    /// learned keys, in one transaction. Remembered snap/2 peers, the light-client checkpoint
-    /// and the devp2p key stay. Takes the lock, so it fails while a chibi runs there. `None`
-    /// when there is no database, which is left uncreated.
-    pub fn reset(dir: &Path) -> Result<Option<Reset>, NodeError> {
-        let path = dir.join(DB_FILE);
-        if !path.try_exists().map_err(|err| io_error(&path, &err))? {
-            return Ok(None);
-        }
-        let disk = Self::open(dir)?;
-        let mut db = disk.db.lock();
-        clear(&mut db.conn)
-            .map(Some)
-            .map_err(|err| db_error(&path, &err))
     }
 
     /// Records `endpoint` in `dir`'s lock file for [`Disk::running`] to report. Only the
@@ -299,7 +316,7 @@ impl Disk {
 
     /// The data directory.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        &self.lock.dir
     }
 
     /// Reads the loaded state.
@@ -326,7 +343,7 @@ impl Disk {
         let mut next = saved.clone();
         edit(&mut next);
         if next != *saved {
-            commit(conn, saved, &next).map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?;
+            commit(conn, saved, &next).map_err(|err| db_error(&self.dir().join(DB_FILE), &err))?;
             *saved = next;
         }
         Ok(written())
@@ -339,13 +356,13 @@ impl Disk {
         let mut select = db
             .conn
             .prepare("SELECT address, slot FROM keys ORDER BY position")
-            .map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?;
+            .map_err(|err| db_error(&self.dir().join(DB_FILE), &err))?;
         let rows = select
             .query_map([], |row| Ok(parse_key(row.get_ref(0)?, row.get_ref(1)?)))
-            .map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?;
+            .map_err(|err| db_error(&self.dir().join(DB_FILE), &err))?;
         let mut keys = Vec::new();
         for row in rows {
-            keys.extend(row.map_err(|err| db_error(&self.dir.join(DB_FILE), &err))?);
+            keys.extend(row.map_err(|err| db_error(&self.dir().join(DB_FILE), &err))?);
         }
         Ok(keys)
     }
@@ -354,12 +371,12 @@ impl Disk {
     /// transaction. Blocks on fsync; call it off the async workers.
     pub(crate) fn save_keys(&self, keys: &[Key]) -> Result<(), NodeError> {
         let mut db = self.db.lock();
-        write_keys(&mut db.conn, keys).map_err(|err| db_error(&self.dir.join(DB_FILE), &err))
+        write_keys(&mut db.conn, keys).map_err(|err| db_error(&self.dir().join(DB_FILE), &err))
     }
 
     /// The devp2p secret key, created on first use so the node keeps one identity.
     pub(crate) fn secret_key(&self) -> Result<SecretKey, NodeError> {
-        let path = self.dir.join(KEY_FILE);
+        let path = self.dir().join(KEY_FILE);
         match fs::read_to_string(&path) {
             Ok(text) => {
                 let bytes = hex::decode(text.trim())
@@ -650,7 +667,7 @@ impl Disk {
             .conn
             .busy_timeout(Duration::from_millis(10))
             .unwrap();
-        let other = Connection::open(self.dir.join(DB_FILE)).unwrap();
+        let other = Connection::open(self.dir().join(DB_FILE)).unwrap();
         other.execute_batch("BEGIN EXCLUSIVE").unwrap();
         other
     }
@@ -869,7 +886,7 @@ mod tests {
     #[test]
     fn reset_deletes_snapshot_outbox_and_keys_and_keeps_peers_checkpoint_and_key() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(Disk::reset(dir.path()).unwrap(), None);
+        assert_eq!(Lock::take(dir.path()).unwrap().reset().unwrap(), None);
         assert!(!dir.path().join(DB_FILE).exists());
         let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
         let key = {
@@ -887,22 +904,25 @@ mod tests {
             ])
             .unwrap();
             assert!(
-                matches!(Disk::reset(dir.path()), Err(NodeError::Disk(_))),
-                "a held directory is not reset"
+                matches!(Lock::take(dir.path()), Err(NodeError::Disk(_))),
+                "a held directory cannot be reset"
             );
             disk.secret_key().unwrap()
         };
         fs::write(dir.path().join("checkpoint"), [7u8; 32]).unwrap();
 
+        let lock = Lock::take(dir.path()).unwrap();
+        assert!(matches!(Disk::open(dir.path()), Err(NodeError::Disk(_))));
         assert_eq!(
-            Disk::reset(dir.path()).unwrap(),
+            lock.reset().unwrap(),
             Some(Reset {
                 snapshot: 1,
                 outbox: 2,
                 keys: 3,
             })
         );
-        assert_eq!(Disk::reset(dir.path()).unwrap(), Some(Reset::default()));
+        assert_eq!(lock.reset().unwrap(), Some(Reset::default()));
+        drop(lock);
         assert_eq!(read_snapshot(dir.path()).unwrap(), None);
         assert_eq!(fs::read(dir.path().join("checkpoint")).unwrap(), [7u8; 32]);
         let disk = Disk::open(dir.path()).unwrap();
