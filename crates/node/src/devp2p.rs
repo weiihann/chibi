@@ -1015,9 +1015,10 @@ mod tests {
         assert!(load.load.lock().is_empty());
 
         let no_snap = watch::Sender::new(Sessions::from([(eth, session(false))]));
+        let no_peer = wire.request(&load, &no_snap).await.unwrap().unwrap_err();
         assert_eq!(
-            wire.request(&load, &no_snap).await.unwrap(),
-            Err(NetError::NoPeer { capability: SNAP })
+            no_peer.to_string(),
+            "no connected peer serves state (snap/2)"
         );
     }
 

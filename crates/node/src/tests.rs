@@ -1265,10 +1265,10 @@ async fn a_pinned_key_that_cannot_be_proven_never_blocks_the_head() {
 }
 
 #[tokio::test]
-async fn health_counts_the_pins_and_learned_keys_the_head_holds() {
+async fn health_counts_the_pinned_and_learned_keys_the_head_holds() {
     let counts = |node: &Node<FixturePeers>| {
         let health = node.health();
-        (health.pins, health.learned, health.unheld_pins)
+        (health.pinned, health.learned, health.unheld_pinned)
     };
     let held = |held, total| Held { held, total };
     let fixture = alice_and_bob();
@@ -1310,10 +1310,10 @@ async fn health_counts_without_computing_token_balances() {
     assert_eq!(
         (
             health.peers,
-            health.snap_peers,
-            health.pins,
+            health.state_peers,
+            health.pinned,
             health.learned,
-            health.unheld_pins
+            health.unheld_pinned
         ),
         (
             1,

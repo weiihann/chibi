@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_warning_names_at_most_five_pins_unheld_at_two_lines() {
+    fn a_status_warning_names_at_most_five_pinned_keys_unheld_at_two_lines() {
         use alloy_primitives::{Address, U256};
 
         let accounts: Vec<Key> = (1..=6u8)
@@ -681,6 +681,24 @@ mod tests {
                 .map(|byte| Address::repeat_byte(byte).to_string())
                 .join(", ")
         );
+    }
+
+    #[test]
+    fn the_first_state_peer_prints_a_plain_ascii_cat() {
+        let mut out = Vec::new();
+        found_state_peer(&mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert_eq!(
+            printed,
+            concat!(
+                "  /\\_/\\\n",
+                " ( o.o )  found a state peer\n",
+                "  > ^ <\n",
+                " (\")_(\")\n",
+            )
+        );
+        assert!(printed.is_ascii());
+        assert!(printed.lines().all(|line| line == line.trim_end()));
     }
 
     #[test]
