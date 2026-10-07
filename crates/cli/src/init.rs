@@ -110,8 +110,8 @@ pub fn init(args: InitArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Re
     Ok(())
 }
 
-/// Clears the saved state of the config's network, then writes the config to `path` and
-/// says what changed. Refuses, writing nothing, while a chibi runs on that network's data
+/// Writes the config to `path`, then clears the saved state of the config's network and says
+/// what changed. Refuses, writing nothing, while a chibi runs on that network's data
 /// directory.
 fn apply<W: Write>(
     output: &mut W,
@@ -129,10 +129,18 @@ fn apply<W: Write>(
             holder.pid
         );
     }
-    if let Some(reset) = Disk::reset(&dir)? {
+    config.save(path)?;
+    let reset = Disk::reset(&dir).map_err(|err| {
+        eyre::eyre!(
+            "wrote {}, but resetting the saved {} state in {} failed: {err}",
+            path.display(),
+            config.network,
+            dir.display()
+        )
+    })?;
+    if let Some(reset) = reset {
         write_reset(output, config.network, &dir, reset)?;
     }
-    config.save(path)?;
     write_next_steps(output, path, config, carried, config_flag)?;
     Ok(())
 }
