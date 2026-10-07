@@ -2,7 +2,7 @@
 //!
 //! This file is the contract between the node implementation and the JSON-RPC layer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,15 +14,18 @@ use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, TxHash, TxKind, U256};
 use chibi_core::VerifiedHeader;
 use chibi_core::exec::{
-    self, CallRequest, ChainEnv, EstimateError, ExecError, ExecutionResult, HaltReason, Misses,
+    self, CallRequest, ChainEnv, EstimateError, ExecError, Executed, ExecutionResult, HaltReason,
+    Misses,
 };
 use chibi_core::state::{Account, Key, Miss, State, StateError, Store};
 use chibi_core::tx::{self, FeeSample, Lookup, PendingTx, VerifiedReceipt};
 use chibi_core::verify::{VerifiedBody, VerifyError};
 use chibi_core::wire::Transaction;
+use chibi_core::working::{WORKING_SET_CAP, WorkingSet};
 use parking_lot::Mutex;
 use reth_chainspec::EthChainSpec as _;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -85,27 +88,46 @@ pub struct NodeConfig {
     pub beacon_url: Option<Url>,
     /// Weak-subjectivity checkpoint override (a finalized beacon block root).
     pub checkpoint: Option<B256>,
-    /// What to track: watch-only addresses and the tokens followed for each.
+    /// Pins: watched addresses, tokens, and contracts kept proven at every head.
     pub watch: Watchlist,
     /// devp2p listen ports.
     pub ports: Ports,
 }
 
-/// What the user asked chibi to track.
+/// What the user pinned. Everything else chibi keeps is learned from requests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Watchlist {
-    /// Watch-only addresses whose accounts are proven and kept current.
+    /// Watch-only addresses whose accounts are kept proven.
     pub addresses: Vec<Address>,
-    /// Tokens whose balances are followed for every watched address.
+    /// Tokens whose balance keys are kept proven for every watched address.
     pub tokens: Vec<Token>,
-    /// Contract accounts and raw storage slots proven and kept current.
+    /// Contract accounts and raw storage slots kept proven.
     pub contracts: Vec<TrackedContract>,
 }
 
-/// A contract account tracked with some of its storage slots.
+impl Watchlist {
+    /// The configured keys: watched accounts, and each contract's account and slots.
+    pub fn pins(&self) -> impl Iterator<Item = Key> + '_ {
+        self.addresses
+            .iter()
+            .copied()
+            .map(Key::Account)
+            .chain(self.contracts.iter().flat_map(|contract| {
+                let address = contract.address;
+                std::iter::once(Key::Account(address)).chain(
+                    contract
+                        .slots
+                        .iter()
+                        .map(move |slot| Key::Slot(address, *slot)),
+                )
+            }))
+    }
+}
+
+/// A contract account pinned with some of its storage slots.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrackedContract {
-    /// The account, tracked for balance, nonce, and code hash. The code itself is fetched on
+    /// The account, kept for balance, nonce, and code hash. The code itself is fetched on
     /// first use and then kept.
     pub address: Address,
     /// Storage keys as `eth_getStorageAt` takes them, not hashed.
@@ -144,8 +166,8 @@ impl<P: Peers> Clone for Node<P> {
     }
 }
 
-/// The only task that advances the store, reanchors it, and writes the saved state.
-/// Not `Clone`: exactly one exists per node.
+/// The only task that advances the store, reanchors it, warms it, and writes the saved
+/// state. Not `Clone`: exactly one exists per node.
 #[derive(Debug)]
 pub struct Follower<P: Peers = Devp2p> {
     pub(crate) shared: Arc<Shared<P>>,
@@ -157,6 +179,8 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) search: Search,
     /// Blocks holding located transactions whose receipts are not yet verified.
     pub(crate) unreceipted: Vec<VerifiedBody>,
+    /// Token seeding has not run at the current anchor's store yet.
+    pub(crate) seed_due: bool,
 }
 
 /// Fee data for `eth_feeHistory`, oldest block first.
@@ -200,7 +224,7 @@ pub struct TxReceipt {
     pub contract_address: Option<Address>,
 }
 
-/// A watched address and its tracked balances at one block.
+/// A watched address and its token balances at one block.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holding {
     /// The watched address.
@@ -209,7 +233,8 @@ pub struct Holding {
     pub balance: Option<U256>,
     /// Account nonce, `None` if not yet proven.
     pub nonce: Option<u64>,
-    /// Token balances in base units by token symbol, `None` if not yet computed.
+    /// Token balances in base units by token symbol: every pinned token, `None` until
+    /// computed, and every other registry token whose balance computes from held keys.
     pub tokens: Vec<(String, Option<U256>)>,
 }
 
@@ -257,7 +282,7 @@ pub enum Stepped {
     Current,
     /// BALs moved the anchor forward to this block.
     Extended(BlockNumHash),
-    /// Tracked keys were re-proven at this block.
+    /// Pins were re-proven at this block; learned keys warm afterwards.
     Reanchored(BlockNumHash),
 }
 
@@ -273,11 +298,14 @@ pub(crate) struct Shared<P> {
     /// whose closures cannot await, so no guard crosses an await.
     state: Mutex<State>,
     fees: Mutex<HashMap<B256, FeeSample>>,
+    /// Wakes the follower to warm keys a request learned.
+    pub(crate) wake: Notify,
 }
 
 impl Node<Devp2p> {
     /// Opens the data dir (taking its lock), starts the light client and devp2p, and returns
-    /// once the state is anchored at a fresh verified head with every tracked key proven.
+    /// once the state is anchored at a fresh verified head. Nothing is proven yet: the
+    /// follower warms pins and remembered keys, and requests fetch what they miss.
     pub async fn start(config: NodeConfig) -> Result<(Self, Follower<Devp2p>), NodeError> {
         let spec = config.network.spec();
         let disk = Disk::open(&config.data_dir)?;
@@ -422,9 +450,10 @@ async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeE
 }
 
 impl<P: Peers> Node<P> {
-    /// Builds a node from its parts and anchors it at the light client's latest head: every
-    /// watched account is proven, token seeding runs, and pending outbox transactions are
-    /// re-broadcast.
+    /// Builds a node from its parts and anchors it at the light client's latest head with
+    /// nothing proven yet, re-broadcasting pending outbox transactions. The working set starts
+    /// with the pins; the follower's first step warms them and seeds pinned tokens, while
+    /// requests fetch whatever they miss.
     pub async fn with_parts(
         spec: NetworkSpec,
         peers: P,
@@ -434,21 +463,7 @@ impl<P: Peers> Node<P> {
     ) -> Result<(Self, Follower<P>), NodeError> {
         let trusted = wait_latest(&mut heads).await?;
         let anchor = fetch::header(&peers, trusted).await?;
-        let tracked: Vec<Key> = watch
-            .addresses
-            .iter()
-            .copied()
-            .map(Key::Account)
-            .chain(watch.contracts.iter().flat_map(|contract| {
-                let address = contract.address;
-                std::iter::once(Key::Account(address)).chain(
-                    contract
-                        .slots
-                        .iter()
-                        .map(move |slot| Key::Slot(address, *slot)),
-                )
-            }))
-            .collect();
+        let working = WorkingSet::new(WORKING_SET_CAP, watch.pins(), Vec::new());
         let outbox = disk.read(|file| file.outbox().to_vec());
         let shared = Arc::new(Shared {
             env: ChainEnv::new(Arc::clone(&spec.chain)),
@@ -456,20 +471,14 @@ impl<P: Peers> Node<P> {
             peers,
             watch: watch.clone(),
             disk,
-            state: Mutex::new(State::new(anchor.clone(), tracked)),
+            state: Mutex::new(State::new(anchor.clone(), working)),
             fees: Mutex::new(HashMap::new()),
+            wake: Notify::new(),
         });
-        shared.reanchor(anchor.clone()).await?;
         shared.restore_outbox(&outbox).await;
         shared.persist().await?;
-        let (number, keys, restored) = shared.read(|s| {
-            (
-                s.anchor().number(),
-                s.tracked().count(),
-                s.txs().has_pending(),
-            )
-        });
-        info!(target: "chibi::node", head = number, keys, "anchored");
+        let (keys, restored) = shared.read(|s| (s.working().len(), s.txs().has_pending()));
+        info!(target: "chibi::node", head = anchor.number(), keys, "anchored");
         // Restored transactions may already sit in blocks this run never passed; the search
         // reaches back to their submission anchors.
         let floor = (!restored).then(|| anchor.num_hash());
@@ -484,6 +493,7 @@ impl<P: Peers> Node<P> {
                 moves: 0,
                 search: Search::new(floor),
                 unreceipted: Vec::new(),
+                seed_due: true,
             },
         ))
     }
@@ -538,9 +548,8 @@ impl<P: Peers> Node<P> {
         let store = self.shared.pin(block)?;
         self.shared
             .resolve(store, |s| {
-                s.account(address)
-                    .map(Option::<&Account>::copied)
-                    .map_err(|miss| vec![miss])
+                let account = s.account(address).map_err(|miss| vec![miss])?;
+                Ok(Executed::one(account.copied(), Key::Account(address)))
             })
             .await
     }
@@ -555,13 +564,14 @@ impl<P: Peers> Node<P> {
         let store = self.shared.pin(block)?;
         self.shared
             .resolve(store, |s| {
-                s.slot(address, slot).map_err(|miss| {
+                let value = s.slot(address, slot).map_err(|miss| {
                     // One storage proof carries its account proof.
                     vec![match miss {
                         Miss::Account(address) => Miss::Storage(address, slot),
                         other @ (Miss::Storage(..) | Miss::Code(_) | Miss::BlockHash(_)) => other,
                     }]
-                })
+                })?;
+                Ok(Executed::one(value, Key::Slot(address, slot)))
             })
             .await
     }
@@ -571,12 +581,12 @@ impl<P: Peers> Node<P> {
         let store = self.shared.pin(block)?;
         self.shared
             .resolve(store, |s| {
+                let read = Key::Account(address);
                 let Some(account) = s.account(address).map_err(|miss| vec![miss])? else {
-                    return Ok(Bytes::new());
+                    return Ok(Executed::one(Bytes::new(), read));
                 };
-                s.code(account.code_hash)
-                    .map(|code| code.original_bytes())
-                    .map_err(|miss| vec![miss])
+                let code = s.code(account.code_hash).map_err(|miss| vec![miss])?;
+                Ok(Executed::one(code.original_bytes(), read))
             })
             .await
     }
@@ -611,11 +621,7 @@ impl<P: Peers> Node<P> {
         let env = &self.shared.env;
         let result = self
             .shared
-            .resolve(store, |s| {
-                exec::execute(s, env, &request)
-                    .map(|executed| executed.result)
-                    .map_err(misses)
-            })
+            .resolve(store, |s| exec::execute(s, env, &request).map_err(misses))
             .await?;
         result.map_err(NodeError::Exec)
     }
@@ -809,9 +815,21 @@ impl<P: Peers> Node<P> {
         }))
     }
 
+    /// The pinned and the learned keys.
     #[cfg(test)]
-    pub(crate) fn tracked(&self) -> std::collections::BTreeSet<Key> {
-        self.shared.read(|s| s.tracked().collect())
+    pub(crate) fn working(&self) -> (BTreeSet<Key>, BTreeSet<Key>) {
+        self.shared.read(|s| {
+            (
+                s.working().pins().collect(),
+                s.working().learned().collect(),
+            )
+        })
+    }
+
+    /// Whether the published store holds `key`.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, key: Key) -> bool {
+        self.shared.read(|s| s.store().holds(key))
     }
 
     /// Current status.
@@ -839,17 +857,30 @@ impl<P: Peers> Follower<P> {
                     warn!(target: "chibi::follow", %err, "step failed; retrying at the next head");
                 }
             }
-            self.heads
-                .latest
-                .changed()
-                .await
-                .map_err(|_| NodeError::Stopped)?;
+            loop {
+                tokio::select! {
+                    changed = self.heads.latest.changed() => {
+                        changed.map_err(|_| NodeError::Stopped)?;
+                        break;
+                    }
+                    () = self.shared.wake.notified() => {
+                        self.shared.warm(self.heads.latest.clone()).await;
+                    }
+                }
+            }
         }
     }
 
-    /// Moves to the newest attested head once, then persists the state.
+    /// Moves to the newest attested head once, seeds pinned tokens if due, warms unheld
+    /// keys, then persists the state.
     pub async fn step(&mut self) -> Result<Stepped, NodeError> {
         self.follow().await
+    }
+
+    /// Proves the working-set keys the store lacks, stopping at a new head.
+    #[cfg(test)]
+    pub(crate) async fn warm(&self) {
+        self.shared.warm(self.heads.latest.clone()).await;
     }
 }
 
@@ -887,19 +918,21 @@ impl<P: Peers> Shared<P> {
         }
     }
 
-    /// Runs `step` on `store`, proving its misses at the same anchor between runs, then folds
-    /// the new facts into the canonical state unless the anchor moved meanwhile.
+    /// Runs `step` on `store`, proving its misses at the same anchor between runs. Then, in
+    /// one update, learns every key the run read or fetched, even when it failed or the
+    /// anchor moved, and folds the new facts into the canonical state unless the anchor
+    /// moved. Wakes the follower if any working-set key is left unheld.
     pub(crate) async fn resolve<T>(
         &self,
         mut store: Arc<Store>,
-        step: impl Fn(&Store) -> Result<T, Vec<Miss>>,
+        step: impl Fn(&Store) -> Result<Executed<T>, Vec<Miss>>,
     ) -> Result<T, NodeError> {
         let anchor = store.anchor().hash();
         let mut facts = Vec::new();
         let mut round = 0;
-        let outcome = loop {
+        let outcome = 'rounds: loop {
             let misses = match step(&store) {
-                Ok(value) => break Ok(value),
+                Ok(executed) => break Ok(executed),
                 Err(misses) => misses,
             };
             if round == MISS_ROUNDS {
@@ -914,56 +947,75 @@ impl<P: Peers> Shared<P> {
             };
             let held = Arc::make_mut(&mut store);
             for fetched in fetched {
-                match fetched {
+                let inserted = match fetched {
                     Fetched::Proven(proven) => {
-                        held.insert(&proven)?;
+                        let inserted = held.insert(&proven);
                         facts.push(proven);
+                        inserted
                     }
-                    Fetched::Ancestors(headers) => held.insert_ancestors(headers)?,
+                    Fetched::Ancestors(headers) => held.insert_ancestors(headers),
+                };
+                if let Err(err) = inserted {
+                    break 'rounds Err(err.into());
                 }
             }
         };
-        if !facts.is_empty() {
-            self.update(|s| s.merge(anchor, &facts));
+        let (outcome, read) = match outcome {
+            Ok(executed) => (Ok(executed.result), executed.read),
+            Err(err) => (Err(err), std::collections::HashSet::new()),
+        };
+        let unheld = self.update(|s| {
+            s.learn(read.into_iter().chain(facts.iter().filter_map(|f| f.key())));
+            s.merge(anchor, &facts);
+            s.unheld().next().is_some()
+        });
+        if unheld {
+            self.wake.notify_one();
         }
         outcome
     }
 
-    /// Proves every tracked key at `target` into a fresh store while the old one stays
-    /// published, swaps, and reruns token seeding.
+    /// Proves the pins at `target` into a fresh store while the old one stays published, and
+    /// swaps. Learned keys are left to [`Shared::warm`], so none can block or abort the move.
     pub(crate) async fn reanchor(&self, target: VerifiedHeader) -> Result<(), NodeError> {
-        let keys: Vec<Key> = self.read(|s| s.tracked().collect());
-        let facts = fetch::keys(&self.peers, &target, keys).await?;
+        let pins: Vec<Key> = self.read(|s| s.working().pins().collect());
+        let facts = fetch::keys(&self.peers, &target, pins).await?;
         self.update(|s| s.reanchor(target, &facts))?;
-        self.seed().await;
         Ok(())
     }
 
     /// Runs `balanceOf(holder)` and a zero `transfer` to the holder from the holder for every
-    /// watched address and token, and tracks every key either run read, whether or not the
-    /// transfer succeeds. That covers proxies, pause flags, fee parameters, blacklists, and
-    /// nonstandard layouts without per-token code.
-    async fn seed(&self) {
+    /// watched address and pinned token, and pins every key either run read, whether or not
+    /// the transfer succeeds. That covers proxies, pause flags, fee parameters, blacklists,
+    /// and nonstandard layouts without per-token code.
+    pub(crate) async fn seed(&self) {
+        let mut seeded = BTreeSet::new();
         for holder in &self.watch.addresses {
             for token in &self.watch.tokens {
                 for request in [balance_of(token, *holder), transfer_to_self(token, *holder)] {
                     let store = self.read(State::snapshot);
-                    let seeded = self
+                    let read = self
                         .resolve(store, |s| {
-                            exec::execute(s, &self.env, &request).map_err(misses)
+                            exec::execute(s, &self.env, &request)
+                                .map(|executed| Executed {
+                                    result: executed.read.clone(),
+                                    read: executed.read,
+                                })
+                                .map_err(misses)
                         })
                         .await;
-                    match seeded {
-                        Ok(executed) => self.update(|s| s.track(executed.read)),
+                    match read {
+                        Ok(read) => seeded.extend(read),
                         Err(err) => warn!(
                             target: "chibi::node",
                             token = token.symbol, %holder, %err,
-                            "token seeding failed; its keys are fetched on demand until the next head",
+                            "token seeding failed; its keys are fetched on demand",
                         ),
                     }
                 }
             }
         }
+        self.update(|s| s.set_seeded(seeded));
     }
 
     /// The display snapshot at `store`, computed locally without fetching.
@@ -979,14 +1031,14 @@ impl<P: Peers> Shared<P> {
                     balance: account.map(|a| a.map_or(U256::ZERO, |a| a.balance)),
                     nonce: account.map(|a| a.map_or(0, |a| a.nonce)),
                     tokens: self
-                        .watch
+                        .spec
                         .tokens
                         .iter()
-                        .map(|token| {
-                            (
-                                token.symbol.to_owned(),
-                                token_balance(store, &self.env, token, *address),
-                            )
+                        .filter_map(|token| {
+                            let balance = token_balance(store, &self.env, token, *address);
+                            let pinned = self.watch.tokens.contains(token);
+                            (pinned || balance.is_some())
+                                .then(|| (token.symbol.to_owned(), balance))
                         })
                         .collect(),
                 }

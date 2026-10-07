@@ -1,10 +1,10 @@
 //! The known-key store and the canonical state around it.
 //!
 //! [`Store`] is partial state at one verified block, its anchor. [`State`] is the value the
-//! follower owns: the published store, the tracked and cached key sets, the finalized header,
-//! and the transaction book. Both are plain values, and no method performs I/O.
+//! follower owns: the published store, the working set of keys it keeps, the finalized
+//! header, and the transaction book. Both are plain values, and no method performs I/O.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use alloy_eip7928::AccountChanges;
@@ -14,9 +14,10 @@ use revm::bytecode::Bytecode;
 
 use crate::tx::TxBook;
 use crate::verify::{Fact, Proven, VerifiedBlock, VerifiedHeader};
+use crate::working::WorkingSet;
 
-/// Largest head gap closed by applying BALs. Past it, re-proving tracked keys is cheaper, and
-/// old roots fall out of what snap peers serve.
+/// Largest head gap closed by applying BALs. Past it, re-proving pins is cheaper, and old
+/// roots fall out of what snap peers serve.
 pub const MAX_BAL_GAP: u64 = 32;
 
 /// Ancestor headers held besides the anchor, so `BLOCKHASH` reaches its full 256 blocks.
@@ -307,6 +308,20 @@ impl Store {
         Ok(())
     }
 
+    /// Drops a held key. Forgetting an account forgets its slots.
+    fn forget(&mut self, key: Key) {
+        match key {
+            Key::Account(address) => {
+                self.accounts.remove(&address);
+            }
+            Key::Slot(address, slot) => {
+                if let Some(Entry::Present { slots, .. }) = self.accounts.get_mut(&address) {
+                    slots.remove(&slot);
+                }
+            }
+        }
+    }
+
     /// Makes the anchor's child the new anchor, keeping the window bounded.
     fn push_anchor(&mut self, child: VerifiedHeader) {
         let parent = std::mem::replace(&mut self.anchor, child);
@@ -316,7 +331,7 @@ impl Store {
         }
     }
 
-    /// BAL semantics after reth's `block_access_list_update`. Only held addresses change.
+    /// BAL semantics after reth's `block_access_list_update`. Only held keys change.
     fn apply_bal(&mut self, bal: &[AccountChanges]) {
         for changes in bal {
             let info = changes.account_info();
@@ -334,7 +349,11 @@ impl Store {
             if account.is_empty() {
                 continue;
             }
-            slots.extend(changes.storage_post_states());
+            for (slot, value) in changes.storage_post_states() {
+                if let Some(held) = slots.get_mut(&slot) {
+                    *held = value;
+                }
+            }
             *entry = Entry::Present { account, slots };
             if let Some((hash, code)) = info
                 .code_hash
@@ -360,37 +379,37 @@ pub enum Plan {
         /// Number of blocks from the anchor's child through the target.
         blocks: u64,
     },
-    /// Prove every tracked key at the target into a fresh store.
+    /// Prove the pins at the target into a fresh store; learned keys are warmed afterwards.
     Reanchor,
 }
 
 /// Outcome of folding a request's facts into [`State`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Merge {
-    /// The facts were inserted.
+    /// The facts for working-set keys were inserted.
     Kept,
-    /// The anchor moved while the request ran; the facts were discarded.
+    /// The anchor moved while the request ran; only code was kept.
     Dropped,
 }
 
 /// The canonical value the follower owns.
+///
+/// The store holds a key only if the working set does. Working-set keys the store lacks are
+/// unheld, and the follower proves them at the anchor.
 #[derive(Clone, Debug)]
 pub struct State {
     store: Arc<Store>,
-    tracked: HashSet<Key>,
-    cached: HashSet<Key>,
+    working: WorkingSet,
     finalized: Option<VerifiedHeader>,
     txs: TxBook,
 }
 
 impl State {
-    /// State at `anchor` with nothing held yet. `tracked` keys are proven by the first
-    /// reanchor.
-    pub fn new(anchor: VerifiedHeader, tracked: impl IntoIterator<Item = Key>) -> Self {
+    /// State at `anchor` with nothing held yet: every key of `working` starts unheld.
+    pub fn new(anchor: VerifiedHeader, working: WorkingSet) -> Self {
         Self {
             store: Arc::new(Store::new(anchor)),
-            tracked: tracked.into_iter().collect(),
-            cached: HashSet::new(),
+            working,
             finalized: None,
             txs: TxBook::default(),
         }
@@ -411,21 +430,38 @@ impl State {
         self.store.anchor()
     }
 
-    /// Keys re-proven at every reanchor.
-    pub fn tracked(&self) -> impl Iterator<Item = Key> + '_ {
-        self.tracked.iter().copied()
+    /// The keys chibi keeps.
+    pub const fn working(&self) -> &WorkingSet {
+        &self.working
     }
 
-    /// Untracked keys merged from requests. A reanchor drops them.
-    pub fn cached(&self) -> impl Iterator<Item = Key> + '_ {
-        self.cached.iter().copied()
+    /// A request read `keys`: records the use. Evicted keys' values leave the store.
+    pub fn learn(&mut self, keys: impl IntoIterator<Item = Key>) {
+        let evicted = self.working.touch(keys);
+        self.forget(evicted);
     }
 
-    /// Marks keys as tracked, as the token seeding run does with the keys it read.
-    pub fn track(&mut self, keys: impl IntoIterator<Item = Key>) {
-        for key in keys {
-            self.cached.remove(&key);
-            self.tracked.insert(key);
+    /// Replaces the keys pinned by token seeding with `keys`.
+    pub fn set_seeded(&mut self, keys: BTreeSet<Key>) {
+        let evicted = self.working.set_seeded(keys);
+        self.forget(evicted);
+    }
+
+    /// Working-set keys the store lacks: pins first, then learned keys most recently used
+    /// first.
+    pub fn unheld(&self) -> impl Iterator<Item = Key> + '_ {
+        self.working
+            .pins()
+            .chain(self.working.learned())
+            .filter(|key| !self.store.holds(*key))
+    }
+
+    fn forget(&mut self, evicted: Vec<Key>) {
+        if evicted.iter().any(|key| self.store.holds(*key)) {
+            let store = Arc::make_mut(&mut self.store);
+            for key in evicted {
+                store.forget(key);
+            }
         }
     }
 
@@ -499,10 +535,10 @@ impl State {
         Ok(())
     }
 
-    /// Replaces the store with one anchored at `target` holding `facts`. Cached keys are
-    /// dropped; code carries over because it is content-addressed. The header window carries
-    /// over when `target` is the anchor's child. Located transactions whose block is no
-    /// longer on the held chain return to pending.
+    /// Replaces the store with one anchored at `target` holding `facts`, the proven pins.
+    /// Every learned key becomes unheld. Code carries over because it is content-addressed.
+    /// The header window carries over when `target` is the anchor's child. Located
+    /// transactions whose block is no longer on the held chain return to pending.
     ///
     /// All or nothing: every fact's block is checked before the store is replaced.
     pub fn reanchor(&mut self, target: VerifiedHeader, facts: &[Proven]) -> Result<(), StateError> {
@@ -539,26 +575,30 @@ impl State {
             store.insert_unchecked(proven);
         }
         self.store = Arc::new(store);
-        self.cached.clear();
         self.txs.revalidate(&self.store);
         Ok(())
     }
 
-    /// Folds facts a request proved at `anchor` into the canonical store.
+    /// Folds facts a request proved at `anchor` into the canonical store. Facts for keys
+    /// outside the working set are skipped. If the anchor moved, only code is kept: it is
+    /// valid at every block.
     pub fn merge(&mut self, anchor: B256, facts: &[Proven]) -> Merge {
-        if anchor != self.store.anchor().hash()
-            || facts.iter().any(|proven| self.store.check(proven).is_err())
-        {
-            return Merge::Dropped;
-        }
-        let store = Arc::make_mut(&mut self.store);
-        for proven in facts {
-            store.insert_unchecked(proven);
-            if let Some(key) = proven.key().filter(|key| !self.tracked.contains(key)) {
-                self.cached.insert(key);
+        let current = anchor == self.store.anchor().hash()
+            && facts.iter().all(|proven| self.store.check(proven).is_ok());
+        let kept: Vec<&Proven> = facts
+            .iter()
+            .filter(|proven| match proven.key() {
+                None => true,
+                Some(key) => current && self.working.contains(key),
+            })
+            .collect();
+        if !kept.is_empty() {
+            let store = Arc::make_mut(&mut self.store);
+            for proven in kept {
+                store.insert_unchecked(proven);
             }
         }
-        Merge::Kept
+        if current { Merge::Kept } else { Merge::Dropped }
     }
 }
 
@@ -599,6 +639,7 @@ mod tests {
     use super::*;
     use crate::testing::{BlockWrites, World, WorldAccount, eth};
     use crate::verify::{self, VerifyError};
+    use crate::working::WORKING_SET_CAP;
     use alloy_primitives::{Bytes, address, keccak256};
     use alloy_rlp::Decodable;
 
@@ -633,7 +674,7 @@ mod tests {
         World::genesis(accounts())
     }
 
-    fn tracked() -> Vec<Key> {
+    fn pins() -> Vec<Key> {
         vec![
             Key::Account(ALICE),
             Key::Slot(TOKEN, slot(1)),
@@ -649,9 +690,10 @@ mod tests {
 
     fn anchored(world: &World) -> State {
         let head = world.verified(world.head());
-        let mut state = State::new(head.clone(), tracked());
+        let working = WorkingSet::new(WORKING_SET_CAP, pins(), Vec::new());
+        let mut state = State::new(head.clone(), working);
         state
-            .reanchor(head.clone(), &prove_all(world, &head, &tracked()))
+            .reanchor(head.clone(), &prove_all(world, &head, &pins()))
             .unwrap();
         state
     }
@@ -731,7 +773,11 @@ mod tests {
                 store.slot(TOKEN, slot(2)),
                 store.slot(TOKEN, slot(3))
             ),
-            (Ok(U256::ZERO), Ok(slot(22)), Ok(slot(33)))
+            (
+                Ok(U256::ZERO),
+                Ok(slot(22)),
+                Err(Miss::Storage(TOKEN, slot(3)))
+            )
         );
         assert_eq!(
             store.account(NEWBIE),
@@ -749,8 +795,8 @@ mod tests {
         assert_eq!(store.slot(DOOMED, slot(1)), Ok(U256::ZERO));
         assert_eq!(store.account(STRANGER), Err(Miss::Account(STRANGER)));
 
-        let mut held = tracked();
-        held.extend([Key::Slot(TOKEN, slot(3)), Key::Account(DOOMED)]);
+        let mut held = pins();
+        held.push(Key::Account(DOOMED));
         assert_matches_world(store, &world, &held);
     }
 
@@ -816,7 +862,7 @@ mod tests {
         assert_eq!(state.anchor(), &target);
         assert_eq!(state.plan(&anchor), Plan::Current);
         assert_eq!(state.store().block_hash(anchor.number()), Ok(anchor.hash()));
-        assert_matches_world(state.store(), &world, &tracked());
+        assert_matches_world(state.store(), &world, &pins());
     }
 
     #[test]
@@ -903,15 +949,13 @@ mod tests {
         let mut state = anchored(&world);
         let anchor = state.anchor().clone();
         let fact = world.prove(&anchor, Key::Account(STRANGER));
+        state.learn([Key::Account(STRANGER)]);
 
         assert_eq!(
             state.merge(anchor.hash(), std::slice::from_ref(&fact)),
             Merge::Kept
         );
-        assert_eq!(
-            state.cached().collect::<Vec<_>>(),
-            vec![Key::Account(STRANGER)]
-        );
+        assert!(state.store().holds(Key::Account(STRANGER)));
 
         let block = mine_bal(&mut world, BlockWrites::default().balance(STRANGER, eth(1)));
         state.advance(block).unwrap();
@@ -941,14 +985,67 @@ mod tests {
             })
         );
         state
-            .reanchor(target.clone(), &prove_all(&world, &target, &tracked()))
+            .reanchor(target.clone(), &prove_all(&world, &target, &pins()))
             .unwrap();
-        assert_eq!(state.cached().count(), 0);
+        assert_eq!(
+            state.unheld().collect::<Vec<_>>(),
+            vec![Key::Account(STRANGER)]
+        );
         assert_eq!(
             state.store().account(STRANGER),
             Err(Miss::Account(STRANGER))
         );
-        assert_matches_world(state.store(), &world, &tracked());
+        assert_matches_world(state.store(), &world, &pins());
+    }
+
+    #[test]
+    fn merge_keeps_only_working_set_keys_and_keeps_code_across_moves() {
+        let mut world = world();
+        let mut state = anchored(&world);
+        let anchor = state.anchor().clone();
+        let stranger = world.prove(&anchor, Key::Account(STRANGER));
+        let code = world.prove_code(keccak256([0x00]));
+        assert_eq!(
+            state.merge(anchor.hash(), std::slice::from_ref(&stranger)),
+            Merge::Kept
+        );
+        assert!(!state.store().holds(Key::Account(STRANGER)));
+
+        let block = mine_bal(&mut world, BlockWrites::default());
+        state.advance(block).unwrap();
+        assert_eq!(
+            state.merge(anchor.hash(), &[stranger, code]),
+            Merge::Dropped
+        );
+        assert_eq!(
+            state
+                .store()
+                .code(keccak256([0x00]))
+                .map(|c| c.original_bytes()),
+            Ok(Bytes::from_static(&[0x00]))
+        );
+    }
+
+    #[test]
+    fn an_evicted_key_leaves_the_store() {
+        let world = world();
+        let head = world.verified(world.head());
+        let working = WorkingSet::new(2, [Key::Account(ALICE)], Vec::new());
+        let mut state = State::new(head.clone(), working);
+        for address in [STRANGER, DOOMED] {
+            state.learn([Key::Account(address)]);
+            let fact = world.prove(&head, Key::Account(address));
+            assert_eq!(
+                state.merge(head.hash(), std::slice::from_ref(&fact)),
+                Merge::Kept
+            );
+        }
+        assert!(!state.store().holds(Key::Account(STRANGER)));
+        assert!(state.store().holds(Key::Account(DOOMED)));
+        assert_eq!(
+            state.unheld().collect::<Vec<_>>(),
+            vec![Key::Account(ALICE)]
+        );
     }
 
     #[test]
