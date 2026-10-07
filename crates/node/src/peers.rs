@@ -413,4 +413,44 @@ mod tests {
             assert!(call.await.unwrap().is_ok());
         }
     }
+
+    #[tokio::test]
+    async fn requests_queued_before_snap_peers_grow_from_one_to_four_go_out_four_at_a_time() {
+        let (arrived, mut arrivals) = mpsc::unbounded_channel();
+        let paced = Arc::new(Paced::new(Stub {
+            snap_peers: AtomicUsize::new(1),
+            arrived,
+        }));
+        let request = AccountRangeRequest {
+            root: B256::ZERO,
+            key: B256::ZERO,
+        };
+        let calls: Vec<_> = (0..9)
+            .map(|_| {
+                let paced = Arc::clone(&paced);
+                tokio::spawn(async move { paced.account_range(request).await })
+            })
+            .collect();
+
+        settle().await;
+        let first = arrivals.try_recv().unwrap();
+        assert!(arrivals.try_recv().is_err());
+
+        paced.inner.snap_peers.store(4, Ordering::SeqCst);
+        first.send(()).unwrap();
+        for _ in 0..2 {
+            settle().await;
+            let mut out = Vec::new();
+            while let Ok(answer) = arrivals.try_recv() {
+                out.push(answer);
+            }
+            assert_eq!(out.len(), 4, "requests out across four snap/2 peers");
+            for answer in out {
+                answer.send(()).unwrap();
+            }
+        }
+        for call in calls {
+            assert!(call.await.unwrap().is_ok());
+        }
+    }
 }
