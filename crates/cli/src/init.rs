@@ -815,6 +815,7 @@ mod tests {
         let custom = answered(ConfigArgs {
             beacon_url: Some("http://127.0.0.1:5052".parse().unwrap()),
             data_dir: Some(dir.path().join("data")),
+            ..ConfigArgs::default()
         });
         assert_eq!(custom.data_dir, Some(dir.path().join("data")));
         custom.save(&path).unwrap();
@@ -828,6 +829,58 @@ mod tests {
             "{text}"
         );
         assert_eq!(Config::load(&path).unwrap(), Some(custom));
+    }
+
+    #[test]
+    fn peer_flags_are_written_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let enode = format!(
+            "enode://{}@10.0.0.1:30303",
+            alloy_primitives::hex::encode([1u8; 64])
+        );
+        let answered = |keys: ConfigArgs| {
+            let mut lines = Lines {
+                input: Cursor::new(&b""[..]),
+                output: Vec::new(),
+            };
+            let args = InitArgs {
+                network: Some(Network::Mainnet),
+                addresses: vec![ALICE],
+                rpc_host: Some(RpcHost::default()),
+                rpc_port: Some(port(8545)),
+                keys,
+            };
+            collect(&mut lines, args, &path).map(|config| config.unwrap().0)
+        };
+
+        let config = answered(ConfigArgs {
+            trusted_peers: vec![enode.parse().unwrap()],
+            trusted_only: true,
+            max_inbound_peers: Some(0),
+            disable_discovery: true,
+            ..ConfigArgs::default()
+        })
+        .unwrap();
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in [
+            format!("trusted_peers = [\"{enode}\"]"),
+            "trusted_only = true".to_owned(),
+            "max_inbound_peers = 0".to_owned(),
+            "disable_discovery = true".to_owned(),
+        ] {
+            assert!(text.contains(&line), "{line} in {text}");
+        }
+        assert_eq!(Config::load(&path).unwrap(), Some(config));
+
+        let error = answered(ConfigArgs {
+            disable_discovery: true,
+            ..ConfigArgs::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("leaves nothing to dial"), "{error}");
     }
 
     #[test]

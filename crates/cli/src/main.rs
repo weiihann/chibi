@@ -556,6 +556,24 @@ mod tests {
     }
 
     #[test]
+    fn peer_flags_are_checked_like_the_config() {
+        for command in ["init", "run"] {
+            for (flag, value) in [
+                ("--trusted-peer", "enode://bad@10.0.0.1:30303"),
+                ("--boot-node", "10.0.0.1:30303"),
+                ("--max-outbound-peers", "0"),
+                ("--max-inbound-peers", "-1"),
+                ("--discovery-port", "70000"),
+            ] {
+                let error = Cli::try_parse_from(["chibi", command, flag, value])
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(value), "{command} {flag}: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn beacon_url_and_data_dir_flags_are_checked_like_the_config() {
         for command in ["init", "run"] {
             let cli = Cli::try_parse_from([

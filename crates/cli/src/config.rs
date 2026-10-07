@@ -705,9 +705,20 @@ mod tests {
         );
     }
 
+    fn enode(byte: u8, port: u16) -> String {
+        format!(
+            "enode://{}@10.0.0.{byte}:{port}",
+            alloy_primitives::hex::encode([byte; 64])
+        )
+    }
+
+    fn record(byte: u8, port: u16) -> NodeRecord {
+        enode(byte, port).parse().unwrap()
+    }
+
     #[test]
     fn full_config_parses_every_field() {
-        let config = Config::parse(
+        let config = Config::parse(&format!(
             r#"
             network = "mainnet"
             addresses = ["0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"]
@@ -718,13 +729,23 @@ mod tests {
             cors_origins = ["https://app.example", "chrome-extension://abc*"]
             allowed_hosts = ["localhost", "chibi.local:9545"]
             p2p_port = 30303
+            discovery_port = 30304
             data_dir = "/srv/chibi"
+            trusted_peers = ["{}", "{}"]
+            trusted_only = true
+            boot_nodes = ["{}"]
+            max_outbound_peers = 5
+            max_inbound_peers = 0
+            disable_discovery = true
 
             [[contracts]]
             address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
             slots = ["0x1"]
             "#,
-        )
+            enode(1, 30303),
+            enode(2, 30305),
+            enode(3, 30303)
+        ))
         .unwrap();
         assert_eq!(
             config,
@@ -744,7 +765,14 @@ mod tests {
                     AllowedHost::try_from("chibi.local:9545".to_owned()).unwrap(),
                 ],
                 p2p_port: Some(30303),
+                discovery_port: Some(30304),
                 data_dir: Some(PathBuf::from("/srv/chibi")),
+                trusted_peers: vec![record(1, 30303), record(2, 30305)],
+                trusted_only: true,
+                boot_nodes: Some(vec![record(3, 30303)]),
+                max_outbound_peers: NonZeroUsize::new(5),
+                max_inbound_peers: Some(0),
+                disable_discovery: true,
                 contracts: vec![TrackedContract {
                     address: USDC,
                     slots: vec![U256::from(1)],
@@ -753,10 +781,18 @@ mod tests {
         );
         let node = config.node_config(PathBuf::from("/data"));
         assert_eq!(
-            node.ports,
-            Ports {
-                rlpx: 30303,
-                discovery: 30303
+            node.net,
+            NetConfig {
+                ports: Ports {
+                    rlpx: 30303,
+                    discovery: 30304
+                },
+                trusted_peers: vec![record(1, 30303), record(2, 30305)],
+                trusted_only: true,
+                boot_nodes: Some(vec![record(3, 30303)]),
+                max_outbound: Some(5),
+                max_inbound: Some(0),
+                disable_discovery: true,
             }
         );
         assert_eq!(
@@ -765,6 +801,115 @@ mod tests {
                 addresses: vec![ALICE],
                 contracts: config.contracts,
             }
+        );
+    }
+
+    #[test]
+    fn peer_keys_default_to_the_networks_peers_and_reths_limits() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.node_config(PathBuf::from("/data")).net,
+            NetConfig::default()
+        );
+        config.p2p_port = Some(30310);
+        assert_eq!(
+            config.node_config(PathBuf::from("/data")).net.ports,
+            Ports {
+                rlpx: 30310,
+                discovery: 30310
+            },
+            "discovery listens on p2p_port unless discovery_port is set"
+        );
+    }
+
+    #[test]
+    fn peer_keys_save_and_load_back_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::new(Network::Mainnet, Vec::new());
+        config.trusted_peers = vec![record(1, 30303), record(2, 30305)];
+        config.trusted_only = true;
+        config.boot_nodes = Some(Vec::new());
+        config.max_outbound_peers = NonZeroUsize::new(3);
+        config.max_inbound_peers = Some(7);
+        config.discovery_port = Some(30399);
+        config.disable_discovery = true;
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in [
+            format!("trusted_peers = [\"{}\", \"{}\"]", enode(1, 30303), enode(2, 30305)),
+            "trusted_only = true".to_owned(),
+            "boot_nodes = []".to_owned(),
+            "max_outbound_peers = 3".to_owned(),
+            "max_inbound_peers = 7".to_owned(),
+            "discovery_port = 30399".to_owned(),
+            "disable_discovery = true".to_owned(),
+        ] {
+            assert!(text.contains(&line), "{line} in {text}");
+        }
+        assert_eq!(Config::load(&path).unwrap(), Some(config));
+
+        Config::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for key in [
+            "trusted",
+            "boot_nodes",
+            "max_",
+            "discovery",
+        ] {
+            assert!(!text.contains(key), "{key} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_bad_enode_is_rejected_naming_the_entry() {
+        let error = |text: String| Config::parse(&text).unwrap_err().to_string();
+        let trusted = error(format!(
+            "trusted_peers = [\"{}\", \"enode://bad@10.0.0.1:30303\"]",
+            enode(1, 30303)
+        ));
+        assert!(
+            trusted.contains("trusted_peers[1]: \"enode://bad@10.0.0.1:30303\" is not an enode URL"),
+            "{trusted}"
+        );
+        let boot = error("boot_nodes = [\"10.0.0.1:30303\"]".to_owned());
+        assert!(
+            boot.contains("boot_nodes[0]: \"10.0.0.1:30303\" is not an enode URL"),
+            "{boot}"
+        );
+        assert!(Config::parse("max_outbound_peers = 0").is_err());
+        assert!(Config::parse("discovery_port = 70000").is_err());
+    }
+
+    #[test]
+    fn trusted_only_and_disable_discovery_need_a_peer_to_dial() {
+        let error = |text: &str| Config::parse(text).unwrap_err().to_string();
+        assert!(
+            error("trusted_only = true").contains(
+                "trusted_only = true needs at least one trusted_peers entry to connect to"
+            ),
+            "{}",
+            error("trusted_only = true")
+        );
+        let nothing = "disable_discovery = true leaves nothing to dial: add trusted_peers";
+        assert!(
+            error("network = \"mainnet\"\ndisable_discovery = true").contains(nothing),
+            "mainnet has no built-in state peers"
+        );
+        let trusted_only = format!(
+            "trusted_only = true\ndisable_discovery = true\ntrusted_peers = [\"{}\"]",
+            enode(1, 30303)
+        );
+        assert!(Config::parse(&trusted_only).is_ok());
+        assert!(
+            Config::parse("disable_discovery = true").is_ok(),
+            "sepolia dials its built-in state peers"
+        );
+        let mut config = Config::parse("disable_discovery = true").unwrap();
+        config.network = Network::Mainnet;
+        assert!(
+            config.validate().unwrap_err().to_string().contains(nothing),
+            "a network switch is checked again"
         );
     }
 

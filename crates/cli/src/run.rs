@@ -405,6 +405,7 @@ mod tests {
         ConfigArgs {
             beacon_url: Some(beacon.parse().unwrap()),
             data_dir: Some(PathBuf::from(data_dir)),
+            ..ConfigArgs::default()
         }
     }
 
@@ -522,6 +523,89 @@ mod tests {
         fs::write(&path, "tokens = [\"USDC\"]\n").unwrap();
         let error = format!("{:#}", load(&path, true, &args).unwrap_err());
         assert!(error.contains("`tokens` was removed"), "{error}");
+    }
+
+    fn enode(byte: u8) -> String {
+        format!(
+            "enode://{}@10.0.0.{byte}:30303",
+            alloy_primitives::hex::encode([byte; 64])
+        )
+    }
+
+    fn run_args(argv: &[&str]) -> RunArgs {
+        use clap::Parser;
+
+        let argv = ["chibi", "run"].iter().chain(argv);
+        match crate::Cli::try_parse_from(argv).unwrap().command {
+            crate::Command::Run(args) => args,
+            other => panic!("run parsed to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_flags_override_the_config_and_reach_the_detached_child() {
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = format!(
+            "trusted_peers = [\"{}\"]\nmax_inbound_peers = 9\n",
+            enode(1)
+        );
+        fs::write(&path, text).unwrap();
+        let record = |byte| enode(byte).parse().unwrap();
+        let args = run_args(&[
+            "--trusted-peer",
+            &enode(2),
+            "--trusted-peer",
+            &enode(3),
+            "--trusted-only",
+            "--boot-node",
+            &enode(4),
+            "--max-outbound-peers",
+            "5",
+            "--max-inbound-peers",
+            "0",
+            "--discovery-port",
+            "30304",
+            "--disable-discovery",
+        ]);
+        let config = load(&path, true, &args).unwrap();
+        assert_eq!(config.trusted_peers, vec![record(2), record(3)]);
+        assert!(config.trusted_only && config.disable_discovery);
+        assert_eq!(config.boot_nodes, Some(vec![record(4)]));
+        assert_eq!(config.max_outbound_peers, NonZeroUsize::new(5));
+        assert_eq!(config.max_inbound_peers, Some(0));
+        assert_eq!(config.discovery_port, Some(30304));
+
+        let child = detached_args(&args, Some(&path))
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>();
+        let child: Vec<&str> = child.iter().skip(4).map(String::as_str).collect();
+        assert_eq!(run_args(&child).keys, args.keys);
+
+        let plain = load(&path, true, &RunArgs::default()).unwrap();
+        assert_eq!(plain.trusted_peers, vec![record(1)]);
+        assert_eq!(plain.max_inbound_peers, Some(9));
+        assert!(!plain.trusted_only && !plain.disable_discovery);
+
+        fs::write(&path, "").unwrap();
+        let error = format!(
+            "{:#}",
+            load(&path, true, &run_args(&["--trusted-only"])).unwrap_err()
+        );
+        assert!(error.contains("trusted_only = true needs"), "{error}");
+        let error = format!(
+            "{:#}",
+            load(
+                &path,
+                true,
+                &run_args(&["--network", "mainnet", "--disable-discovery"])
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("leaves nothing to dial"), "{error}");
     }
 
     #[test]

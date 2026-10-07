@@ -781,6 +781,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::network::Network;
 
     fn session(snap: bool) -> Session {
         Session {
@@ -1149,5 +1150,79 @@ mod tests {
             both_failed(NetError::Rejected, no_eth()),
             NetError::Rejected
         );
+    }
+
+    fn node(byte: u8) -> NodeRecord {
+        NodeRecord::new(([10, 0, 0, byte], 30303).into(), B512::repeat_byte(byte))
+    }
+
+    #[test]
+    fn the_default_net_config_keeps_the_networks_peers_and_reths_limits() {
+        let spec = Network::Sepolia.spec();
+        let net = NetConfig::default();
+        assert_eq!(net.boot_nodes(&spec), spec.boot_nodes.as_slice());
+        assert_eq!(
+            net.known_peers(&spec, vec![node(9)]),
+            spec.snap_peers
+                .iter()
+                .copied()
+                .chain([node(9)])
+                .collect::<Vec<_>>()
+        );
+        let peers = net.peers_config();
+        let defaults = PeersConfig::default();
+        assert!(peers.trusted_nodes.is_empty() && !peers.trusted_nodes_only);
+        assert_eq!(
+            (
+                peers.connection_info.max_outbound,
+                peers.connection_info.max_inbound
+            ),
+            (100, 30)
+        );
+        assert_eq!(
+            peers.connection_info.max_concurrent_outbound_dials,
+            defaults.connection_info.max_concurrent_outbound_dials
+        );
+    }
+
+    #[test]
+    fn configured_peers_replace_and_restrict_the_networks() {
+        let spec = Network::Sepolia.spec();
+        let net = NetConfig {
+            trusted_peers: vec![node(1), node(2)],
+            boot_nodes: Some(vec![node(3)]),
+            max_outbound: Some(5),
+            max_inbound: Some(0),
+            ..NetConfig::default()
+        };
+        assert_eq!(net.boot_nodes(&spec), [node(3)]);
+        assert_eq!(net.known_peers(&spec, Vec::new()), spec.snap_peers);
+        let peers = net.peers_config();
+        assert_eq!(
+            peers.trusted_nodes,
+            vec![TrustedPeer::from(node(1)), TrustedPeer::from(node(2))]
+        );
+        assert!(!peers.trusted_nodes_only);
+        assert_eq!(
+            (
+                peers.connection_info.max_outbound,
+                peers.connection_info.max_inbound
+            ),
+            (5, 0)
+        );
+
+        let only = NetConfig {
+            trusted_peers: vec![node(1)],
+            trusted_only: true,
+            ..NetConfig::default()
+        };
+        assert_eq!(only.boot_nodes(&spec), []);
+        assert_eq!(only.known_peers(&spec, vec![node(9)]), []);
+        assert!(only.peers_config().trusted_nodes_only);
+        let own_boot = NetConfig {
+            boot_nodes: Some(vec![node(3)]),
+            ..only
+        };
+        assert_eq!(own_boot.boot_nodes(&spec), [node(3)]);
     }
 }
