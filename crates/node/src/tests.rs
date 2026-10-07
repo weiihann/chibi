@@ -1116,3 +1116,148 @@ async fn a_bal_write_to_an_unread_slot_is_not_held() {
             .contains(&Key::Slot(PROXY, mapping_slot(BOB)))
     );
 }
+
+async fn storage(node: &Node<FixturePeers>, address: Address, slot: u64) -> U256 {
+    node.storage(address, U256::from(slot), BlockSel::Latest)
+        .await
+        .unwrap()
+}
+
+fn slot_hashes(address: Address, slots: &[u64]) -> Vec<(B256, B256)> {
+    slots
+        .iter()
+        .map(|slot| (keccak256(address), keccak256(B256::from(U256::from(*slot)))))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_restart_opens_with_nothing_proven_then_warms_remembered_keys_newest_first() {
+    let fixture = token_world(250);
+    let dir = tempfile::tempdir().unwrap();
+    let watch = watchlist(&[ALICE], &[]);
+    {
+        let (node, _follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+        for slot in [1, 2, 3] {
+            assert_eq!(storage(&node, PROXY, slot).await, U256::ZERO);
+        }
+        node.save_keys().await.unwrap();
+    }
+
+    let before = fixture.log();
+    let (node, mut follower) = open(&fixture, dir.path(), &[], &watch).await;
+    assert_eq!(fixture.log().proofs, before.proofs);
+    assert_eq!(
+        node.working().1,
+        BTreeSet::from([
+            Key::Account(PROXY),
+            Key::Slot(PROXY, U256::from(1)),
+            Key::Slot(PROXY, U256::from(2)),
+            Key::Slot(PROXY, U256::from(3)),
+        ])
+    );
+    assert!(!node.holds(Key::Slot(PROXY, U256::from(3))));
+
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    assert_eq!(fixture.log().proofs, before.proofs + 7);
+    assert_eq!(
+        fixture.log().slots[before.slots.len()..],
+        slot_hashes(PROXY, &[3, 2, 1])
+    );
+    assert_eq!(storage(&node, PROXY, 1).await, U256::ZERO);
+    assert_eq!(fixture.log().proofs, before.proofs + 7);
+}
+
+#[tokio::test]
+async fn learned_keys_are_saved_only_when_membership_changes() {
+    let fixture = alice_and_bob();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    let saved = |follower: &Follower<FixturePeers>| follower.shared.disk.load_keys().unwrap();
+    let extend = async |follower: &mut Follower<FixturePeers>| {
+        fixture.mine(BlockWrites::default());
+        assert!(matches!(
+            follower.step().await.unwrap(),
+            Stepped::Extended(_)
+        ));
+    };
+
+    assert_eq!(balance(&node, BOB).await, Some(eth(3)));
+    assert_eq!(balance(&node, CAROL).await, None);
+    for _ in 0..4 {
+        extend(&mut follower).await;
+    }
+    assert_eq!(saved(&follower), vec![]);
+    extend(&mut follower).await;
+    assert_eq!(
+        saved(&follower),
+        vec![Key::Account(CAROL), Key::Account(BOB)]
+    );
+
+    for _ in 0..12 {
+        assert_eq!(balance(&node, BOB).await, Some(eth(3)));
+        assert_eq!(balance(&node, ALICE).await, Some(eth(2)));
+        extend(&mut follower).await;
+    }
+    assert_eq!(
+        saved(&follower),
+        vec![Key::Account(CAROL), Key::Account(BOB)]
+    );
+
+    node.save_keys().await.unwrap();
+    assert_eq!(
+        saved(&follower),
+        vec![Key::Account(BOB), Key::Account(CAROL)]
+    );
+}
+
+#[tokio::test]
+async fn recency_survives_a_restart_so_eviction_takes_the_key_oldest_before_it() {
+    let fixture = token_world(250);
+    let dir = tempfile::tempdir().unwrap();
+    let watch = watchlist(&[], &[]);
+    {
+        let (node, _follower) = open(&fixture, dir.path(), &[], &watch).await;
+        for slot in 0..1023 {
+            storage(&node, PROXY, slot).await;
+        }
+        storage(&node, PROXY, 0).await;
+        assert_eq!(node.working().1.len(), 1024);
+        node.save_keys().await.unwrap();
+    }
+
+    let (node, _follower) = open(&fixture, dir.path(), &[], &watch).await;
+    assert_eq!(node.working().1.len(), 1024);
+    storage(&node, PROXY, 5000).await;
+    let learned = node.working().1;
+    assert_eq!(learned.len(), 1024);
+    assert!(!learned.contains(&Key::Slot(PROXY, U256::from(1))));
+    assert!(learned.contains(&Key::Slot(PROXY, U256::from(0))));
+    assert!(learned.contains(&Key::Slot(PROXY, U256::from(2))));
+    assert!(learned.contains(&Key::Slot(PROXY, U256::from(5000))));
+}
+
+#[tokio::test]
+async fn garbage_key_rows_are_skipped_and_cost_nothing_else() {
+    let fixture = alice_and_bob();
+    let dir = tempfile::tempdir().unwrap();
+    Disk::open(dir.path())
+        .unwrap()
+        .save_keys(&[Key::Account(BOB)])
+        .unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("chibi.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO keys (position, address, slot) VALUES
+            (1, x'0b0b', NULL),
+            (2, x'0000000000000000000000000000000000000b0b', x'01'),
+            (3, 'not an address', NULL),
+            (4, x'0000000000000000000000000000000000000b0b', 7);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+    assert_eq!(node.working().1, BTreeSet::from([Key::Account(BOB)]));
+    assert_eq!(fixture.log().proofs, 2);
+    assert_eq!(balance(&node, BOB).await, Some(eth(3)));
+    assert_eq!(fixture.log().proofs, 2);
+}

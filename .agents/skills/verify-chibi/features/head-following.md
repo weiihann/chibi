@@ -35,3 +35,4 @@ Preconditions:
 - `chibi status` values are a display snapshot from disk. They prove persistence, not verification.
 - After the fork, an `Extended` step makes no proof requests for keys chibi holds; only unheld keys are warmed. Compare the values with `oracle-check.sh` anyway; that is the only check that the access list was applied correctly.
 - Before the fork, learned keys only partly re-warm between heads, so a repeated `eth_call` may still fetch. That is expected.
+- Learned keys survive a restart in `chibi.db`, so a second `chibi run` on the same data directory logs a larger `anchored ... keys=` than the first and warms those keys in the background, most recently used first.

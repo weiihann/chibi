@@ -77,6 +77,12 @@ const CHECKPOINT_BYTES: u64 = 32;
 /// How often `start` reports that it is still waiting for a snap/2 peer.
 const SNAP_PEER_PROGRESS: Duration = Duration::from_secs(30);
 
+/// Fewest head moves between two saves of learned keys whose membership changed.
+const KEYS_SAVE_HEADS: u64 = 5;
+
+/// How old the last save of learned keys must be before a change of recency alone is saved.
+const KEYS_SAVE_RECENCY: Duration = Duration::from_secs(60 * 60);
+
 /// Everything `Node::start` needs. The CLI builds it from the config file and flags.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -300,6 +306,17 @@ pub(crate) struct Shared<P> {
     fees: Mutex<HashMap<B256, FeeSample>>,
     /// Wakes the follower to warm keys a request learned.
     pub(crate) wake: Notify,
+    keys_saved: Mutex<KeysSaved>,
+}
+
+/// The working set's counts when the learned keys were last saved, and when that was.
+#[derive(Debug)]
+struct KeysSaved {
+    membership: u64,
+    recency: u64,
+    /// The follower's head moves at that save.
+    moves: u64,
+    at: Instant,
 }
 
 impl Node<Devp2p> {
@@ -452,8 +469,8 @@ async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeE
 impl<P: Peers> Node<P> {
     /// Builds a node from its parts and anchors it at the light client's latest head with
     /// nothing proven yet, re-broadcasting pending outbox transactions. The working set starts
-    /// with the pins; the follower's first step warms them and seeds pinned tokens, while
-    /// requests fetch whatever they miss.
+    /// with the pins and the learned keys the last run saved; the follower's first step warms
+    /// them and seeds pinned tokens, while requests fetch whatever they miss.
     pub async fn with_parts(
         spec: NetworkSpec,
         peers: P,
@@ -463,7 +480,13 @@ impl<P: Peers> Node<P> {
     ) -> Result<(Self, Follower<P>), NodeError> {
         let trusted = wait_latest(&mut heads).await?;
         let anchor = fetch::header(&peers, trusted).await?;
-        let working = WorkingSet::new(WORKING_SET_CAP, watch.pins(), Vec::new());
+        let working = WorkingSet::new(WORKING_SET_CAP, watch.pins(), disk.load_keys()?);
+        let keys_saved = KeysSaved {
+            membership: working.membership(),
+            recency: working.recency(),
+            moves: 0,
+            at: Instant::now(),
+        };
         let outbox = disk.read(|file| file.outbox().to_vec());
         let shared = Arc::new(Shared {
             env: ChainEnv::new(Arc::clone(&spec.chain)),
@@ -474,6 +497,7 @@ impl<P: Peers> Node<P> {
             state: Mutex::new(State::new(anchor.clone(), working)),
             fees: Mutex::new(HashMap::new()),
             wake: Notify::new(),
+            keys_saved: Mutex::new(keys_saved),
         });
         shared.restore_outbox(&outbox).await;
         shared.persist().await?;
@@ -815,6 +839,11 @@ impl<P: Peers> Node<P> {
         }))
     }
 
+    /// Saves the learned keys if they changed since the last save. Called on clean shutdown.
+    pub async fn save_keys(&self) -> Result<(), NodeError> {
+        self.shared.save_keys(None).await
+    }
+
     /// The pinned and the learned keys.
     #[cfg(test)]
     pub(crate) fn working(&self) -> (BTreeSet<Key>, BTreeSet<Key>) {
@@ -1089,6 +1118,41 @@ impl<P: Peers> Shared<P> {
                 file.set_snapshot(shared.snapshot(&store));
                 file.remember_peers(&census.snap_records);
             })
+        })
+        .await
+    }
+
+    /// Saves the learned keys when due: after a membership change once [`KEYS_SAVE_HEADS`]
+    /// head moves passed since the last save, after a recency change once that save is
+    /// [`KEYS_SAVE_RECENCY`] old, and on any change when `moves` is `None` (shutdown).
+    pub(crate) async fn save_keys(self: &Arc<Self>, moves: Option<u64>) -> Result<(), NodeError> {
+        let shared = Arc::clone(self);
+        blocking(move || {
+            let mut saved = shared.keys_saved.lock();
+            let Some((membership, recency, keys)) = shared.read(|s| {
+                let working = s.working();
+                let (membership, recency) = (working.membership(), working.recency());
+                let changed = membership != saved.membership;
+                let reordered = recency != saved.recency;
+                let due = match moves {
+                    None => changed || reordered,
+                    Some(moves) => {
+                        (changed && moves >= saved.moves + KEYS_SAVE_HEADS)
+                            || (reordered && saved.at.elapsed() >= KEYS_SAVE_RECENCY)
+                    }
+                };
+                due.then(|| (membership, recency, working.remembered()))
+            }) else {
+                return Ok(());
+            };
+            shared.disk.save_keys(&keys)?;
+            *saved = KeysSaved {
+                membership,
+                recency,
+                moves: moves.unwrap_or(saved.moves),
+                at: Instant::now(),
+            };
+            Ok(())
         })
         .await
     }

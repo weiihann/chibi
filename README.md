@@ -19,7 +19,7 @@ The design and its tradeoffs are in [docs/DESIGN.md](docs/DESIGN.md). The decisi
 
 chibi remembers the state your wallet and dapps read. You don't pick tokens. Watched addresses, plus any `tokens` or `[[contracts]]` in the config, are pins: they are kept proven at every head and are never dropped. Everything else a request reads is remembered, up to 1024 keys, dropping the least recently used. It is kept current at every head.
 
-Remembered keys are not yet saved across restarts; after a restart chibi keeps only the pins and relearns the rest as they are read.
+Remembered keys survive restarts: chibi saves them in `chibi.db`, most recently used first, and after a restart proves them again in that order in the background. Pins are not saved; they come from the config at every start.
 
 JSON-RPC opens as soon as the head is verified. Pins and other keys are proven in the background, and anything not yet proven is fetched with a proof on first use.
 
@@ -98,7 +98,7 @@ The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 da
 | `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
 | `contracts` | none | Contract accounts and storage slots to pin, see below |
 
-Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, and remembered peers, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi run` and then deleted. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
+Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, remembered peers, and remembered keys, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi run` and then deleted. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config`.
 
 ### Pinning contracts and storage slots
 

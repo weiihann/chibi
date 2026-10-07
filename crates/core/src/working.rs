@@ -27,6 +27,10 @@ pub struct WorkingSet {
     by_age: BTreeSet<(u64, Key)>,
     /// The next use's tick. Each `touch` is one use.
     tick: u64,
+    /// Counts changes to which keys are learned.
+    membership: u64,
+    /// Counts uses that moved an already learned key ahead.
+    recency: u64,
 }
 
 impl WorkingSet {
@@ -44,6 +48,8 @@ impl WorkingSet {
             learned: BTreeMap::new(),
             by_age: BTreeSet::new(),
             tick: 0,
+            membership: 0,
+            recency: 0,
         };
         for key in remembered.into_iter().rev() {
             set.touch_one(key);
@@ -78,6 +84,16 @@ impl WorkingSet {
         self.len() == 0
     }
 
+    /// A count that changes whenever a key is learned or dropped.
+    pub const fn membership(&self) -> u64 {
+        self.membership
+    }
+
+    /// A count that changes whenever a use moves an already learned key ahead.
+    pub const fn recency(&self) -> u64 {
+        self.recency
+    }
+
     /// The learned keys to persist, most recently used first: what [`WorkingSet::new`] takes
     /// back as `remembered`.
     pub fn remembered(&self) -> Vec<Key> {
@@ -108,6 +124,7 @@ impl WorkingSet {
         for key in &self.seeded {
             if let Some(tick) = self.learned.remove(key) {
                 self.by_age.remove(&(tick, *key));
+                self.membership += 1;
             }
         }
         self.touch(dropped)
@@ -129,8 +146,13 @@ impl WorkingSet {
             return;
         }
         let tick = self.tick;
-        if let Some(old) = self.learned.insert(key, tick) {
-            self.by_age.remove(&(old, key));
+        match self.learned.insert(key, tick) {
+            None => self.membership += 1,
+            Some(old) if old != tick => {
+                self.by_age.remove(&(old, key));
+                self.recency += 1;
+            }
+            Some(_) => {}
         }
         self.by_age.insert((tick, key));
     }
@@ -144,6 +166,7 @@ impl WorkingSet {
                 break;
             };
             self.learned.remove(&oldest);
+            self.membership += 1;
             evicted.push(oldest);
             if let Key::Account(address) = oldest {
                 let slots: Vec<(Key, u64)> = self
@@ -239,6 +262,25 @@ mod tests {
             set.learned().collect::<Vec<_>>(),
             vec![account(A), slot, account(X)]
         );
+    }
+
+    #[test]
+    fn membership_counts_learned_and_dropped_keys_and_recency_counts_reuse() {
+        let mut set = WorkingSet::new(2, [account(P)], Vec::new());
+        let start = (set.membership(), set.recency());
+        set.touch([account(A)]);
+        assert_eq!((set.membership(), set.recency()), (start.0 + 1, start.1));
+        set.touch([account(A), account(P)]);
+        assert_eq!(
+            (set.membership(), set.recency()),
+            (start.0 + 1, start.1 + 1)
+        );
+        set.touch([account(B)]);
+        assert_eq!(
+            (set.membership(), set.recency()),
+            (start.0 + 3, start.1 + 1)
+        );
+        assert_eq!(set.remembered(), vec![account(B)]);
     }
 
     #[test]

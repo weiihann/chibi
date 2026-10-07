@@ -139,7 +139,7 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
             return Ok(());
         }
     };
-    let server = rpc::start(node, served.rpc, served.listener)?;
+    let server = rpc::start(node.clone(), served.rpc, served.listener)?;
     if let Err(err) = Disk::announce(&data_dir, &served.url) {
         warn!(%err, "cannot record the JSON-RPC URL for `chibi status`");
     }
@@ -148,6 +148,9 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
         () = server.stopped() => bail!("JSON-RPC server stopped"),
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
+            if let Err(err) = node.save_keys().await {
+                warn!(%err, "cannot save the learned keys");
+            }
             Ok(())
         }
     }

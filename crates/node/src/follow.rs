@@ -160,6 +160,7 @@ impl<P: Peers> Follower<P> {
         self.collect_receipts().await;
 
         shared.persist().await?;
+        shared.save_keys(Some(self.moves)).await?;
         shared.peers.announce(&anchor);
         Ok(stepped)
     }
