@@ -628,7 +628,7 @@ mod tests {
         assert!(
             output.starts_with(&format!(
                 "reset the saved mainnet state in {}: deleted 1 snapshot, 0 pending transactions \
-                 and 1 remembered key; kept remembered state peers, the light-client checkpoint \
+                 and 1 learned key; kept remembered state peers, the light-client checkpoint \
                  and devp2p.key\n\
                  wrote {} (mainnet, 1 address)\n",
                 network_dir.join("chibi.db").display(),
