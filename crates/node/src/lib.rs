@@ -21,7 +21,7 @@ pub use disk::Disk;
 pub use heads::{Heads, HeadsSender};
 pub use network::{Network, NetworkSpec, Token};
 pub use node::{
-    BlockSel, ContractSnapshot, FeeHistory, Follower, Holding, Node, NodeConfig, NodeError,
+    BlockSel, ContractSnapshot, FeeHistory, Follower, Held, Holding, Node, NodeConfig, NodeError,
     Snapshot, Status, Stepped, SubmittedTx, TrackedContract, TxReceipt, Watchlist, read_snapshot,
 };
 pub use peers::{Census, NetError, PeerKey, Peers, Reply};

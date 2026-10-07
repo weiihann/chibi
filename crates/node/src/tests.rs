@@ -1109,13 +1109,17 @@ async fn status_counts_the_pins_and_learned_keys_the_head_holds() {
     );
 
     assert_eq!(follower.step().await.unwrap(), Stepped::Current);
-    assert_eq!(counts(&node), (held(1, 1), held(1, 1), vec![]));
+    assert_eq!(
+        node.working().0,
+        BTreeSet::from([Key::Account(ALICE), Key::Account(MAINNET_ENS_RESOLVER)])
+    );
+    assert_eq!(counts(&node), (held(2, 2), held(1, 1), vec![]));
 
     fixture.fault(Fault::Unavailable(BOB));
     let hash = fixture.mine_without_bal(BlockWrites::default());
     let head = fixture.world(|w| w.verified(hash)).num_hash();
     assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
-    assert_eq!(counts(&node), (held(1, 1), held(0, 1), vec![]));
+    assert_eq!(counts(&node), (held(2, 2), held(0, 1), vec![]));
 }
 
 #[tokio::test]

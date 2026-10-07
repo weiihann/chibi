@@ -289,6 +289,21 @@ pub struct Status {
     pub peers: usize,
     /// Connected sessions that negotiated snap/2.
     pub snap_peers: usize,
+    /// Pinned keys, configured and seeded, the anchor's store holds.
+    pub pins: Held,
+    /// Learned keys the anchor's store holds.
+    pub learned: Held,
+    /// Pinned keys the anchor's store lacks, configured ones first.
+    pub unheld_pins: Vec<Key>,
+}
+
+/// How many of a group of working-set keys the anchor's store holds, out of how many.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// Keys in the store.
+    pub held: usize,
+    /// Keys in the group.
+    pub total: usize,
 }
 
 /// What one follower step did.
@@ -874,12 +889,29 @@ impl<P: Peers> Node<P> {
 
     /// Current status.
     pub fn status(&self) -> Status {
-        let store = self.shared.read(State::snapshot);
+        let (store, pins, learned, unheld_pins) = self.shared.read(|s| {
+            let store = s.snapshot();
+            let working = s.working();
+            let unheld_pins: Vec<Key> = working.pins().filter(|key| !store.holds(*key)).collect();
+            let total = working.pins().count();
+            let pins = Held {
+                held: total - unheld_pins.len(),
+                total,
+            };
+            let learned = working.learned().fold(Held::default(), |held, key| Held {
+                held: held.held + usize::from(store.holds(key)),
+                total: held.total + 1,
+            });
+            (store, pins, learned, unheld_pins)
+        });
         let census = self.shared.peers.census();
         Status {
             snapshot: self.shared.snapshot(&store),
             peers: census.peers,
             snap_peers: census.snap_peers,
+            pins,
+            learned,
+            unheld_pins,
         }
     }
 }
