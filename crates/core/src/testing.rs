@@ -26,7 +26,7 @@ use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks, MAINNET, SE
 
 use crate::state::{Key, Miss};
 use crate::verify::{
-    self, AccountQuery, CodeQuery, Proven, StorageQuery, TrustedHash, VerifiedHeader,
+    self, AccountQuery, CodeQuery, Proven, SlotProof, TrustedHash, VerifiedHeader,
 };
 use crate::wire::{self, AccountRangeRequest, AccountReply, StorageRangeRequest, StorageReply};
 
@@ -376,19 +376,22 @@ impl World {
 
     /// Proves `key` at `at` through the production verifier.
     pub fn prove(&self, at: &VerifiedHeader, key: Key) -> Proven {
-        let proven = match key {
-            Key::Account(address) => {
-                let query = AccountQuery::new(at, address);
-                query.verify(self.account_reply(&query.request()))
-            }
-            Key::Slot(address, slot) => {
-                let query = StorageQuery::new(at, address, slot);
-                query.verify(
-                    self.account_reply(&query.account_request()),
-                    Some(self.storage_reply(&query.storage_request())),
-                )
-            }
+        let address = match key {
+            Key::Account(address) | Key::Slot(address, _) => address,
         };
+        let query = AccountQuery::new(at, address);
+        let proven =
+            query
+                .verify(self.account_reply(&query.request()))
+                .and_then(|account| match key {
+                    Key::Account(_) => Ok(account.proven()),
+                    Key::Slot(_, slot) => match account.slot(slot) {
+                        SlotProof::Known(proven) => Ok(proven),
+                        SlotProof::Wanted(query) => {
+                            query.verify(self.storage_reply(&query.request()))
+                        }
+                    },
+                });
         match proven {
             Ok(proven) => proven,
             Err(error) => panic!("world proof for {key:?} does not verify: {error}"),

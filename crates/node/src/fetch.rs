@@ -4,14 +4,19 @@
 //! Proofs get up to [`ATTEMPTS`] tries; a reply that proves its sender lied gets the sender
 //! penalized. A key that cannot be proven is an error, never a zero.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use alloy_primitives::{Address, B256, U256};
 use chibi_core::state::{HEADER_WINDOW, Key, Miss, Store};
 use chibi_core::verify::{
-    self, AccountQuery, CodeQuery, Proven, StorageQuery, VerifiedBlock, VerifiedBody,
-    VerifiedReceipts,
+    self, AccountQuery, CodeQuery, Proven, ProvenAccount, SlotProof, StorageQuery, VerifiedBlock,
+    VerifiedBody, VerifiedReceipts,
 };
 use chibi_core::{TrustedHash, VerifiedHeader, VerifyError};
+use futures::stream::{BoxStream, FuturesUnordered};
 use futures::{Stream, StreamExt as _, TryStreamExt as _, stream};
+use tokio::sync::Semaphore;
 use tracing::debug;
 
 use crate::node::NodeError;
@@ -20,7 +25,7 @@ use crate::peers::{NetError, PeerKey, Peers};
 /// Tries per proof before giving up.
 const ATTEMPTS: u32 = 3;
 
-/// Proofs in flight at once.
+/// Requests one fetch keeps in flight at once.
 pub(crate) const CONCURRENCY: usize = 16;
 
 /// Why one attempt failed.
@@ -235,9 +240,30 @@ pub(crate) async fn account<P: Peers>(
     at: &VerifiedHeader,
     address: Address,
 ) -> Result<Proven, NodeError> {
-    let query = AccountQuery::new(at, address);
+    proven_account(peers, &Semaphore::new(1), AccountQuery::new(at, address))
+        .await
+        .map(|account| account.proven())
+}
+
+/// Holds one of `gate`'s permits while `request` is out.
+async fn gated<T>(
+    gate: &Semaphore,
+    request: impl Future<Output = Result<T, NetError>>,
+) -> Result<T, Failure> {
+    let _permit = gate
+        .acquire()
+        .await
+        .map_err(|_| Failure::Net(NetError::Stopped))?;
+    sent(request.await)
+}
+
+async fn proven_account<P: Peers>(
+    peers: &P,
+    gate: &Semaphore,
+    query: AccountQuery,
+) -> Result<ProvenAccount, NodeError> {
     retry(peers, || async {
-        let reply = sent(peers.account_range(query.request()).await)?;
+        let reply = gated(gate, peers.account_range(query.request())).await?;
         query
             .verify(reply.value)
             .map_err(|err| Failure::verify(reply.peer, err))
@@ -245,48 +271,24 @@ pub(crate) async fn account<P: Peers>(
     .await
 }
 
-/// One slot and its account at `at`'s state root, both requests in flight together.
-pub(crate) async fn slot<P: Peers>(
+async fn proven_slot<P: Peers>(
     peers: &P,
-    at: &VerifiedHeader,
-    address: Address,
-    slot: U256,
+    gate: &Semaphore,
+    query: StorageQuery,
 ) -> Result<Proven, NodeError> {
-    let query = StorageQuery::new(at, address, slot);
     retry(peers, || async {
-        let (account, storage) = tokio::join!(
-            peers.account_range(query.account_request()),
-            peers.storage_range(query.storage_request()),
-        );
-        let account = sent(account)?;
-        let (storage_peer, storage, storage_failure) = match sent(storage) {
-            Ok(reply) => (Some(reply.peer), Some(reply.value), None),
-            Err(failure) => (None, None, Some(failure)),
-        };
-        let account_copy = account.value.clone();
-        let err = match query.verify(account.value, storage) {
-            Ok(proven) => return Ok(proven),
-            Err(err) => err,
-        };
-        if !err.blames_peer() {
-            return Err(storage_failure.unwrap_or(Failure::verify(account.peer, err)));
-        }
-        // Either half can carry the lie; the account half alone tells which.
-        let account_ok = AccountQuery::new(at, address).verify(account_copy).is_ok();
-        let liar = match (account_ok, storage_peer) {
-            (true, Some(peer)) => peer,
-            (true, None) | (false, _) => account.peer,
-        };
-        Err(Failure::verify(liar, err))
+        let reply = gated(gate, peers.storage_range(query.request())).await?;
+        query
+            .verify(reply.value)
+            .map_err(|err| Failure::verify(reply.peer, err))
     })
     .await
 }
 
-/// Code by hash.
-pub(crate) async fn code<P: Peers>(peers: &P, hash: B256) -> Result<Proven, NodeError> {
+async fn code<P: Peers>(peers: &P, gate: &Semaphore, hash: B256) -> Result<Proven, NodeError> {
     let query = CodeQuery::new(hash);
     retry(peers, || async {
-        let reply = sent(peers.byte_codes(vec![query.request()]).await)?;
+        let reply = gated(gate, peers.byte_codes(vec![query.request()])).await?;
         query
             .verify(reply.value.into_iter().next())
             .map_err(|err| Failure::verify(reply.peer, err))
@@ -294,42 +296,132 @@ pub(crate) async fn code<P: Peers>(peers: &P, hash: B256) -> Result<Proven, Node
     .await
 }
 
-/// Proves `key` at `at`.
-pub(crate) async fn key<P: Peers>(
-    peers: &P,
-    at: &VerifiedHeader,
-    key: Key,
-) -> Result<Proven, NodeError> {
-    match key {
-        Key::Account(address) => account(peers, at, address).await,
-        Key::Slot(address, index) => slot(peers, at, address, index).await,
+/// Keys that could not be proven, and why.
+#[derive(Debug)]
+pub(crate) struct Unproven {
+    pub(crate) keys: Vec<Key>,
+    pub(crate) error: Box<NodeError>,
+}
+
+/// The keys of one account wanted in a round: its own fact, its slots, or both.
+struct Wanted {
+    address: Address,
+    account: bool,
+    slots: Vec<U256>,
+}
+
+impl Wanted {
+    fn keys(&self) -> Vec<Key> {
+        let account = self.account.then_some(Key::Account(self.address));
+        let slots = self.slots.iter().map(|slot| Key::Slot(self.address, *slot));
+        account.into_iter().chain(slots).collect()
     }
 }
 
-/// Proves every key at `at` with bounded concurrency. Fails if any key fails.
+/// `keys` grouped by account, in order of first appearance, without repeats.
+fn by_account(keys: impl IntoIterator<Item = Key>) -> Vec<Wanted> {
+    let mut wanted: Vec<Wanted> = Vec::new();
+    let mut index = HashMap::new();
+    for key in keys {
+        let address = match key {
+            Key::Account(address) | Key::Slot(address, _) => address,
+        };
+        let at = *index.entry(address).or_insert_with(|| {
+            wanted.push(Wanted {
+                address,
+                account: false,
+                slots: Vec::new(),
+            });
+            wanted.len() - 1
+        });
+        let entry = &mut wanted[at];
+        match key {
+            Key::Account(_) => entry.account = true,
+            Key::Slot(_, slot) if !entry.slots.contains(&slot) => entry.slots.push(slot),
+            Key::Slot(..) => {}
+        }
+    }
+    wanted
+}
+
+/// Proves `keys` at `at`, each account once for all its wanted slots, with at most `gate`'s
+/// permits in requests at once. A bad account reply blames its sender and sinks every key of
+/// the account; a bad storage reply blames its sender and sinks only its slot.
+fn proofs<'a, P: Peers>(
+    peers: &'a P,
+    at: &'a VerifiedHeader,
+    keys: Vec<Key>,
+    gate: Arc<Semaphore>,
+) -> impl Stream<Item = Result<Proven, Unproven>> + Send + 'a {
+    stream::iter(by_account(keys))
+        .map(move |wanted| account_keys(peers, at, wanted, Arc::clone(&gate)))
+        .flatten_unordered(None)
+}
+
+fn account_keys<'a, P: Peers>(
+    peers: &'a P,
+    at: &'a VerifiedHeader,
+    wanted: Wanted,
+    gate: Arc<Semaphore>,
+) -> BoxStream<'a, Result<Proven, Unproven>> {
+    let query = AccountQuery::new(at, wanted.address);
+    let account_gate = Arc::clone(&gate);
+    stream::once(async move { proven_account(peers, &account_gate, query).await })
+        .flat_map(move |proven| match proven {
+            Err(error) => stream::iter([Err(Unproven {
+                keys: wanted.keys(),
+                error: Box::new(error),
+            })])
+            .left_stream(),
+            Ok(account) => {
+                let fact = wanted.account.then(|| Ok(account.proven()));
+                let slots: FuturesUnordered<_> = wanted
+                    .slots
+                    .iter()
+                    .map(|slot| {
+                        let (key, proof) = (Key::Slot(wanted.address, *slot), account.slot(*slot));
+                        let gate = Arc::clone(&gate);
+                        async move {
+                            match proof {
+                                SlotProof::Known(proven) => Ok(proven),
+                                SlotProof::Wanted(query) => proven_slot(peers, &gate, query)
+                                    .await
+                                    .map_err(|error| Unproven {
+                                        keys: vec![key],
+                                        error: Box::new(error),
+                                    }),
+                            }
+                        }
+                    })
+                    .collect();
+                stream::iter(fact).chain(slots).right_stream()
+            }
+        })
+        .boxed()
+}
+
+/// Proves every key at `at`. Fails if any key fails.
 pub(crate) async fn keys<P: Peers>(
     peers: &P,
     at: &VerifiedHeader,
     keys: Vec<Key>,
 ) -> Result<Vec<Proven>, NodeError> {
-    stream::iter(keys)
-        .map(|k| key(peers, at, k))
-        .buffer_unordered(CONCURRENCY)
+    proofs(peers, at, keys, Arc::new(Semaphore::new(CONCURRENCY)))
+        .map_err(|unproven| *unproven.error)
         .try_collect()
         .await
 }
 
-/// Proves each key at `at` with at most `in_flight` proofs at once, yielding every key's own
-/// result, so one key that cannot be proven never sinks the others.
+/// Proves each key at `at` with at most `in_flight` requests at once, yielding every proof
+/// and every failure with the keys it sank, so a key that cannot be proven never sinks the
+/// keys it does not depend on.
 pub(crate) fn each<'a, P: Peers>(
     peers: &'a P,
     at: &'a VerifiedHeader,
     keys: Vec<Key>,
     in_flight: usize,
-) -> impl Stream<Item = (Key, Result<Proven, NodeError>)> + 'a {
-    stream::iter(keys)
-        .map(move |k| async move { (k, key(peers, at, k).await) })
-        .buffer_unordered(in_flight)
+) -> impl Stream<Item = Result<Proven, Unproven>> + 'a {
+    proofs(peers, at, keys, Arc::new(Semaphore::new(in_flight)))
 }
 
 /// Fetches everything `misses` names at `store`'s anchor, in parallel. Block-hash misses
@@ -341,12 +433,13 @@ pub(crate) async fn misses<P: Peers>(
 ) -> Result<Vec<Fetched>, NodeError> {
     let at = store.anchor();
     let mut deepest: Option<u64> = None;
-    let mut proofs = Vec::with_capacity(misses.len());
+    let mut keys = Vec::new();
+    let mut codes = Vec::new();
     for miss in misses {
         match miss {
-            Miss::Account(address) => proofs.push(Key::Account(address).into()),
-            Miss::Storage(address, index) => proofs.push(Key::Slot(address, index).into()),
-            Miss::Code(hash) => proofs.push(Wanted::Code(hash)),
+            Miss::Account(address) => keys.push(Key::Account(address)),
+            Miss::Storage(address, index) => keys.push(Key::Slot(address, index)),
+            Miss::Code(hash) => codes.push(hash),
             Miss::BlockHash(number) => {
                 deepest = Some(deepest.map_or(number, |deepest| deepest.min(number)));
             }
@@ -370,28 +463,18 @@ pub(crate) async fn misses<P: Peers>(
         }
         ancestors(peers, oldest, count).await.map(Some)
     };
-    let proven = stream::iter(proofs)
-        .map(|wanted| async move {
-            match wanted {
-                Wanted::Key(k) => key(peers, at, k).await,
-                Wanted::Code(hash) => code(peers, hash).await,
-            }
+    let gate = Arc::new(Semaphore::new(CONCURRENCY));
+    let codes = stream::iter(codes)
+        .map(|hash| {
+            let gate = Arc::clone(&gate);
+            async move { code(peers, &gate, hash).await }
         })
-        .buffer_unordered(CONCURRENCY)
+        .buffer_unordered(CONCURRENCY);
+    let keys = proofs(peers, at, keys, Arc::clone(&gate)).map_err(|unproven| *unproven.error);
+    let proven = stream::select(keys, codes)
         .map_ok(Fetched::Proven)
         .try_collect::<Vec<_>>();
     let (ancestors, mut fetched) = tokio::try_join!(ancestors, proven)?;
     fetched.extend(ancestors.map(Fetched::Ancestors));
     Ok(fetched)
-}
-
-enum Wanted {
-    Key(Key),
-    Code(B256),
-}
-
-impl From<Key> for Wanted {
-    fn from(key: Key) -> Self {
-        Self::Key(key)
-    }
 }

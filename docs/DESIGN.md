@@ -104,6 +104,8 @@ The follower warms after each step: it proves unheld keys at the current anchor,
 
 `Node` pins `Arc<Store>` and runs a pure step on it. `exec::execute` uses a revm `Database` whose error type cannot be constructed. A miss is recorded and reads as empty for the rest of that run only, and any recorded miss withholds the result (`Result<_, Misses>`, where `Misses` is non-empty by construction). One run can find several misses. The node proves them in one parallel batch at the pinned anchor, inserts them into the request's own copy (`Arc::make_mut`), and runs again, so round trips scale with dependency depth rather than key count. At the end `State::merge` learns every key the request read. It keeps the new values if the anchor has not moved; otherwise it drops them, except code, which is content-addressed, and the follower warms those keys at the current anchor, so the next identical call is warm. Gas estimation is reth's bisection as a pure function inside the same loop.
 
+Every batch of keys, whether a request round, a reanchor's pins, or a warm pass, is proven grouped by account: one account request per address, whose proof carries the storage root, then one storage request per wanted slot against that root. A slot of an absent account, or of an account whose storage root is empty, is a known zero and costs no storage request. A bad account reply penalizes its sender and fails every key of that account; a bad storage reply penalizes its sender and fails only its slot.
+
 ### Concurrency
 
 | Pair | Outcome |

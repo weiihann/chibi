@@ -1389,13 +1389,13 @@ async fn a_restart_opens_with_nothing_proven_then_warms_remembered_keys_newest_f
     assert!(!node.holds(Key::Slot(PROXY, U256::from(3))));
 
     assert_eq!(follower.step().await.unwrap(), Stepped::Current);
-    assert_eq!(fixture.log().proofs, before.proofs + 8);
+    assert_eq!(fixture.log().proofs, before.proofs + 6);
     assert_eq!(
         fixture.log().slots[before.slots.len()..],
         slot_hashes(PROXY, &[3, 2, 1])
     );
     assert_eq!(storage(&node, PROXY, 1).await, U256::ZERO);
-    assert_eq!(fixture.log().proofs, before.proofs + 8);
+    assert_eq!(fixture.log().proofs, before.proofs + 6);
 }
 
 #[tokio::test]

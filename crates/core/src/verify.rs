@@ -15,7 +15,7 @@ use alloy_eip7928::{AccountChanges, compute_block_access_list_hash};
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, BlockNumber, Bloom, Bytes, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable};
-use alloy_trie::EMPTY_ROOT_HASH;
+use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount};
 use reth_trie_common::range_proof::{RangeProofError, verify_range_proof};
 use revm::bytecode::Bytecode;
 
@@ -271,52 +271,75 @@ impl AccountQuery {
     }
 
     /// Verifies `reply` and returns the account or its proven absence.
-    pub fn verify(&self, reply: AccountReply) -> Result<Proven, VerifyError> {
-        let account = self.prove(reply)?;
-        Ok(Proven {
-            at: Some(self.at),
-            fact: Fact::Account {
-                address: self.address,
-                account,
-            },
-        })
-    }
-
-    fn prove(&self, reply: AccountReply) -> Result<Option<Account>, VerifyError> {
+    pub fn verify(&self, reply: AccountReply) -> Result<ProvenAccount, VerifyError> {
         let leaf = single_key(self.root, self.key, reply.accounts, &reply.proof)?;
-        Ok(leaf.map(|account| Account::from(&account)))
+        Ok(ProvenAccount { query: *self, leaf })
     }
 }
 
-/// One slot, proven with its account at the same state root.
-///
-/// The account and storage requests are independent and can be sent concurrently: peers
-/// locate the storage trie through the state root, so the storage request needs no storage
-/// root up front.
+/// An account proven at a state root, or its proven absence, holding the storage root its
+/// slots are proven under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenAccount {
+    query: AccountQuery,
+    leaf: Option<TrieAccount>,
+}
+
+impl ProvenAccount {
+    /// The account fact.
+    pub fn proven(&self) -> Proven {
+        Proven {
+            at: Some(self.query.at),
+            fact: Fact::Account {
+                address: self.query.address,
+                account: self.leaf.as_ref().map(Account::from),
+            },
+        }
+    }
+
+    /// `slot` of this account. An absent account, or one with an empty storage root, makes
+    /// the slot a known zero; otherwise it takes a storage proof.
+    pub fn slot(&self, slot: U256) -> SlotProof {
+        let Some(leaf) = &self.leaf else {
+            return SlotProof::Known(self.proven());
+        };
+        let query = StorageQuery {
+            account: self.query,
+            state: Account::from(leaf),
+            storage_root: leaf.storage_root,
+            slot,
+            slot_key: keccak256(B256::from(slot)),
+        };
+        if leaf.storage_root == EMPTY_ROOT_HASH {
+            SlotProof::Known(query.fact(U256::ZERO))
+        } else {
+            SlotProof::Wanted(query)
+        }
+    }
+}
+
+/// What proving one slot of a [`ProvenAccount`] takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotProof {
+    /// The account alone settles it: absent, or with empty storage.
+    Known(Proven),
+    /// A storage proof against the account's storage root.
+    Wanted(StorageQuery),
+}
+
+/// One single-key `GetStorageRanges` against a proven account's storage root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageQuery {
     account: AccountQuery,
+    state: Account,
+    storage_root: B256,
     slot: U256,
     slot_key: B256,
 }
 
 impl StorageQuery {
-    /// A query for `slot` of `address` at the state root of `at`.
-    pub fn new(at: &VerifiedHeader, address: Address, slot: U256) -> Self {
-        Self {
-            account: AccountQuery::new(at, address),
-            slot,
-            slot_key: keccak256(B256::from(slot)),
-        }
-    }
-
-    /// The account half of the query.
-    pub const fn account_request(&self) -> AccountRangeRequest {
-        self.account.request()
-    }
-
-    /// The storage half: origin and limit are both `keccak256(slot)`.
-    pub const fn storage_request(&self) -> StorageRangeRequest {
+    /// The request to send: origin and limit are both `keccak256(slot)`.
+    pub const fn request(&self) -> StorageRangeRequest {
         StorageRangeRequest {
             root: self.account.root,
             account: self.account.key,
@@ -324,57 +347,31 @@ impl StorageQuery {
         }
     }
 
-    /// Verifies both replies. An absent account, or one with an empty storage root, makes the
-    /// slot a known zero, and `storage` is not consulted.
-    pub fn verify(
-        &self,
-        account: AccountReply,
-        storage: Option<StorageReply>,
-    ) -> Result<Proven, VerifyError> {
-        let at = Some(self.account.at);
-        let address = self.account.address;
-        let Some(leaf) = single_key(
-            self.account.root,
-            self.account.key,
-            account.accounts,
-            &account.proof,
+    /// Verifies `storage` against the account's storage root.
+    pub fn verify(&self, storage: StorageReply) -> Result<Proven, VerifyError> {
+        if storage.slots.iter().any(|(_, value)| value.is_zero()) {
+            return Err(VerifyError::ZeroSlot);
+        }
+        let value = single_key(
+            self.storage_root,
+            self.slot_key,
+            storage.slots,
+            &storage.proof,
         )?
-        else {
-            return Ok(Proven {
-                at,
-                fact: Fact::Account {
-                    address,
-                    account: None,
-                },
-            });
-        };
-        let value = if leaf.storage_root == EMPTY_ROOT_HASH {
-            U256::ZERO
-        } else {
-            let storage = storage.ok_or(VerifyError::RootUnavailable {
-                root: leaf.storage_root,
-            })?;
-            if storage.slots.iter().any(|(_, value)| value.is_zero()) {
-                return Err(VerifyError::ZeroSlot);
-            }
-            single_key(
-                leaf.storage_root,
-                self.slot_key,
-                storage.slots,
-                &storage.proof,
-            )?
-            .unwrap_or_default()
-        };
-        let account = Account::from(&leaf);
-        Ok(Proven {
-            at,
+        .unwrap_or_default();
+        Ok(self.fact(value))
+    }
+
+    const fn fact(&self, value: U256) -> Proven {
+        Proven {
+            at: Some(self.account.at),
             fact: Fact::Slot {
-                address,
-                account,
+                address: self.account.address,
+                account: self.state,
                 slot: self.slot,
                 value,
             },
-        })
+        }
     }
 }
 
@@ -732,12 +729,23 @@ mod tests {
         world.account_reply(&query.request())
     }
 
+    fn account(world: &World, at: &VerifiedHeader, address: Address) -> ProvenAccount {
+        let query = AccountQuery::new(at, address);
+        query.verify(world.account_reply(&query.request())).unwrap()
+    }
+
+    fn wanted(proof: SlotProof) -> StorageQuery {
+        match proof {
+            SlotProof::Wanted(query) => query,
+            SlotProof::Known(proven) => panic!("slot already known: {proven:?}"),
+        }
+    }
+
     #[test]
     fn present_account_matches_world() {
         let world = world();
         let head = world.verified(world.head());
-        let query = AccountQuery::new(&head, ALICE);
-        let proven = query.verify(account_reply(&world, &query)).unwrap();
+        let proven = account(&world, &head, ALICE).proven();
         let expected = Account {
             nonce: 7,
             balance: eth(5),
@@ -760,28 +768,29 @@ mod tests {
         let query = AccountQuery::new(&head, NOBODY);
         let reply = account_reply(&world, &query);
         assert!(reply.accounts.len() == 1 && reply.accounts[0].0 > query.request().key);
-        assert_eq!(query.verify(reply).unwrap().account(), Some(None));
+        assert_eq!(query.verify(reply).unwrap().proven().account(), Some(None));
     }
 
     #[test]
     fn storage_present_absent_and_empty_root() {
         let world = world();
         let head = world.verified(world.head());
-        let slot = |address, slot: u64| {
-            let query = StorageQuery::new(&head, address, U256::from(slot));
-            let account = world.account_reply(&query.account_request());
-            let storage = world.storage_reply(&query.storage_request());
-            query.verify(account, Some(storage)).unwrap()
+        let token = account(&world, &head, TOKEN);
+        let slot = |slot: u64| {
+            let query = wanted(token.slot(U256::from(slot)));
+            query.verify(world.storage_reply(&query.request())).unwrap()
         };
-        assert_eq!(slot(TOKEN, 2).slot_value(), Some(U256::from(22)));
-        assert_eq!(slot(TOKEN, 9).slot_value(), Some(U256::ZERO));
-        let absent = slot(NOBODY, 1);
+        assert_eq!(slot(2).slot_value(), Some(U256::from(22)));
+        assert_eq!(slot(9).slot_value(), Some(U256::ZERO));
+
+        let SlotProof::Known(absent) = account(&world, &head, NOBODY).slot(U256::from(1)) else {
+            panic!("an absent account's slot needs no storage proof");
+        };
         assert_eq!((absent.account(), absent.slot_value()), (Some(None), None));
 
-        let query = StorageQuery::new(&head, ALICE, U256::from(1));
-        let eoa = query
-            .verify(world.account_reply(&query.account_request()), None)
-            .unwrap();
+        let SlotProof::Known(eoa) = account(&world, &head, ALICE).slot(U256::from(1)) else {
+            panic!("a slot of empty storage needs no storage proof");
+        };
         assert_eq!(eoa.slot_value(), Some(U256::ZERO));
         assert_eq!(eoa.key(), Some(Key::Slot(ALICE, U256::from(1))));
     }
@@ -803,12 +812,11 @@ mod tests {
     fn tampered_slot_is_rejected() {
         let world = world();
         let head = world.verified(world.head());
-        let query = StorageQuery::new(&head, TOKEN, U256::from(2));
-        let account = world.account_reply(&query.account_request());
-        let mut storage = world.storage_reply(&query.storage_request());
+        let query = wanted(account(&world, &head, TOKEN).slot(U256::from(2)));
+        let mut storage = world.storage_reply(&query.request());
         storage.slots[0].1 = U256::from(23);
         assert!(matches!(
-            query.verify(account, Some(storage)),
+            query.verify(storage),
             Err(VerifyError::RangeProof { .. })
         ));
     }
@@ -905,14 +913,9 @@ mod tests {
         assert_eq!(error, VerifyError::RootUnavailable { root });
         assert!(!error.blames_peer());
 
-        let query = StorageQuery::new(&head, TOKEN, U256::from(1));
-        let account = world.account_reply(&query.account_request());
+        let query = wanted(account(&world, &head, TOKEN).slot(U256::from(1)));
         assert!(matches!(
-            query.verify(account.clone(), Some(StorageReply::default())),
-            Err(VerifyError::RootUnavailable { .. })
-        ));
-        assert!(matches!(
-            query.verify(account, None),
+            query.verify(StorageReply::default()),
             Err(VerifyError::RootUnavailable { .. })
         ));
     }

@@ -357,16 +357,16 @@ impl<P: Peers> Shared<P> {
                 _ = latest.changed() => break true,
                 next = proofs.next() => match next {
                     None => break false,
-                    Some((_, Ok(proven))) => {
+                    Some(Ok(proven)) => {
                         batch.push(proven);
                         if batch.len() == WARM_MERGE {
                             self.update(|s| s.merge(anchor.hash(), &batch));
                             batch.clear();
                         }
                     }
-                    Some((key, Err(err))) => {
-                        failed += 1;
-                        debug!(target: "chibi::follow", ?key, %err, "warming a key failed; retrying next pass");
+                    Some(Err(unproven)) => {
+                        failed += unproven.keys.len();
+                        debug!(target: "chibi::follow", keys = ?unproven.keys, err = %unproven.error, "warming keys failed; retrying next pass");
                     }
                 },
             }
