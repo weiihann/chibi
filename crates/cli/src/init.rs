@@ -489,6 +489,82 @@ mod tests {
         NonZeroU16::new(port).unwrap()
     }
 
+    #[tokio::test]
+    async fn writing_resets_the_networks_saved_state_and_refuses_while_chibi_runs_there() {
+        use chibi_core::testing::{WorldAccount, eth};
+        use chibi_node::fixture::Fixture;
+        use chibi_node::{BlockSel, Disk, Node, Stepped, Watchlist, read_snapshot};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::new(Network::Mainnet, vec![ALICE]);
+        config.data_dir = Some(dir.path().join("data"));
+        let network_dir = dir.path().join("data").join("mainnet");
+        let write = |config: &Config| {
+            let mut output = Vec::new();
+            apply(&mut output, &path, config, &Carried::default(), None, |_| None)
+                .map(|()| String::from_utf8(output).unwrap())
+        };
+
+        let fixture = Fixture::genesis([
+            (ALICE, WorldAccount::eoa(eth(2))),
+            (BOB, WorldAccount::eoa(eth(3))),
+        ]);
+        {
+            let (node, mut follower) = Node::with_parts(
+                Fixture::spec(&[]),
+                fixture.peers(),
+                fixture.heads(),
+                Disk::open(&network_dir).unwrap(),
+                &Watchlist {
+                    addresses: vec![ALICE],
+                    contracts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+            node.account(BOB, BlockSel::Latest).await.unwrap();
+            node.save_keys().await.unwrap();
+
+            let error = write(&config).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "chibi is running on {} (pid {}); stop it before rerunning chibi init. Nothing was written",
+                    network_dir.display(),
+                    std::process::id()
+                )
+            );
+            assert!(!path.exists());
+        }
+        assert!(read_snapshot(&network_dir).unwrap().is_some());
+
+        let output = write(&config).unwrap();
+        assert!(
+            output.starts_with(&format!(
+                "reset the saved mainnet state in {}: deleted 1 snapshot, 0 pending transactions \
+                 and 1 remembered key; kept remembered state peers, the light-client checkpoint \
+                 and devp2p.key\n\
+                 wrote {} (mainnet, 1 address)\n",
+                network_dir.join("chibi.db").display(),
+                path.display()
+            )),
+            "{output}"
+        );
+        assert_eq!(read_snapshot(&network_dir).unwrap(), None);
+        assert_eq!(Config::load(&path).unwrap(), Some(config.clone()));
+
+        config.data_dir = Some(dir.path().join("fresh"));
+        let output = write(&config).unwrap();
+        assert!(
+            output.starts_with(&format!("wrote {} (mainnet, 1 address)\n", path.display())),
+            "{output}"
+        );
+        assert!(!output.contains("reset"), "{output}");
+        assert!(!dir.path().join("fresh").exists());
+    }
+
     #[test]
     fn network_prompt_defaults_to_sepolia() {
         let (network, output) = scripted("\n", |i, o| prompt_network(i, o));

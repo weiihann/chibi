@@ -828,6 +828,55 @@ mod tests {
     }
 
     #[test]
+    fn reset_deletes_snapshot_outbox_and_keys_and_keeps_peers_checkpoint_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Disk::reset(dir.path()).unwrap(), None);
+        assert!(!dir.path().join(DB_FILE).exists());
+        let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
+        let key = {
+            let disk = Disk::open(dir.path()).unwrap();
+            disk.save(|saved| {
+                saved.set_outbox(vec![queued(1, 9), queued(2, 11)]);
+                saved.set_snapshot(snapshot);
+                saved.remember_peers(&[record(1, 30303), record(2, 30304)]);
+            })
+            .unwrap();
+            disk.save_keys(&[
+                Key::Account(Address::repeat_byte(1)),
+                Key::Slot(Address::repeat_byte(2), U256::from(3)),
+                Key::Account(Address::repeat_byte(4)),
+            ])
+            .unwrap();
+            assert!(
+                matches!(Disk::reset(dir.path()), Err(NodeError::Disk(_))),
+                "a held directory is not reset"
+            );
+            disk.secret_key().unwrap()
+        };
+        fs::write(dir.path().join("checkpoint"), [7u8; 32]).unwrap();
+
+        assert_eq!(
+            Disk::reset(dir.path()).unwrap(),
+            Some(Reset {
+                snapshot: 1,
+                outbox: 2,
+                keys: 3,
+            })
+        );
+        assert_eq!(Disk::reset(dir.path()).unwrap(), Some(Reset::default()));
+        assert_eq!(read_snapshot(dir.path()).unwrap(), None);
+        assert_eq!(fs::read(dir.path().join("checkpoint")).unwrap(), [7u8; 32]);
+        let disk = Disk::open(dir.path()).unwrap();
+        assert_eq!(disk.secret_key().unwrap(), key);
+        assert_eq!(disk.load_keys().unwrap(), Vec::new());
+        disk.read(|saved| {
+            assert_eq!(saved.snapshot(), None);
+            assert_eq!(saved.outbox(), &[]);
+            assert_eq!(saved.peers(), vec![record(1, 30303), record(2, 30304)]);
+        });
+    }
+
+    #[test]
     fn a_legacy_state_file_from_before_contracts_is_imported_then_deleted() {
         let dir = tempfile::tempdir().unwrap();
         write_legacy_state(dir.path());
