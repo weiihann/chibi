@@ -543,9 +543,8 @@ mod tests {
     }
 
     #[test]
-    fn address_prompt_validates_dedupes_and_requires_one() {
-        let script = "\n\
-                      0x1234\n\
+    fn address_prompt_validates_and_dedupes() {
+        let script = "0x1234\n\
                       0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6a063\n\
                       0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063\n\
                       0x8f3cf7ad23cd3cadbd9735aff958023239c6a063\n\
@@ -557,8 +556,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "{prompt}Enter at least one address.\n\
-                 {prompt}\"0x1234\" is not an address (expected 0x followed by 40 hex digits)\n\
+                "{prompt}\"0x1234\" is not an address (expected 0x followed by 40 hex digits)\n\
                  {prompt}\"0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6a063\" has an invalid checksum\n\
                  {prompt}\
                  {prompt}{ALICE} is already on the list.\n\
@@ -569,14 +567,37 @@ mod tests {
     }
 
     #[test]
-    fn address_prompt_ends_with_input_once_one_is_entered() {
+    fn address_prompt_ends_with_input() {
         let (addresses, _) = scripted("0x00000000000000000000000000000000000000b0\n", |i, o| {
             prompt_addresses(i, o)
         });
         assert_eq!(addresses.unwrap(), vec![BOB]);
+    }
 
-        let (none, _) = scripted("\n", |i, o| prompt_addresses(i, o));
-        assert!(matches!(none, Err(InitError::Ended(_))));
+    #[test]
+    fn init_accepts_no_watched_addresses() {
+        for script in ["\n", ""] {
+            let (addresses, _) = scripted(script, |i, o| prompt_addresses(i, o));
+            assert_eq!(addresses.unwrap(), Vec::<Address>::new(), "{script:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut lines = Lines {
+            input: Cursor::new(&b"\n\n\n\n"[..]),
+            output: Vec::new(),
+        };
+        let (config, _) = collect(&mut lines, InitArgs::default(), &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config, Config::new(Network::Sepolia, Vec::new()));
+        let mut output = Vec::new();
+        write_next_steps(&mut output, &path, &config, &Carried::default(), None).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.starts_with(&format!("wrote {} (sepolia, 0 addresses)\n", path.display())),
+            "{output}"
+        );
     }
 
     #[test]

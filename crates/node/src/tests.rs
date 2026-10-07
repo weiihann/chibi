@@ -23,8 +23,8 @@ use crate::disk::{Disk, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR};
 use crate::network::{MAINNET_ENS_RESOLVER, Token};
 use crate::node::{
-    BlockSel, ContractSnapshot, Follower, Node, NodeError, Stepped, TrackedContract, Watchlist,
-    read_snapshot,
+    BlockSel, ContractSnapshot, Follower, Held, Node, NodeError, Stepped, TrackedContract,
+    Watchlist, read_snapshot,
 };
 
 const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
@@ -1085,6 +1085,37 @@ async fn a_learned_key_that_cannot_be_proven_never_blocks_the_head() {
     fixture.heal();
     assert_eq!(follower.step().await.unwrap(), Stepped::Current);
     assert!(node.holds(Key::Account(BOB)));
+}
+
+#[tokio::test]
+async fn status_counts_the_pins_and_learned_keys_the_head_holds() {
+    let counts = |node: &Node<FixturePeers>| {
+        let status = node.status();
+        (status.pins, status.learned, status.unheld_pins)
+    };
+    let held = |held, total| Held { held, total };
+    let fixture = alice_and_bob();
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = open(&fixture, dir.path(), &[], &watchlist(&[ALICE], &[])).await;
+    assert_eq!(
+        counts(&node),
+        (held(0, 1), held(0, 0), vec![Key::Account(ALICE)])
+    );
+
+    assert_eq!(balance(&node, BOB).await, Some(eth(3)));
+    assert_eq!(
+        counts(&node),
+        (held(0, 1), held(1, 1), vec![Key::Account(ALICE)])
+    );
+
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    assert_eq!(counts(&node), (held(1, 1), held(1, 1), vec![]));
+
+    fixture.fault(Fault::Unavailable(BOB));
+    let hash = fixture.mine_without_bal(BlockWrites::default());
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Reanchored(head));
+    assert_eq!(counts(&node), (held(1, 1), held(0, 1), vec![]));
 }
 
 #[tokio::test]

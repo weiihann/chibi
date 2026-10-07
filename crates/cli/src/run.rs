@@ -408,6 +408,26 @@ mod tests {
     }
 
     #[test]
+    fn run_without_a_config_file_uses_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = load(&path, None, None, None).unwrap();
+        assert_eq!(config, Config::new(Network::Sepolia, Vec::new()));
+        assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
+        assert!(config.tokens.is_empty() && config.contracts.is_empty());
+        assert_eq!(config.data_dir, None);
+        assert!(!path.exists());
+
+        let config = load(&path, Some(Network::Mainnet), None, NonZeroU16::new(8745)).unwrap();
+        assert_eq!(config.network, Network::Mainnet);
+        assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
+
+        fs::write(&path, "network = \"goerli\"\n").unwrap();
+        let error = load(&path, None, None, None).unwrap_err().to_string();
+        assert!(error.starts_with("invalid config "), "{error}");
+    }
+
+    #[test]
     fn hints_repeat_the_config_and_network_flags() {
         assert_eq!(hint_flags(&RunArgs::default(), None), "");
         let args = RunArgs {
