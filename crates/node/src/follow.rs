@@ -34,6 +34,10 @@ const BODY_BATCH: usize = 64;
 /// Proofs a warm pass gathers before merging them, so requests see its progress early.
 const WARM_MERGE: usize = 64;
 
+/// Warm proofs in flight at once. reth keeps one snap request in flight per peer, so a wallet
+/// request or a BAL fetch queues behind at most this many warm proofs.
+const WARM_IN_FLIGHT: usize = 2;
+
 /// Which blocks have been searched for pending transactions.
 ///
 /// A pending transaction is dropped as replaced only once every block since its submission
@@ -344,7 +348,7 @@ impl<P: Peers> Shared<P> {
             return;
         }
         let wanted = keys.len();
-        let mut proofs = std::pin::pin!(fetch::each(&self.peers, &anchor, keys));
+        let mut proofs = std::pin::pin!(fetch::each(&self.peers, &anchor, keys, WARM_IN_FLIGHT));
         let mut batch = Vec::with_capacity(WARM_MERGE);
         let mut failed = 0;
         let interrupted = loop {

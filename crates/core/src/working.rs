@@ -8,7 +8,7 @@ use alloy_primitives::{Address, U256};
 use crate::state::Key;
 
 /// Most keys kept, pins included.
-pub const WORKING_SET_CAP: usize = 4096;
+pub const WORKING_SET_CAP: usize = 1024;
 
 /// Pins plus learned keys.
 ///
