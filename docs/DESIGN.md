@@ -98,7 +98,7 @@ Once the trusted head's header is fetched and verified, `Node::start` builds an 
 
 ### Warming
 
-The follower warms after each step: it proves unheld keys at the current anchor, pins first, then learned keys most recently used first, with at most `WARM_IN_FLIGHT` = 2 proofs in flight, merging every 64 proofs. reth keeps one in-flight snap request per peer, so wallet requests and BAL fetches wait behind at most 2 warm proofs. It stops at once when a new head arrives. A key that fails stays unheld for the next pass and never blocks the head. Requests wake the follower when anything is unheld.
+The follower warms after each step: it proves unheld keys at the current anchor, pins first, then learned keys most recently used first, with at most `WARM_IN_FLIGHT` = 8 requests in flight, merging every 64 proofs. chibi sends snap/2 requests itself, up to 16 at once to each snap/2 session (reth's session buffers 32 and drops the rest; reth's fetcher would send one at a time), each to the session with the fewest in flight, so warming takes at most half of one peer and wallet requests and BAL fetches always find room. It stops at once when a new head arrives. A key that fails stays unheld for the next pass and never blocks the head. Requests wake the follower when anything is unheld.
 
 ### Requests and misses
 
@@ -172,7 +172,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - We accept warming inside the follower, so its merges never straddle an anchor move, at the cost of warming that pauses while the follower moves the head.
 - We accept discarding BAL post-states for unheld slots, so the store stays bounded and immune to other users' traffic; a dapp re-reading such a slot pays a fetch.
 - We accept a constant eviction budget of 1024 keys (pins plus learned, with pins exempt from eviction) and no config knob. Measured on Sepolia, one snap/2 peer proves about 3 keys a second, so re-warming a full set of learned keys takes about 6 minutes.
-- We accept slow warming (2 proofs in flight), in exchange for wallet requests and BAL fetches that never queue behind more than 2 warm proofs.
+- We accept warming with half of one peer's 16 snap slots, in exchange for wallet requests and BAL fetches that always find the other half free.
 - We accept opening RPC before any proof, so the first reads pay a fetch, in exchange for a wallet that never sees the network as down while chibi proves.
 - We accept losing up to 5 heads of newly learned keys, and up to an hour of recency, on a crash, in exchange for not rewriting up to 1024 rows at every head.
 - We accept rewriting the snapshot row at each head (a few KB of JSON), in exchange for keeping the display-only snapshot out of the schema. The outbox and peers tables are rewritten only when they change.

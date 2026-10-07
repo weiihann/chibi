@@ -17,6 +17,7 @@ use chibi_core::wire::{
 };
 use chibi_core::{TrustedHash, VerifiedHeader};
 use futures::StreamExt;
+use parking_lot::Mutex;
 use reth_chainspec::{ChainSpec, EthChainSpec, Head};
 use reth_eth_wire_types::snap::{
     AccountData, AccountRangeMessage, BlockAccessListsMessage, ByteCodesMessage,
@@ -32,18 +33,18 @@ use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
 use reth_network::{
     FetchClient, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkHandle, NetworkManager,
 };
-use reth_network_api::{Direction, Peers as _};
+use reth_network_api::{Direction, PeerRequest, Peers as _};
 use reth_network_p2p::block_access_lists::client::{BalRequirement, BlockAccessListsClient};
 use reth_network_p2p::bodies::client::BodiesClient;
 use reth_network_p2p::download::DownloadClient;
 use reth_network_p2p::error::RequestError;
 use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
 use reth_network_p2p::receipts::client::ReceiptsClient;
-use reth_network_p2p::snap::client::{SnapClient, SnapResponse};
+use reth_network_p2p::snap::client::SnapResponse;
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace};
 
@@ -105,6 +106,44 @@ pub struct Session {
 /// Established sessions by peer.
 pub type Sessions = HashMap<PeerKey, Session>;
 
+/// chibi's snap/2 requests in flight, by session.
+#[derive(Debug, Default)]
+struct SnapLoad(Mutex<HashMap<PeerKey, usize>>);
+
+impl SnapLoad {
+    /// The snap/2 session in `sessions` with the fewest requests in flight, counted against it
+    /// until the lease drops.
+    fn lease(&self, sessions: &Sessions) -> Option<Lease<'_>> {
+        let mut load = self.0.lock();
+        let peer = sessions
+            .iter()
+            .filter(|(_, session)| session.snap)
+            .map(|(peer, _)| *peer)
+            .min_by_key(|peer| load.get(peer).copied().unwrap_or_default())?;
+        *load.entry(peer).or_default() += 1;
+        Some(Lease { load: self, peer })
+    }
+}
+
+/// One request counted against `peer`.
+#[derive(Debug)]
+struct Lease<'a> {
+    load: &'a SnapLoad,
+    peer: PeerKey,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let mut load = self.load.0.lock();
+        if let Some(count) = load.get_mut(&self.peer) {
+            *count -= 1;
+            if *count == 0 {
+                load.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// devp2p failed to start.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Devp2pError {
@@ -128,6 +167,7 @@ pub struct Devp2p {
     fetch: FetchClient,
     chain: Arc<ChainSpec>,
     sessions: watch::Receiver<Sessions>,
+    snap_load: SnapLoad,
     tasks: [JoinHandle<()>; 3],
 }
 
@@ -197,6 +237,7 @@ impl Devp2p {
             fetch,
             chain: Arc::clone(&spec.chain),
             sessions,
+            snap_load: SnapLoad::default(),
             tasks,
         })
     }
@@ -233,6 +274,24 @@ impl Devp2p {
         NetError::Rejected
     }
 
+    /// Sends `request` to the connected snap/2 session with the fewest chibi requests in
+    /// flight. reth's fetcher would hold each peer to one request at a time.
+    async fn snap(&self, request: SnapProtocolMessage) -> Result<(PeerId, SnapResponse), NetError> {
+        let lease = self
+            .snap_load
+            .lease(&self.sessions.borrow())
+            .ok_or(NetError::NoPeer { capability: SNAP })?;
+        let peer = lease.peer.0;
+        let (response, reply) = oneshot::channel();
+        self.handle
+            .send_request(peer, PeerRequest::GetSnap { request, response });
+        match reply.await {
+            Ok(Ok(response)) => Ok((peer, response)),
+            Ok(Err(err)) => Err(net_error(&err, SNAP)),
+            Err(_) => Err(NetError::Rejected),
+        }
+    }
+
     async fn snap_block_access_lists(
         &self,
         blocks: Vec<B256>,
@@ -243,10 +302,9 @@ impl Devp2p {
             block_hashes: blocks,
             response_bytes: RESPONSE_BYTES,
         };
-        let (peer, response) = SnapClient::get_block_access_lists(&self.fetch, message)
-            .await
-            .map_err(|err| net_error(&err, SNAP))?
-            .split();
+        let (peer, response) = self
+            .snap(SnapProtocolMessage::GetBlockAccessLists(message))
+            .await?;
         match response {
             SnapResponse::BlockAccessLists(message) => {
                 align(message.block_access_lists.0, requested)
@@ -307,11 +365,8 @@ impl Peers for Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .fetch
-            .get_account_range(message)
-            .await
-            .map_err(|err| net_error(&err, SNAP))?
-            .split();
+            .snap(SnapProtocolMessage::GetAccountRange(message))
+            .await?;
         match response {
             SnapResponse::AccountRange(range) => Ok(Self::reply(
                 peer,
@@ -343,11 +398,8 @@ impl Peers for Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .fetch
-            .get_storage_ranges(message)
-            .await
-            .map_err(|err| net_error(&err, SNAP))?
-            .split();
+            .snap(SnapProtocolMessage::GetStorageRanges(message))
+            .await?;
         let ranges = match response {
             SnapResponse::StorageRanges(ranges) => ranges,
             SnapResponse::AccountRange(_)
@@ -380,11 +432,8 @@ impl Peers for Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .fetch
-            .get_byte_codes(message)
-            .await
-            .map_err(|err| net_error(&err, SNAP))?
-            .split();
+            .snap(SnapProtocolMessage::GetByteCodes(message))
+            .await?;
         match response {
             SnapResponse::ByteCodes(codes) => Ok(Self::reply(peer, codes.codes)),
             SnapResponse::AccountRange(_)
@@ -672,9 +721,43 @@ mod tests {
         GetReceipts70, HeadersDirection,
     };
     use reth_network_p2p::error::RequestResult;
-    use tokio::sync::oneshot;
 
     use super::*;
+
+    fn session(snap: bool) -> Session {
+        Session {
+            client: Arc::from("test"),
+            eth: 69,
+            snap,
+            dialable: None,
+        }
+    }
+
+    #[test]
+    fn snap_requests_go_to_the_least_loaded_snap_session_until_released() {
+        let (a, b, eth) = (
+            PeerKey(B512::repeat_byte(1)),
+            PeerKey(B512::repeat_byte(2)),
+            PeerKey(B512::repeat_byte(3)),
+        );
+        let sessions = Sessions::from([
+            (a, session(true)),
+            (b, session(true)),
+            (eth, session(false)),
+        ]);
+        let load = SnapLoad::default();
+
+        let leases: Vec<_> = (0..4).map(|_| load.lease(&sessions).unwrap()).collect();
+        let on = |peer| leases.iter().filter(|lease| lease.peer == peer).count();
+        assert_eq!((on(a), on(b), on(eth)), (2, 2, 0));
+
+        drop(leases);
+        assert!(load.0.lock().is_empty());
+        assert!(
+            load.lease(&Sessions::from([(eth, session(false))]))
+                .is_none()
+        );
+    }
 
     const PEER: PeerId = B512::repeat_byte(7);
     const HASH: B256 = B256::repeat_byte(1);

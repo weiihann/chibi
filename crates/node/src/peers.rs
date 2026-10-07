@@ -20,9 +20,10 @@ use tracing::debug;
 /// How long a peer may take to answer one request, counted from when it is sent.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// snap/2 requests one peer works on at once. reth's fetcher sends a peer one request at a
-/// time and queues the rest.
-const SNAP_PER_PEER: usize = 1;
+/// snap/2 requests one peer works on at once. A peer answers in about the same time with up to
+/// 32 in flight, and reth's session buffers 32 commands and drops the rest; half leaves room
+/// for reth's own traffic.
+const SNAP_PER_PEER: usize = 16;
 
 /// Identifies the peer that sent a reply, so a failed verification can penalize it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -375,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_snap_peers_drop_from_four_to_one_only_one_request_is_out_at_a_time() {
+    async fn after_snap_peers_drop_from_four_to_one_only_one_peers_slots_are_out_at_a_time() {
         let (arrived, mut arrivals) = mpsc::unbounded_channel();
         let paced = Arc::new(Paced::new(Stub {
             snap_peers: AtomicUsize::new(4),
@@ -385,7 +386,7 @@ mod tests {
             root: B256::ZERO,
             key: B256::ZERO,
         };
-        let calls: Vec<_> = (0..8)
+        let calls: Vec<_> = (0..8 * SNAP_PER_PEER)
             .map(|_| {
                 let paced = Arc::clone(&paced);
                 tokio::spawn(async move { paced.account_range(request).await })
@@ -397,7 +398,7 @@ mod tests {
         while let Ok(answer) = arrivals.try_recv() {
             first.push(answer);
         }
-        assert_eq!(first.len(), 4);
+        assert_eq!(first.len(), 4 * SNAP_PER_PEER);
 
         paced.inner.snap_peers.store(1, Ordering::SeqCst);
         for answer in first {
@@ -409,7 +410,11 @@ mod tests {
             while let Ok(answer) = arrivals.try_recv() {
                 out.push(answer);
             }
-            assert_eq!(out.len(), 1, "requests out at the one remaining peer");
+            assert_eq!(
+                out.len(),
+                SNAP_PER_PEER,
+                "requests out at the one remaining peer"
+            );
             for answer in out {
                 answer.send(()).unwrap();
             }
@@ -420,7 +425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_queued_before_snap_peers_grow_from_one_to_four_go_out_four_at_a_time() {
+    async fn requests_queued_before_snap_peers_grow_from_one_to_four_use_all_four_peers_slots() {
         let (arrived, mut arrivals) = mpsc::unbounded_channel();
         let paced = Arc::new(Paced::new(Stub {
             snap_peers: AtomicUsize::new(1),
@@ -430,7 +435,7 @@ mod tests {
             root: B256::ZERO,
             key: B256::ZERO,
         };
-        let calls: Vec<_> = (0..9)
+        let calls: Vec<_> = (0..9 * SNAP_PER_PEER)
             .map(|_| {
                 let paced = Arc::clone(&paced);
                 tokio::spawn(async move { paced.account_range(request).await })
@@ -438,18 +443,27 @@ mod tests {
             .collect();
 
         settle().await;
-        let first = arrivals.try_recv().unwrap();
-        assert!(arrivals.try_recv().is_err());
+        let mut first = Vec::new();
+        while let Ok(answer) = arrivals.try_recv() {
+            first.push(answer);
+        }
+        assert_eq!(first.len(), SNAP_PER_PEER);
 
         paced.inner.snap_peers.store(4, Ordering::SeqCst);
-        first.send(()).unwrap();
+        for answer in first {
+            answer.send(()).unwrap();
+        }
         for _ in 0..2 {
             settle().await;
             let mut out = Vec::new();
             while let Ok(answer) = arrivals.try_recv() {
                 out.push(answer);
             }
-            assert_eq!(out.len(), 4, "requests out across four snap/2 peers");
+            assert_eq!(
+                out.len(),
+                4 * SNAP_PER_PEER,
+                "requests out across four snap/2 peers"
+            );
             for answer in out {
                 answer.send(()).unwrap();
             }

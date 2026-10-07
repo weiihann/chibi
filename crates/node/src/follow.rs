@@ -34,9 +34,9 @@ const BODY_BATCH: usize = 64;
 /// Proofs a warm pass gathers before merging them, so requests see its progress early.
 const WARM_MERGE: usize = 64;
 
-/// Warm proofs in flight at once. reth keeps one snap request in flight per peer, so a wallet
-/// request or a BAL fetch queues behind at most this many warm proofs.
-const WARM_IN_FLIGHT: usize = 2;
+/// Warm requests in flight at once: half of one snap/2 peer's slots, so a wallet request or a
+/// BAL fetch always finds the other half.
+const WARM_IN_FLIGHT: usize = 8;
 
 /// Which blocks have been searched for pending transactions.
 ///
