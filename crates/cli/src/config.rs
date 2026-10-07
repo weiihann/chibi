@@ -156,22 +156,24 @@ impl Config {
         toml::from_str(text)
     }
 
-    /// Reads and parses the config file at `path`.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| {
-            if source.kind() == io::ErrorKind::NotFound {
-                ConfigError::Missing(path.to_owned())
-            } else {
-                ConfigError::Read {
+    /// Reads and parses the config file at `path`; `None` when there is no file.
+    pub fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ConfigError::Read {
                     path: path.to_owned(),
                     source,
-                }
+                });
             }
-        })?;
-        Self::parse(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_owned(),
-            source,
-        })
+        };
+        Self::parse(&text)
+            .map(Some)
+            .map_err(|source| ConfigError::Parse {
+                path: path.to_owned(),
+                source,
+            })
     }
 
     /// Writes the config to `path`, creating its directory.
@@ -257,6 +259,13 @@ impl Config {
     /// The URL a wallet uses to reach the JSON-RPC server.
     pub fn rpc_url(&self) -> String {
         format!("http://{}:{}", self.rpc_host.url_host(), self.rpc_port)
+    }
+}
+
+impl Default for Config {
+    /// Sepolia on 127.0.0.1:8545 with nothing pinned: what `chibi run` uses without a file.
+    fn default() -> Self {
+        Self::new(Network::default(), Vec::new())
     }
 }
 
@@ -582,9 +591,6 @@ pub enum ConfigError {
         "cannot locate the data directory: neither XDG_DATA_HOME nor HOME is an absolute path; set data_dir in the config"
     )]
     NoDataDir,
-    /// No config file exists yet.
-    #[error("no config at {}; run `chibi init` first", .0.display())]
-    Missing(PathBuf),
     /// The file exists but could not be read.
     #[error("failed to read {}: {source}", path.display())]
     Read {
@@ -845,7 +851,7 @@ mod tests {
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("tokens"), "{text}");
-        assert_eq!(Config::load(&path).unwrap(), config);
+        assert_eq!(Config::load(&path).unwrap(), Some(config));
     }
 
     #[test]
@@ -1015,15 +1021,13 @@ mod tests {
         assert!(text.contains(r#"rpc_host = "::1""#), "{text}");
         assert!(text.contains("[[contracts]]"), "{text}");
         assert!(text.contains(r#"slots = ["0x1", "0xffff"#), "{text}");
-        assert_eq!(Config::load(&path).unwrap(), config);
+        assert_eq!(Config::load(&path).unwrap(), Some(config));
     }
 
     #[test]
-    fn missing_file_says_to_run_init() {
+    fn missing_file_loads_as_none() {
         let dir = tempfile::tempdir().unwrap();
-        let error = Config::load(&dir.path().join("config.toml")).unwrap_err();
-        assert!(matches!(error, ConfigError::Missing(_)), "{error}");
-        assert!(error.to_string().contains("chibi init"));
+        assert_eq!(Config::load(&dir.path().join("config.toml")).unwrap(), None);
     }
 
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {

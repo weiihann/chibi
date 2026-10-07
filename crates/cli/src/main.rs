@@ -23,7 +23,7 @@ use chibi_node::{Disk, Network, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 use eyre::WrapErr;
 
-use crate::config::{Config, ConfigError, default_config_path, default_data_root, process_env};
+use crate::config::{Config, default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::run::RunArgs;
 
@@ -79,7 +79,7 @@ fn main() -> eyre::Result<()> {
         Command::Init(answers) => init::init(answers, &path, named.as_deref()),
         Command::Run(args) => run::run(&args, &path, named.as_deref()),
         Command::Stop { network } => {
-            let config = Config::load(&path)?;
+            let config = Config::load(&path)?.unwrap_or_default();
             let network = network.unwrap_or(config.network);
             run::stop(network, &config.network_dir(network, process_env)?)
         }
@@ -96,23 +96,11 @@ fn named_config(flag: Option<PathBuf>, env: impl Fn(&str) -> Option<OsString>) -
     })
 }
 
-/// The network to show and its data directory. Without a config file, `--network` alone still
-/// finds the default data directory.
+/// The network to show and its data directory, from the defaults when there is no config file.
 fn status_target(network: Option<Network>, path: &Path) -> eyre::Result<(Network, PathBuf)> {
-    match Config::load(path) {
-        Ok(config) => {
-            let network = network.unwrap_or(config.network);
-            Ok((network, config.network_dir(network, process_env)?))
-        }
-        Err(ConfigError::Missing(missing)) => match network {
-            Some(network) => Ok((
-                network,
-                default_data_root(process_env)?.join(network.name()),
-            )),
-            None => Err(ConfigError::Missing(missing).into()),
-        },
-        Err(err) => Err(err.into()),
-    }
+    let config = Config::load(path)?.unwrap_or_default();
+    let network = network.unwrap_or(config.network);
+    Ok((network, config.network_dir(network, process_env)?))
 }
 
 fn status(network: Option<Network>, path: &Path) -> eyre::Result<()> {

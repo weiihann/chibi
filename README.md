@@ -34,14 +34,19 @@ JSON-RPC opens as soon as the head is verified. Pins and other keys are proven i
 git clone https://github.com/weiihann/chibi
 cd chibi
 ./install.sh
+chibi run
 ```
 
-`install.sh` builds and installs the `chibi` binary with cargo and runs `chibi init`. It does not start chibi.
+When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id. That is all the setup chibi needs: it learns the accounts and storage slots your wallet reads (see [What chibi keeps](#what-chibi-keeps)).
 
-`chibi init` asks, in order:
+`install.sh` builds and installs the `chibi` binary with cargo and, on a terminal, runs `chibi init`. Every question has a default, so pressing Enter through them is fine. It does not start chibi.
+
+A config file is optional. Without one, `chibi run`, `run -b`, `status`, and `stop` use Sepolia, JSON-RPC on `127.0.0.1:8545`, no pins, and the default data directory; `chibi run` logs that it found no config and where `chibi init` would write one.
+
+`chibi init` chooses the network, host, port, and optional pins. It asks, in order:
 
 1. The network (Sepolia by default).
-2. Watch-only addresses. Paste as many as you like and press Enter on an empty line to finish.
+2. Watch-only addresses to pin, optional. Paste as many as you like and press Enter on an empty line to finish; an empty first line pins none.
 3. The RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default).
 
 It writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is set to an absolute path, otherwise to `~/.config/chibi/`, on macOS and Linux alike. In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:
@@ -50,7 +55,7 @@ It writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is s
 chibi init --network sepolia --address 0xYourAddress --rpc-host 127.0.0.1 --rpc-port 8545
 ```
 
-`--data-dir PATH` writes a `data_dir` into the config (see below). A fresh config has no `tokens`. When `chibi init` overwrites an existing config, it keeps that config's `tokens` and `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so.
+`--data-dir PATH` writes a `data_dir` into the config (see below). A fresh config has no `tokens`. When `chibi init` overwrites an existing config, it keeps that config's `tokens` and `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so. A config file that exists must parse: `chibi run` refuses a malformed one rather than falling back to the defaults.
 
 Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent; an empty `CHIBI_CONFIG` counts as unset:
 
@@ -73,7 +78,7 @@ On first start chibi needs a weak-subjectivity checkpoint for the light client. 
 
 chibi then waits for a devp2p peer that serves snap/2, logging progress every 30 seconds. On Sepolia this has taken from a few seconds to several minutes, because few peers serve it (on 2026-10-05 only Nethermind nodes did). chibi dials a short list of known snap/2 peers and the outbound snap/2 peers it reached on earlier runs first. The JSON-RPC server opens only after the first verified head.
 
-When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
+When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id (with a config, the URL uses its `rpc_host` and `rpc_port`).
 
 `chibi status` reads the snapshot saved at the last verified head, so it works without a running node. For each watched address it shows the address's primary ENS name, ETH, the nonce, every pinned token (`?` until computed), and any other listed token whose balance chibi can compute from the keys it holds and is not zero, in list order. An unpinned token appears only after something read its keys. Those values are labeled with their block and are not re-verified.
 

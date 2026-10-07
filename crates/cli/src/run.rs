@@ -59,15 +59,22 @@ pub struct RunArgs {
     pub detached: bool,
 }
 
-/// Loads the config at `path` with the command-line overrides applied. A network override
-/// tracks the same token symbols at that network's addresses.
+/// Loads the config at `path`, or the defaults when there is no file, with the command-line
+/// overrides applied. A network override tracks the same token symbols at that network's
+/// addresses.
 pub fn load(
     path: &Path,
     network: Option<Network>,
     rpc_host: Option<RpcHost>,
     rpc_port: Option<NonZeroU16>,
 ) -> eyre::Result<Config> {
-    let mut config = Config::load(path)?;
+    let mut config = Config::load(path)?.unwrap_or_else(|| {
+        info!(
+            "no config at {}; using the defaults. `chibi init` writes one there",
+            path.display()
+        );
+        Config::default()
+    });
     if let Some(network) = network {
         config.set_network(network)?;
     }
@@ -83,17 +90,19 @@ pub fn load(
 /// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`.
 /// `path` is absolute; `config_flag` is the config the user named, repeated in hints.
 pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
+    if !args.background {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .with_ansi(!args.detached)
+            .init();
+    }
     let config = load(path, args.network, args.rpc_host.clone(), args.rpc_port)?;
     let data_dir = config.network_dir(config.network, process_env)?;
     if args.background {
         return start_background(args, &config, &data_dir, path, config_flag);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_ansi(!args.detached)
-        .init();
     let rpc_config = config.rpc()?;
     let listener = rpc::bind(rpc_config.addr)?;
     let served = Served {

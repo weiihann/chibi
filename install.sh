@@ -18,7 +18,7 @@ echo
 if [ -t 0 ]; then
     "$bin/chibi" init
 else
-    echo "Input is not a terminal, so chibi was not set up. Run \`chibi init\` to write its config."
+    echo "Input is not a terminal, so \`chibi init\` was not run. chibi runs on the defaults without a config; run \`chibi init\` to choose others."
 fi
 
 echo

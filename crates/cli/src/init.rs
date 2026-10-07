@@ -128,7 +128,7 @@ fn collect<A: Ask>(
         if !ask.overwrite(path)? {
             return Ok(None);
         }
-        Config::load(path).ok()
+        Config::load(path).ok().flatten()
     } else {
         None
     };
@@ -192,7 +192,7 @@ impl Ask for Screens {
         loop {
             let taken = addresses.clone();
             let help = if addresses.is_empty() {
-                "0x followed by 40 hex digits"
+                "0x followed by 40 hex digits, or Enter for none"
             } else {
                 "another address, or Enter to finish"
             };
@@ -323,11 +323,7 @@ enum AddressAnswer {
 
 fn address_answer(text: &str, taken: &[Address]) -> AddressAnswer {
     if text.is_empty() {
-        return if taken.is_empty() {
-            AddressAnswer::Retry("Enter at least one address.".to_owned())
-        } else {
-            AddressAnswer::Finish
-        };
+        return AddressAnswer::Finish;
     }
     match parse_address(text) {
         Ok(address) if taken.contains(&address) => {
@@ -350,9 +346,6 @@ fn prompt_addresses<R: BufRead, W: Write>(
             format_args!("Watch-only address (blank to finish): "),
         )?;
         let Some(answer) = answer else {
-            if addresses.is_empty() {
-                return Err(InitError::Ended("a watch-only address was entered"));
-            }
             return Ok(addresses);
         };
         match address_answer(&answer, &addresses) {
@@ -704,7 +697,7 @@ mod tests {
         let custom = answered(Some(dir.path().join("data")));
         assert_eq!(custom.data_dir, Some(dir.path().join("data")));
         custom.save(&path).unwrap();
-        assert_eq!(Config::load(&path).unwrap(), custom);
+        assert_eq!(Config::load(&path).unwrap(), Some(custom));
 
         let relative = absolute_path("data").unwrap();
         assert!(relative.is_absolute() && relative.ends_with("data"));
