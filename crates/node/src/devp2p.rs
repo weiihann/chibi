@@ -119,7 +119,9 @@ struct SnapLoad {
 
 impl SnapLoad {
     /// Hands `send` the snap/2 session in `sessions` with the fewest requests in flight and
-    /// waits for the reply it returns.
+    /// waits for the reply it returns. The request counts against the session until reth
+    /// resolves the reply, even if the caller stops waiting first, because reth keeps the
+    /// request out at the peer until then.
     async fn submit(
         self: &Arc<Self>,
         mut sessions: watch::Receiver<Sessions>,
@@ -127,10 +129,17 @@ impl SnapLoad {
     ) -> Result<(PeerId, SnapResponse), NetError> {
         let lease = self.lease(&mut sessions).await?;
         let peer = lease.peer.0;
-        match send(peer).await {
-            Ok(Ok(response)) => Ok((peer, response)),
-            Ok(Err(err)) => Err(net_error(&err, SNAP)),
-            Err(_) => Err(NetError::Rejected),
+        let reply = send(peer);
+        let (forward, forwarded) = oneshot::channel();
+        tokio::spawn(async move {
+            let reply = reply.await;
+            drop(lease);
+            forward.send(reply).ok();
+        });
+        match forwarded.await {
+            Ok(Ok(Ok(response))) => Ok((peer, response)),
+            Ok(Ok(Err(err))) => Err(net_error(&err, SNAP)),
+            Ok(Err(_)) | Err(_) => Err(NetError::Rejected),
         }
     }
 
