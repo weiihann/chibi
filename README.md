@@ -8,7 +8,7 @@ chibi is early software. It targets Sepolia first. Mainnet support exists in the
 
 - A sync-committee light client ([helios](https://github.com/a16z/helios)) vouches for execution block hashes. chibi fetches each header over devp2p and checks its hash.
 - Account and storage values come from single-key snap/2 range proofs, checked against the verified header's state root. A key chibi never fetched is never read as zero.
-- chibi keeps only the state your wallet and dapps read, up to 1024 keys (see [What chibi keeps](#what-chibi-keeps)).
+- chibi keeps only the state your wallet and dapps read (see [What chibi keeps](#what-chibi-keeps)).
 - After the Glamsterdam upgrade, each block's access list (EIP-7928) keeps those keys current. Before it, chibi proves the pins again at every new head and re-proves the other keys in the background.
 - `eth_call` and `eth_estimateGas` run in a local EVM. A missing key is fetched with a proof and the call runs again.
 - Signed transactions go straight to devp2p peers. chibi finds them in verified block bodies and checks their receipts against the block's receipts root.
@@ -17,7 +17,7 @@ The design and its tradeoffs are in [docs/DESIGN.md](docs/DESIGN.md). The decisi
 
 ## What chibi keeps
 
-chibi remembers the state your wallet and dapps read. You don't pick tokens. Watched addresses, plus any `tokens` or `[[contracts]]` in the config, are pins: they are kept proven at every head and are never dropped. Everything else a request reads is remembered, up to 1024 keys, dropping the least recently used. It is kept current at every head.
+chibi remembers the state your wallet and dapps read, as accounts and storage slots. You don't pick tokens. Watched addresses, plus any `tokens` or `[[contracts]]` in the config, are pins: they are kept proven at every head and are never dropped. Everything else a request reads is remembered and kept current at every head. Once pins and remembered keys together pass 1024, the least recently used remembered key is dropped. Pins never count against that: a pinned set larger than 1024 is kept whole, and then nothing else is remembered.
 
 Remembered keys survive restarts: chibi saves them in `chibi.db`, most recently used first, and after a restart proves them again in that order in the background. Pins are not saved; they come from the config at every start.
 
