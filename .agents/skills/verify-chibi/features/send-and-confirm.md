@@ -37,4 +37,4 @@ Preconditions:
 - Receipts exist only for transactions sent through this chibi instance. Looking up someone else's transaction returns `null`.
 - A stale head (see `doctor.sh`) stalls inclusion: the receipt never appears until a snap/2 peer returns.
 - Never write the private key into evidence. `cast send --json` output does not contain it; keep it that way when adding commands.
-- Pending transactions survive a restart through the outbox in `state.json`. `cleanup.sh` deletes that file, so finish the receipt check before cleanup.
+- Pending transactions survive a restart through the outbox in the data directory's `chibi.db`. `cleanup.sh` deletes the data directory, so finish the receipt check before cleanup.
