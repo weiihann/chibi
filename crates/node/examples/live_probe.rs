@@ -16,7 +16,7 @@ use alloy_primitives::{Address, B256, address, b256, keccak256};
 use chibi_core::verify;
 use chibi_core::wire::{AccountRangeRequest, StorageRangeRequest};
 use chibi_node::beacon::{self, Beacon, BeaconConfig};
-use chibi_node::devp2p::{Devp2p, HeadHint, Ports, Sessions, rng_secret_key};
+use chibi_node::devp2p::{Devp2p, HeadHint, NetConfig, Sessions, rng_secret_key};
 use chibi_node::{Heads, NetError, Network, NetworkSpec, Peers};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -61,10 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let net = Devp2p::start(
         &spec,
         rng_secret_key(),
-        Ports {
-            rlpx: 0,
-            discovery: 0,
-        },
+        &NetConfig::default(),
         HeadHint::Attested(trusted),
     )
     .await?;

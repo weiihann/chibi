@@ -32,6 +32,7 @@ use reth_network::eth_requests::IncomingEthRequest;
 use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
 use reth_network::{
     FetchClient, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkHandle, NetworkManager,
+    PeersConfig,
 };
 use reth_network_api::{Direction, PeerRequest, Peers as _};
 use reth_network_p2p::block_access_lists::client::{BalRequirement, BlockAccessListsClient};
@@ -41,7 +42,8 @@ use reth_network_p2p::error::{RequestError, RequestResult};
 use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
 use reth_network_p2p::receipts::client::ReceiptsClient;
 use reth_network_p2p::snap::client::SnapResponse;
-use reth_network_peers::{NodeRecord, PeerId};
+pub use reth_network_peers::NodeRecord;
+use reth_network_peers::{PeerId, TrustedPeer};
 use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
@@ -71,12 +73,66 @@ const BAL_SOURCES: &str = "snap/2 or eth/71";
 const SNAP_2: Capability = Capability::snap_2();
 
 /// Local listening ports. Zero lets the operating system pick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ports {
     /// RLPx TCP port.
     pub rlpx: u16,
     /// discv4 UDP port.
     pub discovery: u16,
+}
+
+/// How chibi joins the devp2p network beyond what its [`NetworkSpec`] gives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetConfig {
+    /// Local listening ports.
+    pub ports: Ports,
+    /// Nodes always dialed and kept, besides the network's built-in snap/2 peers.
+    pub trusted_peers: Vec<NodeRecord>,
+    /// Connect to `trusted_peers` only, dialing no built-in, remembered or discovered peer.
+    pub trusted_only: bool,
+    /// Discovery boot nodes in place of the network's.
+    pub boot_nodes: Option<Vec<NodeRecord>>,
+    /// Most outbound sessions; reth's default when `None`.
+    pub max_outbound: Option<usize>,
+    /// Most inbound sessions; reth's default when `None`.
+    pub max_inbound: Option<usize>,
+    /// Run no discovery, dialing only the peers given.
+    pub disable_discovery: bool,
+}
+
+impl NetConfig {
+    /// The nodes discovery starts from: the configured ones, else the network's, except when
+    /// only trusted peers may connect.
+    fn boot_nodes<'a>(&'a self, spec: &'a NetworkSpec) -> &'a [NodeRecord] {
+        match &self.boot_nodes {
+            Some(nodes) => nodes,
+            None if self.trusted_only => &[],
+            None => &spec.boot_nodes,
+        }
+    }
+
+    /// The peers to dial at start besides the trusted ones, which reth dials itself: the
+    /// network's built-in snap/2 peers and `remembered`, unless only trusted peers may connect.
+    pub fn known_peers(&self, spec: &NetworkSpec, remembered: Vec<NodeRecord>) -> Vec<NodeRecord> {
+        if self.trusted_only {
+            return Vec::new();
+        }
+        spec.snap_peers.iter().copied().chain(remembered).collect()
+    }
+
+    fn peers_config(&self) -> PeersConfig {
+        PeersConfig::default()
+            .with_trusted_nodes(
+                self.trusted_peers
+                    .iter()
+                    .copied()
+                    .map(TrustedPeer::from)
+                    .collect(),
+            )
+            .with_trusted_nodes_only(self.trusted_only)
+            .with_max_outbound_opt(self.max_outbound)
+            .with_max_inbound_opt(self.max_inbound)
+    }
 }
 
 /// The head chibi advertises when the network starts.
@@ -236,11 +292,11 @@ pub struct Devp2p {
 }
 
 impl Devp2p {
-    /// Starts discovery and sessions for `spec`, advertising snap/2 and `head`.
+    /// Starts discovery and sessions for `spec` as `net` says, advertising snap/2 and `head`.
     pub async fn start(
         spec: &NetworkSpec,
         secret_key: SecretKey,
-        ports: Ports,
+        net: &NetConfig,
         head: HeadHint<'_>,
     ) -> Result<Self, Devp2pError> {
         let tokio = Handle::try_current().map_err(|_| Devp2pError::NoRuntime)?;
@@ -266,9 +322,11 @@ impl Devp2p {
             }
         };
         let config = NetworkConfigBuilder::eth(secret_key, runtime)
-            .boot_nodes(spec.boot_nodes.iter().copied())
-            .listener_port(ports.rlpx)
-            .discovery_port(ports.discovery)
+            .boot_nodes(net.boot_nodes(spec).iter().copied())
+            .listener_port(net.ports.rlpx)
+            .discovery_port(net.ports.discovery)
+            .peer_config(net.peers_config())
+            .disable_discovery_if(net.disable_discovery)
             .set_head(head)
             .with_snap(true)
             .disable_tx_gossip(true)

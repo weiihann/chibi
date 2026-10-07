@@ -17,7 +17,8 @@ use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, InquireError, Select, Text};
 
 use crate::config::{
-    Config, ConfigArgs, DEFAULT_RPC_PORT, InvalidRpcHost, RpcHost, parse_address, process_env,
+    Config, ConfigArgs, DEFAULT_RPC_PORT, InvalidConfig, InvalidRpcHost, RpcHost, parse_address,
+    process_env,
 };
 
 /// How long the port check waits for a listener to accept.
@@ -53,6 +54,8 @@ pub enum InitError {
     Cancelled,
     #[error(transparent)]
     Host(#[from] InvalidRpcHost),
+    #[error(transparent)]
+    Config(#[from] InvalidConfig),
     #[error("prompt failed: {0}")]
     Prompt(InquireError),
 }
@@ -201,6 +204,7 @@ fn collect<A: Ask>(
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
     args.keys.apply(&mut config);
+    config.validate()?;
     let mut carried = Carried::default();
     if let Some(existing) = existing {
         if config.data_dir.is_none() {
@@ -873,6 +877,7 @@ mod tests {
             assert!(text.contains(&line), "{line} in {text}");
         }
         assert_eq!(Config::load(&path).unwrap(), Some(config));
+        std::fs::remove_file(&path).unwrap();
 
         let error = answered(ConfigArgs {
             disable_discovery: true,

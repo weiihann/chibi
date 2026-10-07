@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
-use crate::devp2p::{Devp2p, Devp2pError, HeadHint, Ports};
+use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig};
 use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
 use crate::follow::Search;
@@ -100,8 +100,8 @@ pub struct NodeConfig {
     pub checkpoint: Option<B256>,
     /// Pins: watched addresses and contracts kept proven at every head.
     pub watch: Watchlist,
-    /// devp2p listen ports.
-    pub ports: Ports,
+    /// How to join the devp2p network: ports, trusted peers, boot nodes, limits, discovery.
+    pub net: NetConfig,
 }
 
 /// What the user pinned. Everything else chibi keeps is learned from requests, except the
@@ -370,12 +370,7 @@ impl Node<Devp2p> {
         let spec = config.network.spec();
         let disk = Disk::open(&config.data_dir)?;
         let secret_key = disk.secret_key()?;
-        let known_peers: Vec<_> = spec
-            .snap_peers
-            .iter()
-            .copied()
-            .chain(disk.read(Saved::peers))
-            .collect();
+        let known_peers = config.net.known_peers(&spec, disk.read(Saved::peers));
         let checkpoint = checkpoint(&spec, config.checkpoint, &config.data_dir).await?;
         let url = match config.beacon_url {
             Some(url) => url,
@@ -401,9 +396,9 @@ impl Node<Devp2p> {
         info!(target: "chibi::node", network = %spec.network, hash = %trusted.hash(), "light client synced");
 
         let net =
-            Devp2p::start(&spec, secret_key, config.ports, HeadHint::Attested(trusted)).await?;
+            Devp2p::start(&spec, secret_key, &config.net, HeadHint::Attested(trusted)).await?;
         net.add_peers(&known_peers);
-        wait_for_snap_peer(&net, known_peers.len()).await?;
+        wait_for_snap_peer(&net, known_peers.len() + config.net.trusted_peers.len()).await?;
 
         let (node, mut follower) = Node::with_parts(spec, net, heads, disk, &config.watch).await?;
         follower.beacon = Some(beacon);

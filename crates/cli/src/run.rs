@@ -98,6 +98,7 @@ pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
         config.rpc_port = port;
     }
     args.keys.apply(&mut config);
+    config.validate()?;
     Ok(config)
 }
 
@@ -536,10 +537,10 @@ mod tests {
         use clap::Parser;
 
         let argv = ["chibi", "run"].iter().chain(argv);
-        match crate::Cli::try_parse_from(argv).unwrap().command {
-            crate::Command::Run(args) => args,
-            other => panic!("run parsed to {other:?}"),
-        }
+        let crate::Command::Run(args) = crate::Cli::try_parse_from(argv).unwrap().command else {
+            panic!("run parsed to another command");
+        };
+        args
     }
 
     #[test]

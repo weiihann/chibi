@@ -10,7 +10,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use chibi_node::{Network, Node, NodeConfig, Ports, Watchlist};
+use chibi_node::{NetConfig, Network, Node, NodeConfig, Watchlist};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -38,10 +38,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             addresses: vec![watched],
             contracts: Vec::new(),
         },
-        ports: Ports {
-            rlpx: 0,
-            discovery: 0,
-        },
+        net: NetConfig::default(),
     };
 
     let (node, mut follower) = Node::start(config).await?;

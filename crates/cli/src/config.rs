@@ -4,13 +4,13 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use alloy_primitives::{Address, B256, U256};
 use chibi_node::devp2p::Ports;
-use chibi_node::{Network, NodeConfig, TrackedContract, Watchlist};
+use chibi_node::{NetConfig, Network, NodeConfig, NodeRecord, TrackedContract, Watchlist};
 use clap::Args;
 use serde::de::{Error as _, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -53,9 +53,36 @@ pub struct Config {
     /// devp2p listen port for both RLPx and discovery; the OS picks one when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_port: Option<u16>,
+    /// UDP discovery port when it must differ from `p2p_port`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_port: Option<u16>,
     /// Absolute root of the per-network data directories; the user data directory when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
+    /// Nodes always dialed and kept, besides the network's built-in state peers.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_records"
+    )]
+    pub trusted_peers: Vec<NodeRecord>,
+    /// Connect to `trusted_peers` only: no built-in, remembered or discovered peer.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub trusted_only: bool,
+    /// Discovery boot nodes in place of the network's.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_boot_nodes"
+    )]
+    pub boot_nodes: Option<Vec<NodeRecord>>,
+    /// Most outbound peer sessions; reth's default when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_outbound_peers: Option<NonZeroUsize>,
+    /// Most inbound peer sessions; reth's default when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inbound_peers: Option<usize>,
+    /// Run no peer discovery, dialing only the trusted and built-in peers.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disable_discovery: bool,
     /// Contract accounts tracked with raw storage slots, one entry per address.
     #[serde(
         skip_serializing_if = "Vec::is_empty",
@@ -75,10 +102,32 @@ pub struct ConfigArgs {
     /// Directory to keep per-network data in instead of $XDG_DATA_HOME/chibi.
     #[arg(long, value_name = "PATH", value_parser = absolute_path)]
     pub data_dir: Option<PathBuf>,
+    /// Node chibi always dials and keeps, besides the network's built-in state peers; repeat
+    /// for several.
+    #[arg(long = "trusted-peer", value_name = "ENODE", value_parser = parse_enode)]
+    pub trusted_peers: Vec<NodeRecord>,
+    /// Connect to the trusted peers only.
+    #[arg(long)]
+    pub trusted_only: bool,
+    /// Discovery boot node in place of the network's; repeat for several.
+    #[arg(long = "boot-node", value_name = "ENODE", value_parser = parse_enode)]
+    pub boot_nodes: Vec<NodeRecord>,
+    /// Most outbound peer sessions [default: 100].
+    #[arg(long, value_name = "N")]
+    pub max_outbound_peers: Option<NonZeroUsize>,
+    /// Most inbound peer sessions [default: 30].
+    #[arg(long, value_name = "N")]
+    pub max_inbound_peers: Option<usize>,
+    /// UDP discovery port, when it must differ from p2p_port.
+    #[arg(long, value_name = "PORT")]
+    pub discovery_port: Option<u16>,
+    /// Run no peer discovery; dial only the trusted and built-in peers.
+    #[arg(long)]
+    pub disable_discovery: bool,
 }
 
 impl ConfigArgs {
-    /// Sets every key given on `config`.
+    /// Sets every key given on `config`. Repeated flags replace the configured list.
     pub fn apply(&self, config: &mut Config) {
         if let Some(url) = &self.beacon_url {
             config.beacon_url = Some(url.clone());
@@ -86,6 +135,23 @@ impl ConfigArgs {
         if let Some(dir) = &self.data_dir {
             config.data_dir = Some(dir.clone());
         }
+        if !self.trusted_peers.is_empty() {
+            config.trusted_peers.clone_from(&self.trusted_peers);
+        }
+        config.trusted_only |= self.trusted_only;
+        if !self.boot_nodes.is_empty() {
+            config.boot_nodes = Some(self.boot_nodes.clone());
+        }
+        if let Some(max) = self.max_outbound_peers {
+            config.max_outbound_peers = Some(max);
+        }
+        if let Some(max) = self.max_inbound_peers {
+            config.max_inbound_peers = Some(max);
+        }
+        if let Some(port) = self.discovery_port {
+            config.discovery_port = Some(port);
+        }
+        config.disable_discovery |= self.disable_discovery;
     }
 
     /// The flags that give the same keys again.
@@ -97,8 +163,36 @@ impl ConfigArgs {
         if let Some(dir) = &self.data_dir {
             argv.extend(["--data-dir".into(), dir.as_os_str().to_owned()]);
         }
+        for record in &self.trusted_peers {
+            argv.extend(["--trusted-peer".into(), record.to_string().into()]);
+        }
+        if self.trusted_only {
+            argv.push("--trusted-only".into());
+        }
+        for record in &self.boot_nodes {
+            argv.extend(["--boot-node".into(), record.to_string().into()]);
+        }
+        if let Some(max) = self.max_outbound_peers {
+            argv.extend(["--max-outbound-peers".into(), max.to_string().into()]);
+        }
+        if let Some(max) = self.max_inbound_peers {
+            argv.extend(["--max-inbound-peers".into(), max.to_string().into()]);
+        }
+        if let Some(port) = self.discovery_port {
+            argv.extend(["--discovery-port".into(), port.to_string().into()]);
+        }
+        if self.disable_discovery {
+            argv.push("--disable-discovery".into());
+        }
         argv
     }
+}
+
+/// Parses an `enode://` URL as a node record.
+fn parse_enode(text: &str) -> Result<NodeRecord, String> {
+    text.trim()
+        .parse()
+        .map_err(|err| format!("{text:?} is not an enode URL: {err}"))
 }
 
 /// `text` as an absolute path, resolved against the working directory.
@@ -132,7 +226,21 @@ struct ConfigFile {
     #[serde(default)]
     p2p_port: Option<u16>,
     #[serde(default)]
+    discovery_port: Option<u16>,
+    #[serde(default)]
     data_dir: Option<PathBuf>,
+    #[serde(default)]
+    trusted_peers: Vec<String>,
+    #[serde(default)]
+    trusted_only: bool,
+    #[serde(default)]
+    boot_nodes: Option<Vec<String>>,
+    #[serde(default)]
+    max_outbound_peers: Option<NonZeroUsize>,
+    #[serde(default)]
+    max_inbound_peers: Option<usize>,
+    #[serde(default)]
+    disable_discovery: bool,
     #[serde(default)]
     contracts: Vec<ContractEntry>,
 }
@@ -156,8 +264,13 @@ impl TryFrom<ConfigFile> for Config {
         if let Some(dir) = file.data_dir.as_ref().filter(|dir| !dir.is_absolute()) {
             return Err(InvalidConfig::RelativeDataDir(dir.clone()));
         }
-        Ok(Self {
+        let config = Self {
             contracts: parse_contracts(&file.contracts)?,
+            trusted_peers: parse_records("trusted_peers", &file.trusted_peers)?,
+            boot_nodes: file
+                .boot_nodes
+                .map(|texts| parse_records("boot_nodes", &texts))
+                .transpose()?,
             network: file.network,
             addresses: file.addresses,
             beacon_url: file.beacon_url,
@@ -167,8 +280,15 @@ impl TryFrom<ConfigFile> for Config {
             cors_origins: file.cors_origins,
             allowed_hosts: file.allowed_hosts,
             p2p_port: file.p2p_port,
+            discovery_port: file.discovery_port,
             data_dir: file.data_dir,
-        })
+            trusted_only: file.trusted_only,
+            max_outbound_peers: file.max_outbound_peers,
+            max_inbound_peers: file.max_inbound_peers,
+            disable_discovery: file.disable_discovery,
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -185,9 +305,29 @@ impl Config {
             cors_origins: default_cors_origins(),
             allowed_hosts: AllowedHost::loopback(),
             p2p_port: None,
+            discovery_port: None,
             data_dir: None,
+            trusted_peers: Vec::new(),
+            trusted_only: false,
+            boot_nodes: None,
+            max_outbound_peers: None,
+            max_inbound_peers: None,
+            disable_discovery: false,
             contracts: Vec::new(),
         }
+    }
+
+    /// Checks the rules between keys, which flags can break after the file parsed: trusted
+    /// peers to connect to under `trusted_only`, and a peer to dial without discovery.
+    pub fn validate(&self) -> Result<(), InvalidConfig> {
+        if self.trusted_only && self.trusted_peers.is_empty() {
+            return Err(InvalidConfig::TrustedOnlyWithoutPeers);
+        }
+        let built_in = !self.trusted_only && !self.network.spec().snap_peers.is_empty();
+        if self.disable_discovery && self.trusted_peers.is_empty() && !built_in {
+            return Err(InvalidConfig::NothingToDial);
+        }
+        Ok(())
     }
 
     /// Parses the TOML text of a config file.
@@ -260,9 +400,17 @@ impl Config {
                 addresses: self.addresses.clone(),
                 contracts: self.contracts.clone(),
             },
-            ports: Ports {
-                rlpx: port,
-                discovery: port,
+            net: NetConfig {
+                ports: Ports {
+                    rlpx: port,
+                    discovery: self.discovery_port.unwrap_or(port),
+                },
+                trusted_peers: self.trusted_peers.clone(),
+                trusted_only: self.trusted_only,
+                boot_nodes: self.boot_nodes.clone(),
+                max_outbound: self.max_outbound_peers.map(NonZeroUsize::get),
+                max_inbound: self.max_inbound_peers,
+                disable_discovery: self.disable_discovery,
             },
         }
     }
@@ -446,6 +594,24 @@ pub enum InvalidConfig {
     /// `data_dir` would depend on the directory chibi is started from.
     #[error("data_dir {} is not an absolute path", .0.display())]
     RelativeDataDir(PathBuf),
+    /// A `trusted_peers` or `boot_nodes` entry that is not an enode URL.
+    #[error("{key}[{index}]: {reason}")]
+    Enode {
+        /// The key the entry is under.
+        key: &'static str,
+        /// Position of the entry in the list.
+        index: usize,
+        /// What was wrong with it, quoting the entry.
+        reason: String,
+    },
+    /// `trusted_only` with no peer it may connect to.
+    #[error("trusted_only = true needs at least one trusted_peers entry to connect to")]
+    TrustedOnlyWithoutPeers,
+    /// `disable_discovery` with no trusted peer and no built-in state peer to dial.
+    #[error(
+        "disable_discovery = true leaves nothing to dial: add trusted_peers or turn discovery back on"
+    )]
+    NothingToDial,
 }
 
 /// A `[[contracts]]` entry that names no valid address or slot.
@@ -471,6 +637,17 @@ pub enum InvalidContract {
         /// The slot as written.
         slot: String,
     },
+}
+
+/// The node records `texts` name, under `key` in the file.
+fn parse_records(key: &'static str, texts: &[String]) -> Result<Vec<NodeRecord>, InvalidConfig> {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            parse_enode(text).map_err(|reason| InvalidConfig::Enode { key, index, reason })
+        })
+        .collect()
 }
 
 /// One tracked contract per address, in first-seen order, with its slots deduplicated in order.
@@ -634,6 +811,23 @@ fn deserialize_addresses<'de, D: Deserializer<'de>>(
         .iter()
         .map(|text| parse_address(text).map_err(D::Error::custom))
         .collect()
+}
+
+fn serialize_records<S: Serializer>(
+    records: &[NodeRecord],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(records.iter().map(NodeRecord::to_string))
+}
+
+fn serialize_boot_nodes<S: Serializer>(
+    records: &Option<Vec<NodeRecord>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match records {
+        Some(records) => serialize_records(records, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn serialize_addresses<S: Serializer>(
@@ -837,7 +1031,11 @@ mod tests {
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         for line in [
-            format!("trusted_peers = [\"{}\", \"{}\"]", enode(1, 30303), enode(2, 30305)),
+            format!(
+                "trusted_peers = [\"{}\", \"{}\"]",
+                enode(1, 30303),
+                enode(2, 30305)
+            ),
             "trusted_only = true".to_owned(),
             "boot_nodes = []".to_owned(),
             "max_outbound_peers = 3".to_owned(),
@@ -851,12 +1049,7 @@ mod tests {
 
         Config::default().save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        for key in [
-            "trusted",
-            "boot_nodes",
-            "max_",
-            "discovery",
-        ] {
+        for key in ["trusted", "boot_nodes", "max_", "discovery"] {
             assert!(!text.contains(key), "{key} in {text}");
         }
     }
@@ -869,7 +1062,8 @@ mod tests {
             enode(1, 30303)
         ));
         assert!(
-            trusted.contains("trusted_peers[1]: \"enode://bad@10.0.0.1:30303\" is not an enode URL"),
+            trusted
+                .contains("trusted_peers[1]: \"enode://bad@10.0.0.1:30303\" is not an enode URL"),
             "{trusted}"
         );
         let boot = error("boot_nodes = [\"10.0.0.1:30303\"]".to_owned());
