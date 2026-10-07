@@ -14,7 +14,7 @@ use chibi_core::wire::{
 };
 use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::debug;
 
 /// How long a peer may take to answer one request, counted from when it is sent.
@@ -138,11 +138,15 @@ impl<P: Peers> Paced<P> {
         }
     }
 
+    fn wanted(&self) -> usize {
+        self.inner.census().snap_peers.max(1) * SNAP_PER_PEER
+    }
+
     /// Follows the connected snap/2 peers, keeping at least one slot so that reth fails a
-    /// request at once when no snap/2 peer is connected. A slot held while shrinking is
-    /// retired when its request finishes.
+    /// request at once when no snap/2 peer is connected. Free slots are retired here; a slot
+    /// held while the peers shrink is retired when its holder lets go of it.
     fn resize(&self) {
-        let wanted = self.inner.census().snap_peers.max(1) * SNAP_PER_PEER;
+        let wanted = self.wanted();
         let mut capacity = self.capacity.lock();
         if wanted > *capacity {
             self.slots.add_permits(wanted - *capacity);
@@ -159,7 +163,11 @@ impl<P: Peers> Paced<P> {
     ) -> Result<T, NetError> {
         let queued = Instant::now();
         self.resize();
-        let _slot = self.slots.acquire().await.map_err(|_| NetError::Stopped)?;
+        let permit = self.slots.acquire().await.map_err(|_| NetError::Stopped)?;
+        let _slot = Slot {
+            paced: self,
+            permit: Some(permit),
+        };
         let sent = Instant::now();
         let result = timed(request).await;
         debug!(
@@ -171,6 +179,26 @@ impl<P: Peers> Paced<P> {
             "snap request",
         );
         result
+    }
+}
+
+/// A held snap slot. On release it goes back to the semaphore, unless the snap/2 peers have
+/// shrunk below the slots in use, in which case it is retired.
+struct Slot<'a, P: Peers> {
+    paced: &'a Paced<P>,
+    permit: Option<SemaphorePermit<'a>>,
+}
+
+impl<P: Peers> Drop for Slot<'_, P> {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let mut capacity = self.paced.capacity.lock();
+        if *capacity > self.paced.wanted() {
+            permit.forget();
+            *capacity -= 1;
+        }
     }
 }
 
