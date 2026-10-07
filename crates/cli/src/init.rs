@@ -527,6 +527,9 @@ mod tests {
     use std::path::PathBuf;
 
     use alloy_primitives::address;
+    use chibi_core::testing::{WorldAccount, eth};
+    use chibi_node::fixture::{Fixture, FixturePeers};
+    use chibi_node::{BlockSel, Node, Stepped, Watchlist, read_snapshot};
 
     use super::*;
 
@@ -547,12 +550,36 @@ mod tests {
         NonZeroU16::new(port).unwrap()
     }
 
+    /// A node on `network_dir` that saved a snapshot and one learned key. It holds the
+    /// directory until dropped.
+    async fn node_with_saved_state(fixture: &Fixture, network_dir: &Path) -> Node<FixturePeers> {
+        let (node, mut follower) = Node::with_parts(
+            Fixture::spec(&[]),
+            fixture.peers(),
+            fixture.heads(),
+            Disk::open(network_dir).unwrap(),
+            &Watchlist {
+                addresses: vec![ALICE],
+                contracts: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+        node.account(BOB, BlockSel::Latest).await.unwrap();
+        node.save_keys().await.unwrap();
+        node
+    }
+
+    fn alice_and_bob() -> Fixture {
+        Fixture::genesis([
+            (ALICE, WorldAccount::eoa(eth(2))),
+            (BOB, WorldAccount::eoa(eth(3))),
+        ])
+    }
+
     #[tokio::test]
     async fn writing_resets_the_networks_saved_state_and_refuses_while_chibi_runs_there() {
-        use chibi_core::testing::{WorldAccount, eth};
-        use chibi_node::fixture::Fixture;
-        use chibi_node::{BlockSel, Disk, Node, Stepped, Watchlist, read_snapshot};
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut config = Config::new(Network::Mainnet, vec![ALICE]);
@@ -571,26 +598,9 @@ mod tests {
             .map(|()| String::from_utf8(output).unwrap())
         };
 
-        let fixture = Fixture::genesis([
-            (ALICE, WorldAccount::eoa(eth(2))),
-            (BOB, WorldAccount::eoa(eth(3))),
-        ]);
+        let fixture = alice_and_bob();
         {
-            let (node, mut follower) = Node::with_parts(
-                Fixture::spec(&[]),
-                fixture.peers(),
-                fixture.heads(),
-                Disk::open(&network_dir).unwrap(),
-                &Watchlist {
-                    addresses: vec![ALICE],
-                    contracts: Vec::new(),
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(follower.step().await.unwrap(), Stepped::Current);
-            node.account(BOB, BlockSel::Latest).await.unwrap();
-            node.save_keys().await.unwrap();
+            let _node = node_with_saved_state(&fixture, &network_dir).await;
 
             let error = write(&config).unwrap_err().to_string();
             assert_eq!(
@@ -628,6 +638,31 @@ mod tests {
         );
         assert!(!output.contains("reset"), "{output}");
         assert!(!dir.path().join("fresh").exists());
+    }
+
+    #[tokio::test]
+    async fn a_config_that_cannot_be_written_leaves_the_saved_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("config.toml");
+        let mut config = Config::new(Network::Mainnet, vec![ALICE]);
+        config.data_dir = Some(dir.path().join("data"));
+        let network_dir = dir.path().join("data").join("mainnet");
+        drop(node_with_saved_state(&alice_and_bob(), &network_dir).await);
+
+        let mut output = Vec::new();
+        let written = apply(
+            &mut output,
+            &path,
+            &config,
+            &Carried::default(),
+            None,
+            |_| None,
+        );
+        assert!(written.is_err());
+        assert!(output.is_empty(), "{}", String::from_utf8_lossy(&output));
+        assert!(read_snapshot(&network_dir).unwrap().is_some());
     }
 
     #[test]
