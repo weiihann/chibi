@@ -27,7 +27,8 @@ const SLOT_SECONDS: u64 = 12;
 const SEPOLIA_ENS_RESOLVER: Address = address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
 
 /// ENS's UniversalResolver on mainnet.
-const MAINNET_ENS_RESOLVER: Address = address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
+pub(crate) const MAINNET_ENS_RESOLVER: Address =
+    address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
 
 /// A supported network, as named in `config.toml` and on the command line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

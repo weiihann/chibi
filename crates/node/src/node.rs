@@ -188,7 +188,7 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) search: Search,
     /// Blocks holding located transactions whose receipts are not yet verified.
     pub(crate) unreceipted: Vec<VerifiedBody>,
-    /// Token seeding has not completed at the current anchor's store yet.
+    /// Seeding has not completed at the current anchor's store yet.
     pub(crate) seed_due: bool,
 }
 
@@ -239,8 +239,9 @@ pub struct Holding {
     /// The watched address.
     pub address: Address,
     /// The primary ENS name, checked by the resolver to resolve back to the address. `None`
-    /// when there is none, it does not compute from held keys, or the lookup reverts, which
-    /// includes names served offchain. Absent from snapshots saved before names.
+    /// when the address has no name, the name is empty or not UTF-8, the lookup reverts
+    /// (which includes names served offchain), or it does not compute from held keys. Absent
+    /// from snapshots saved before names.
     #[serde(default)]
     pub name: Option<String>,
     /// ETH balance in wei, `None` if not yet proven.
@@ -479,7 +480,7 @@ impl<P: Peers> Node<P> {
     /// Builds a node from its parts and anchors it at the light client's latest head with
     /// nothing proven yet, re-broadcasting pending outbox transactions. The working set starts
     /// with the pins and the learned keys the last run saved; the follower's first step warms
-    /// them and seeds pinned tokens, while requests fetch whatever they miss.
+    /// them and seeds, while requests fetch whatever they miss.
     pub async fn with_parts(
         spec: NetworkSpec,
         peers: P,
@@ -909,7 +910,7 @@ impl<P: Peers> Follower<P> {
         }
     }
 
-    /// Moves to the newest attested head once, seeds pinned tokens if due, warms unheld
+    /// Moves to the newest attested head once, seeds if due, warms unheld
     /// keys, then persists the state.
     pub async fn step(&mut self) -> Result<Stepped, NodeError> {
         self.follow().await

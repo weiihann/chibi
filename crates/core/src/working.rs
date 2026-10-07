@@ -19,7 +19,7 @@ pub struct WorkingSet {
     cap: usize,
     /// Watched accounts and configured contract accounts and slots.
     configured: BTreeSet<Key>,
-    /// Keys read by the last seeding of pinned tokens, minus configured ones.
+    /// Keys read by the last seeding, minus configured ones.
     seeded: BTreeSet<Key>,
     /// Key to the tick of its last use. Ordered so an account's slots form one range.
     learned: BTreeMap<Key, u64>,

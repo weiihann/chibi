@@ -20,7 +20,7 @@ use chibi_core::wire::Transaction;
 
 use crate::disk::{Disk, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR};
-use crate::network::Token;
+use crate::network::{MAINNET_ENS_RESOLVER, Token};
 use crate::node::{
     BlockSel, ContractSnapshot, Follower, Node, NodeError, Stepped, TrackedContract, Watchlist,
     read_snapshot,
@@ -34,9 +34,6 @@ const CAROL: Address = address!("0x00000000000000000000000000000000000ca201");
 const PAUSABLE: Address = address!("0x0000000000000000000000000000000000009a05");
 const PAUSABLE_IMPL: Address = address!("0x0000000000000000000000000000000000002222");
 const NEW_IMPL: Address = address!("0x0000000000000000000000000000000000003333");
-
-/// The fixture spec's ENS UniversalResolver.
-const RESOLVER: Address = address!("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
 
 const TKN: Token = Token {
     symbol: "TKN",
@@ -161,8 +158,7 @@ fn pausable_keys() -> BTreeSet<Key> {
     ])
 }
 
-/// Whether the working set, pinned or learned, has any key of `address`.
-fn holds_key_of(node: &Node<FixturePeers>, address: Address) -> bool {
+fn working_set_has_key_of(node: &Node<FixturePeers>, address: Address) -> bool {
     let (pins, learned) = node.working();
     pins.iter().chain(&learned).any(|key| match key {
         Key::Account(at) | Key::Slot(at, _) => *at == address,
@@ -305,7 +301,7 @@ async fn token_seeding_pins_proxy_keys_and_follows_bal_writes() {
         node.working().0,
         BTreeSet::from([
             Key::Account(ALICE),
-            Key::Account(RESOLVER),
+            Key::Account(MAINNET_ENS_RESOLVER),
             Key::Account(PROXY),
             Key::Account(IMPL),
             Key::Slot(PROXY, impl_slot()),
@@ -343,7 +339,7 @@ async fn a_reseed_that_cannot_complete_keeps_seeded_pins_and_retries() {
     let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], TOKENS).await;
     let seeded = BTreeSet::from([
         Key::Account(ALICE),
-        Key::Account(RESOLVER),
+        Key::Account(MAINNET_ENS_RESOLVER),
         Key::Account(PROXY),
         Key::Account(IMPL),
         Key::Slot(PROXY, impl_slot()),
@@ -367,7 +363,7 @@ async fn a_reseed_that_cannot_complete_keeps_seeded_pins_and_retries() {
         pins,
         BTreeSet::from([
             Key::Account(ALICE),
-            Key::Account(RESOLVER),
+            Key::Account(MAINNET_ENS_RESOLVER),
             Key::Account(PROXY),
             Key::Account(NEW_IMPL),
             Key::Slot(PROXY, impl_slot()),
@@ -405,7 +401,7 @@ async fn a_configured_contract_slot_is_pinned_and_follows_bal_writes() {
         node.working().0,
         BTreeSet::from([
             Key::Account(ALICE),
-            Key::Account(RESOLVER),
+            Key::Account(MAINNET_ENS_RESOLVER),
             Key::Account(IMPL),
             Key::Slot(IMPL, set),
             Key::Slot(IMPL, unset),
@@ -495,8 +491,8 @@ async fn a_registry_token_that_is_not_pinned_is_not_seeded_or_reported() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[TKN]).await;
 
-    assert!(!holds_key_of(&node, PAUSABLE));
-    assert!(!holds_key_of(&node, PAUSABLE_IMPL));
+    assert!(!working_set_has_key_of(&node, PAUSABLE));
+    assert!(!working_set_has_key_of(&node, PAUSABLE_IMPL));
     assert_eq!(
         node.status().snapshot.holdings[0].tokens,
         vec![("TKN".to_owned(), Some(U256::from(250)))]
@@ -518,8 +514,8 @@ async fn a_restart_without_a_token_stops_pinning_it() {
         U256::from(999),
     ));
     let (node, _follower) = start_watching(&fixture, dir.path(), &[ALICE], BOTH, &[TKN]).await;
-    assert!(!holds_key_of(&node, PAUSABLE));
-    assert!(!holds_key_of(&node, PAUSABLE_IMPL));
+    assert!(!working_set_has_key_of(&node, PAUSABLE));
+    assert!(!working_set_has_key_of(&node, PAUSABLE_IMPL));
     assert_eq!(
         node.status().snapshot.holdings[0].tokens,
         vec![("TKN".to_owned(), Some(U256::from(999)))]
@@ -1288,8 +1284,7 @@ async fn garbage_key_rows_are_skipped_and_cost_nothing_else() {
 const NAME_RESOLVER: Address = address!("0x0000000000000000000000000000000000005e50");
 
 /// Code answering `reverse` like the UniversalResolver: `name` for `named`, and the empty
-/// name every unnamed address gets for any other address. It returns a fixed ABI-encoded
-/// `(string, address, address)` chosen by comparing the calldata word holding the address.
+/// name every unnamed address gets for any other address.
 fn reverse_resolver_code(named: Address, name: &[u8]) -> Bytes {
     let unnamed_reply = (String::new(), Address::ZERO, NAME_RESOLVER).abi_encode_params();
     // `bytes` and `string` share an encoding, so a name need not be UTF-8.
@@ -1301,11 +1296,11 @@ fn reverse_resolver_code(named: Address, name: &[u8]) -> Bytes {
     code.extend_from_slice(named.as_slice());
     code.extend_from_slice(&[0; 12]);
     code.extend_from_slice(&[0x60, 0x64, 0x35, 0x14]); // eq(calldataload(0x64), word)
-    let branch = code.len() + 4 + RETURN_DATA_LEN;
+    let branch = code.len() + 4 + RETURN_SLICE_CODE_LEN;
     code.push(0x61); // push2 the named branch
     code.extend_from_slice(&u16::try_from(branch).unwrap().to_be_bytes());
     code.push(0x57); // jumpi
-    let data = branch + 1 + RETURN_DATA_LEN;
+    let data = branch + 1 + RETURN_SLICE_CODE_LEN;
     return_code_slice(&mut code, data, unnamed_reply.len());
     code.push(0x5b); // jumpdest
     return_code_slice(&mut code, data + unnamed_reply.len(), named_reply.len());
@@ -1314,8 +1309,7 @@ fn reverse_resolver_code(named: Address, name: &[u8]) -> Bytes {
     Bytes::from(code)
 }
 
-/// Length of the code [`return_code_slice`] appends.
-const RETURN_DATA_LEN: usize = 15;
+const RETURN_SLICE_CODE_LEN: usize = 15;
 
 /// Appends code returning `len` bytes of the running code from `offset`.
 fn return_code_slice(code: &mut Vec<u8>, offset: usize, len: usize) {
@@ -1332,7 +1326,7 @@ fn return_code_slice(code: &mut Vec<u8>, offset: usize, len: usize) {
     code.push(0x61); // push2 len
     code.extend_from_slice(&len);
     code.extend_from_slice(&[0x60, 0x00, 0xf3]); // return(0, len)
-    assert_eq!(code.len() - start, RETURN_DATA_LEN);
+    assert_eq!(code.len() - start, RETURN_SLICE_CODE_LEN);
 }
 
 /// Code that reverts every call, like the UniversalResolver on a forward-check mismatch or
@@ -1356,7 +1350,7 @@ async fn a_watched_address_shows_its_primary_name_and_bals_keep_it_current() {
         (ALICE, WorldAccount::eoa(eth(2))),
         (BOB, WorldAccount::eoa(eth(3))),
         (
-            RESOLVER,
+            MAINNET_ENS_RESOLVER,
             WorldAccount::contract(reverse_resolver_code(ALICE, b"alice.eth")),
         ),
     ]);
@@ -1364,13 +1358,19 @@ async fn a_watched_address_shows_its_primary_name_and_bals_keep_it_current() {
     let (node, mut follower) = start(&fixture, dir.path(), &[ALICE, BOB], &[]).await;
 
     assert_eq!(names(&node), vec![Some("alice.eth".to_owned()), None]);
-    assert!(node.working().0.contains(&Key::Account(RESOLVER)));
+    assert!(
+        node.working()
+            .0
+            .contains(&Key::Account(MAINNET_ENS_RESOLVER))
+    );
     let saved = read_snapshot(dir.path()).unwrap().unwrap();
     assert_eq!(saved.holdings[0].name.as_deref(), Some("alice.eth"));
     assert_eq!(saved.holdings[1].name, None);
 
     let proofs = fixture.log().proofs;
-    fixture.mine(BlockWrites::default().code(RESOLVER, reverse_resolver_code(BOB, b"bob.eth")));
+    fixture.mine(
+        BlockWrites::default().code(MAINNET_ENS_RESOLVER, reverse_resolver_code(BOB, b"bob.eth")),
+    );
     assert!(matches!(
         follower.step().await.unwrap(),
         Stepped::Extended(_)
@@ -1384,7 +1384,7 @@ async fn a_name_that_is_not_utf8_is_no_name() {
     let fixture = Fixture::genesis([
         (ALICE, WorldAccount::eoa(eth(2))),
         (
-            RESOLVER,
+            MAINNET_ENS_RESOLVER,
             WorldAccount::contract(reverse_resolver_code(ALICE, b"\xff.eth")),
         ),
     ]);
@@ -1397,7 +1397,10 @@ async fn a_name_that_is_not_utf8_is_no_name() {
 #[tokio::test]
 async fn a_reverting_resolver_gives_no_name_and_seeding_still_completes() {
     let mut accounts = token_accounts(250);
-    accounts.push((RESOLVER, WorldAccount::contract(reverting_code())));
+    accounts.push((
+        MAINNET_ENS_RESOLVER,
+        WorldAccount::contract(reverting_code()),
+    ));
     let fixture = Fixture::genesis(accounts);
     let dir = tempfile::tempdir().unwrap();
     let (node, mut follower) = start(&fixture, dir.path(), &[ALICE], TOKENS).await;
@@ -1413,7 +1416,7 @@ async fn a_reverting_resolver_gives_no_name_and_seeding_still_completes() {
         node.working().0,
         BTreeSet::from([
             Key::Account(ALICE),
-            Key::Account(RESOLVER),
+            Key::Account(MAINNET_ENS_RESOLVER),
             Key::Account(PROXY),
             Key::Account(IMPL),
             Key::Slot(PROXY, impl_slot()),
