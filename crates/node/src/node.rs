@@ -39,8 +39,10 @@ use crate::heads::Heads;
 use crate::network::{Network, NetworkSpec, Token};
 use crate::peers::{NetError, Peers};
 
-/// Fetch rounds one request may need before it gives up.
-const MISS_ROUNDS: u32 = 8;
+/// Fetch rounds one request may need before it gives up. Each round proves the keys the last
+/// run missed, so this is the depth of a call's dependency chain. A cold ENS reverse lookup
+/// on Sepolia (ENSv2: a proxy, its implementation, then registries and resolvers) took 31.
+const MISS_ROUNDS: u32 = 64;
 
 /// Recent blocks sampled for the suggested tip, as reth's gas price oracle does.
 const FEE_BLOCKS: usize = 20;
@@ -968,7 +970,10 @@ impl<P: Peers> Shared<P> {
         let mut round = 0;
         let outcome = 'rounds: loop {
             let misses = match step(&store) {
-                Ok(executed) => break Ok(executed),
+                Ok(executed) => {
+                    debug!(target: "chibi::node", rounds = round, "resolved");
+                    break Ok(executed);
+                }
                 Err(misses) => misses,
             };
             if round == MISS_ROUNDS {
