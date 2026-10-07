@@ -82,3 +82,29 @@ fn chibi_config_selects_the_config_and_the_flag_overrides_it() {
     ));
     assert!(status.contains("no snapshot for sepolia"), "{status}");
 }
+
+#[test]
+fn a_named_config_that_does_not_exist_fails_every_command_but_init() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("typo.toml");
+    let shown = missing.display().to_string();
+    for args in [&["run"][..], &["run", "-b"], &["status"], &["stop"]] {
+        for (chibi_config, flag) in [(Some(missing.as_path()), None), (None, Some(&shown))] {
+            let mut argv: Vec<&str> = args.to_vec();
+            if let Some(flag) = flag {
+                argv.extend(["--config", flag]);
+            }
+            let output = chibi(home.path(), chibi_config, &argv);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{argv:?}");
+            assert!(stderr.contains(&shown), "{argv:?}: {stderr}");
+        }
+    }
+    assert!(!missing.exists());
+    assert!(!home.path().join(".local").exists());
+
+    let status = stdout(&chibi(home.path(), None, &["status"]));
+    assert!(status.contains("no snapshot for sepolia"), "{status}");
+    let stopped = stdout(&chibi(home.path(), None, &["stop"]));
+    assert!(stopped.contains("not running on sepolia"), "{stopped}");
+}

@@ -23,7 +23,7 @@ use chibi_node::{Disk, Network, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 use eyre::WrapErr;
 
-use crate::config::{Config, default_config_path, process_env};
+use crate::config::{default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::run::RunArgs;
 
@@ -67,24 +67,33 @@ enum Command {
 
 fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
-    let named = named_config(cli.config, process_env)
+    let (path, named) = config_paths(cli.config, process_env)?;
+    match cli.command {
+        Command::Init(answers) => init::init(answers, &path, named.as_deref()),
+        Command::Run(args) => run::run(&args, &path, named.as_deref()),
+        Command::Stop { network } => {
+            let config = run::config(&path, named.is_some())?;
+            let network = network.unwrap_or(config.network);
+            run::stop(network, &config.network_dir(network, process_env)?)
+        }
+        Command::Status { network } => status(network, &path, named.is_some()),
+    }
+}
+
+/// The absolute config path to use, and the same path again when the user named it.
+fn config_paths(
+    flag: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> eyre::Result<(PathBuf, Option<PathBuf>)> {
+    let named = named_config(flag, &env)
         .map(std::path::absolute)
         .transpose()
         .wrap_err("cannot resolve the config path")?;
     let path = match &named {
         Some(path) => path.clone(),
-        None => default_config_path(process_env)?,
+        None => default_config_path(&env)?,
     };
-    match cli.command {
-        Command::Init(answers) => init::init(answers, &path, named.as_deref()),
-        Command::Run(args) => run::run(&args, &path, named.as_deref()),
-        Command::Stop { network } => {
-            let config = Config::load(&path)?.unwrap_or_default();
-            let network = network.unwrap_or(config.network);
-            run::stop(network, &config.network_dir(network, process_env)?)
-        }
-        Command::Status { network } => status(network, &path),
-    }
+    Ok((path, named))
 }
 
 /// The config the user named: `--config`, else a non-empty `CHIBI_CONFIG`.
@@ -96,15 +105,20 @@ fn named_config(flag: Option<PathBuf>, env: impl Fn(&str) -> Option<OsString>) -
     })
 }
 
-/// The network to show and its data directory, from the defaults when there is no config file.
-fn status_target(network: Option<Network>, path: &Path) -> eyre::Result<(Network, PathBuf)> {
-    let config = Config::load(path)?.unwrap_or_default();
+/// The network to show and its data directory, from the defaults when there is no config file
+/// at the default path.
+fn status_target(
+    network: Option<Network>,
+    path: &Path,
+    named: bool,
+) -> eyre::Result<(Network, PathBuf)> {
+    let config = run::config(path, named)?;
     let network = network.unwrap_or(config.network);
     Ok((network, config.network_dir(network, process_env)?))
 }
 
-fn status(network: Option<Network>, path: &Path) -> eyre::Result<()> {
-    let (network, data_dir) = status_target(network, path)?;
+fn status(network: Option<Network>, path: &Path, named: bool) -> eyre::Result<()> {
+    let (network, data_dir) = status_target(network, path, named)?;
     let running = Disk::running(&data_dir)?;
     let snapshot = read_snapshot(&data_dir)?;
     let written = write_full_status(
@@ -286,6 +300,8 @@ mod tests {
     use alloy_eips::BlockNumHash;
     use alloy_primitives::{Address, B256, address};
     use chibi_node::{ContractSnapshot, Holding};
+
+    use crate::config::Config;
 
     use super::*;
 
@@ -550,9 +566,7 @@ mod tests {
 
         let (path, flag) = config_paths(None, env(Some(named.clone()))).unwrap();
         assert_eq!((&path, flag.as_deref()), (&named, Some(named.as_path())));
-        let error = run::config(&path, flag.is_some())
-            .unwrap_err()
-            .to_string();
+        let error = run::config(&path, flag.is_some()).unwrap_err().to_string();
         assert!(error.contains(&named.display().to_string()), "{error}");
 
         let (path, flag) = config_paths(Some(named.clone()), env(None)).unwrap();

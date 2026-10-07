@@ -67,22 +67,32 @@ pub struct RunArgs {
     pub detached: bool,
 }
 
-/// Loads the config at `path`, or the defaults when there is no file, with the command-line
-/// overrides applied. A network override tracks the same token symbols at that network's
-/// addresses.
+/// The config at `path`. Without a file there, a config the user `named` with `--config` or
+/// `CHIBI_CONFIG` is an error, and the default path yields the defaults.
+pub fn config(path: &Path, named: bool) -> eyre::Result<Config> {
+    match Config::load(path)? {
+        Some(config) => Ok(config),
+        None if named => bail!("no config at {}", path.display()),
+        None => {
+            info!(
+                "no config at {}; using the defaults. `chibi init` writes one there",
+                path.display()
+            );
+            Ok(Config::default())
+        }
+    }
+}
+
+/// [`config`] with the command-line overrides applied. A network override tracks the same
+/// token symbols at that network's addresses.
 pub fn load(
     path: &Path,
+    named: bool,
     network: Option<Network>,
     rpc_host: Option<RpcHost>,
     rpc_port: Option<NonZeroU16>,
 ) -> eyre::Result<Config> {
-    let mut config = Config::load(path)?.unwrap_or_else(|| {
-        info!(
-            "no config at {}; using the defaults. `chibi init` writes one there",
-            path.display()
-        );
-        Config::default()
-    });
+    let mut config = config(path, named)?;
     if let Some(network) = network {
         config.set_network(network)?;
     }
@@ -96,7 +106,8 @@ pub fn load(
 }
 
 /// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`.
-/// `path` is absolute; `config_flag` is the config the user named, repeated in hints.
+/// `path` is absolute; `config_flag` is the config the user named, which must exist, repeated
+/// in hints and passed to the background child.
 pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
     if !args.background {
         tracing_subscriber::fmt()
@@ -106,10 +117,16 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
             .with_ansi(!args.detached)
             .init();
     }
-    let config = load(path, args.network, args.rpc_host.clone(), args.rpc_port)?;
+    let config = load(
+        path,
+        config_flag.is_some(),
+        args.network,
+        args.rpc_host.clone(),
+        args.rpc_port,
+    )?;
     let data_dir = config.network_dir(config.network, process_env)?;
     if args.background {
-        return start_background(args, &config, &data_dir, path, config_flag);
+        return start_background(args, &config, &data_dir, config_flag);
     }
     let rpc_config = config.rpc()?;
     let listener = rpc::bind(rpc_config.addr)?;
@@ -244,15 +261,16 @@ async fn shutdown_signal() -> io::Result<&'static str> {
     }
 }
 
-/// The arguments for the detached child: the config at its absolute `path`, so the child reads
-/// the same file whatever its working directory, and the same `run` flags plus `--detached`.
-pub fn detached_args(args: &RunArgs, path: &Path) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
-        "--config".into(),
-        path.as_os_str().to_owned(),
-        "run".into(),
-        "--detached".into(),
-    ];
+/// The arguments for the detached child: the config the user named, as an absolute path so the
+/// child reads the same file whatever its working directory, and the same `run` flags plus
+/// `--detached`. Without a named config the child resolves the default path from the
+/// environment it inherits.
+pub fn detached_args(args: &RunArgs, config_flag: Option<&Path>) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = Vec::new();
+    if let Some(path) = config_flag {
+        argv.extend(["--config".into(), path.as_os_str().to_owned()]);
+    }
+    argv.extend(["run".into(), "--detached".into()]);
     if let Some(network) = args.network {
         argv.extend(["--network".into(), network.name().into()]);
     }
@@ -281,7 +299,6 @@ fn start_background(
     args: &RunArgs,
     config: &Config,
     data_dir: &Path,
-    path: &Path,
     config_flag: Option<&Path>,
 ) -> eyre::Result<()> {
     let flags = hint_flags(args, config_flag);
@@ -303,7 +320,7 @@ fn start_background(
     let start = log.metadata()?.len();
     let exe = std::env::current_exe().wrap_err("cannot locate the chibi executable")?;
     let mut child = Command::new(exe)
-        .args(detached_args(args, path))
+        .args(detached_args(args, config_flag))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -394,7 +411,10 @@ mod tests {
             background: true,
             ..RunArgs::default()
         };
-        assert_eq!(strings(detached_args(&background, None)), ["run", "--detached"]);
+        assert_eq!(
+            strings(detached_args(&background, None)),
+            ["run", "--detached"]
+        );
         assert_eq!(
             strings(detached_args(&background, Some(path))),
             ["--config", "/cfg/chibi.toml", "run", "--detached"]
@@ -436,8 +456,7 @@ mod tests {
         };
         let path = Path::new("/cfg/chibi.toml");
         for named in [Some(path), None] {
-            let argv =
-                std::iter::once(OsString::from("chibi")).chain(detached_args(&args, named));
+            let argv = std::iter::once(OsString::from("chibi")).chain(detached_args(&args, named));
             let cli = crate::Cli::try_parse_from(argv).unwrap();
             assert_eq!(cli.config.as_deref(), named);
             let crate::Command::Run(parsed) = cli.command else {
@@ -521,9 +540,7 @@ mod tests {
     fn a_named_config_that_does_not_exist_is_an_error_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("typo.toml");
-        let error = load(&path, true, None, None, None)
-            .unwrap_err()
-            .to_string();
+        let error = load(&path, true, None, None, None).unwrap_err().to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
         let error = config(&path, true).unwrap_err().to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");

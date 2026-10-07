@@ -41,7 +41,7 @@ When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a
 
 `install.sh` builds and installs the `chibi` binary with cargo and, on a terminal, runs `chibi init`. Every question has a default, so pressing Enter through them is fine. It does not start chibi.
 
-A config file is optional. Without one, `chibi run`, `run -b`, `status`, and `stop` use Sepolia, JSON-RPC on `127.0.0.1:8545`, no pins, and the default data directory; `chibi run` logs that it found no config and where `chibi init` would write one.
+A config file is optional. Without one at the default path, `chibi run`, `run -b`, `status`, and `stop` use Sepolia, JSON-RPC on `127.0.0.1:8545`, no pins, and the default data directory; `chibi run` logs that it found no config and where `chibi init` would write one.
 
 `chibi init` chooses the network, host, port, and optional pins. It asks, in order:
 
@@ -57,7 +57,7 @@ chibi init --network sepolia --address 0xYourAddress --rpc-host 127.0.0.1 --rpc-
 
 `--data-dir PATH` writes a `data_dir` into the config (see below). A fresh config has no `tokens`. When `chibi init` overwrites an existing config, it keeps that config's `tokens` and `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so. A config file that exists must parse: `chibi run` refuses a malformed one rather than falling back to the defaults.
 
-Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent; an empty `CHIBI_CONFIG` counts as unset:
+Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent; an empty `CHIBI_CONFIG` counts as unset. A config named either way must exist: every command but `chibi init` fails, naming the path, rather than falling back to the defaults:
 
 ```sh
 chibi --config ~/chibi-test.toml init

@@ -9,7 +9,7 @@ The shortest path: a new user installs chibi, runs `chibi run` with no config, a
 - `onboard-init-plain` asks the same questions as plain line prompts when stdin is not a terminal; Enter takes each default.
 - `onboard-init-flags` writes the config from `--network`, `--address`, `--rpc-host`, and `--rpc-port` without prompting. There is no token flag. Overwriting a config keeps its `tokens` list, `[[contracts]]`, and `data_dir`, and says so.
 - `onboard-background` runs chibi with `chibi run -b`, reports it with `chibi status`, and stops it with `chibi stop`.
-- `onboard-no-config` runs chibi with no config file: `run`, `run -b`, `status`, and `stop` use Sepolia, `127.0.0.1:8545`, no pins, and the default data dir, and the run logs that no config was found and where `chibi init` would write one. A config file that exists but does not parse is still an error.
+- `onboard-no-config` runs chibi with no config file at the default path: `run`, `run -b`, `status`, and `stop` use Sepolia, `127.0.0.1:8545`, no pins, and the default data dir, and the run logs that no config was found and where `chibi init` would write one. A config file that exists but does not parse is still an error, and so is a `--config` or `CHIBI_CONFIG` path with no file, named in the error.
 
 ## How to get to it (user POV)
 
