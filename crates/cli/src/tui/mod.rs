@@ -134,14 +134,20 @@ fn open<B: Backend, E>(
 /// Opens the terminal with ratatui, replacing its panic hook, which writes to stdout and so
 /// can block behind the render thread, with one that only leaves raw mode.
 fn init() -> io::Result<ratatui::DefaultTerminal> {
+    hook_releasing(ratatui::try_init, release_raw)
+}
+
+/// Runs `open`, then replaces whatever panic hook it installed with one that calls `release`
+/// and then the hook in place before `open`.
+fn hook_releasing<T>(open: impl FnOnce() -> T, release: fn()) -> T {
     let previous = std::panic::take_hook();
-    let terminal = ratatui::try_init();
+    let opened = open();
     drop(std::panic::take_hook());
     std::panic::set_hook(Box::new(move |info| {
-        release_raw();
+        release();
         previous(info);
     }));
-    terminal
+    opened
 }
 
 /// Draws the latest view until every sender is dropped, then restores the terminal. Runs on
@@ -810,6 +816,32 @@ mod tests {
         });
         assert!(unwound.is_err());
         assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+    }
+
+    /// Set in the child process that the hook test runs, so it installs the hook and panics.
+    const HOOK_CHILD: &str = "CHIBI_PANIC_HOOK_CHILD";
+
+    #[test]
+    fn the_panic_hook_releases_raw_mode_then_calls_the_previous_hook() {
+        const NAME: &str = "the_panic_hook_releases_raw_mode_then_calls_the_previous_hook";
+        if std::env::var_os(HOOK_CHILD).is_some() {
+            std::panic::set_hook(Box::new(|_| eprintln!("hook: previous")));
+            hook_releasing(
+                || std::panic::set_hook(Box::new(|_| eprintln!("hook: ratatui"))),
+                || eprintln!("hook: released"),
+            );
+            panic!("the child panics");
+        }
+        let module = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("{module}::{NAME}"), "--nocapture"])
+            .env(HOOK_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!child.status.success());
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        let hooks: Vec<&str> = stderr.lines().filter(|l| l.starts_with("hook: ")).collect();
+        assert_eq!(hooks, ["hook: released", "hook: previous"], "{stderr}");
     }
 
     #[test]
