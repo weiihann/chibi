@@ -637,6 +637,37 @@ async fn seeding_pins_the_pause_flag_so_a_transfer_fetches_only_the_recipient() 
     );
 }
 
+/// Seeds ALICE against `registry` with every proof taking 100 ms, returning the time it took
+/// and the pins it left.
+async fn timed_seed(registry: &'static [Token]) -> (Duration, BTreeSet<Key>) {
+    let fixture = two_token_world(250, 40);
+    fixture.serve_proofs(16, Duration::from_millis(100));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, follower) = open(&fixture, dir.path(), registry, &watchlist(&[ALICE])).await;
+    let started = tokio::time::Instant::now();
+    assert!(follower.shared.seed().await);
+    (started.elapsed(), node.working().0)
+}
+
+#[tokio::test(start_paused = true)]
+async fn seeding_probes_every_token_at_once() {
+    let (slowest, _) = timed_seed(&[PSE]).await;
+    assert_eq!(slowest, Duration::from_millis(1000));
+
+    let (both, pins) = timed_seed(BOTH).await;
+    assert_eq!(both, slowest, "the faster token is probed alongside");
+    let mut expected = pausable_keys();
+    expected.extend([
+        Key::Account(ALICE),
+        Key::Account(MAINNET_ENS_RESOLVER),
+        Key::Account(PROXY),
+        Key::Account(IMPL),
+        Key::Slot(PROXY, impl_slot()),
+        Key::Slot(PROXY, mapping_slot(ALICE)),
+    ]);
+    assert_eq!(pins, expected);
+}
+
 #[tokio::test]
 async fn every_registry_token_is_pinned_for_every_watched_address() {
     let fixture = two_token_world(250, 40);
