@@ -46,8 +46,8 @@ use crate::peers::{NetError, Paced, Peers, REQUEST_TIMEOUT};
 /// on Sepolia (ENSv2: a proxy, its implementation, then registries and resolvers) took 31.
 const MISS_ROUNDS: u32 = 64;
 
-/// Names and tokens seeding probes at once: half of one snap/2 peer's slots, so a wallet
-/// request always finds the other half.
+/// Names and tokens seeding probes at once. It bounds concurrent EVM probes, not snap
+/// requests: each probe's misses go through the fetch and snap gates like any request.
 const SEED_IN_FLIGHT: usize = 8;
 
 /// Shortest gap between seeding runs a wake retries. A run's own requests wake the follower,
