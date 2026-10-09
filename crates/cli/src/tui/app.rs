@@ -11,6 +11,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{AddressError, parse_address};
 use crate::format_units;
+use crate::tui::cat::Pose;
 use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
 use crate::tui::wallet::{self, SECRET_BYTES, Secret};
 
@@ -28,6 +29,12 @@ pub const PASSWORD_BYTES: usize = 256;
 
 /// The shortest time the Excited screen stays up, so a fast anchor still shows it.
 pub const EXCITED_FOR: Duration = Duration::from_millis(1500);
+
+/// How long one frame of a pixel cat stays up.
+pub const CAT_FRAME: Duration = Duration::from_millis(250);
+
+/// The fewest terminal columns that show the idle cat beside the form.
+pub const SIDE_CAT_COLUMNS: u16 = 70;
 
 /// The fewest characters a new keystore's password may have.
 pub const PASSWORD_MIN_CHARS: usize = 8;
@@ -391,10 +398,15 @@ pub struct App {
     pub notice: Option<String>,
     /// The wallet being set up.
     pub setup: Setup,
+    /// Whether cats are drawn in 24-bit colour pixels, else in ASCII.
+    pub pixel_cats: bool,
+    /// The terminal's width in columns.
+    pub width: u16,
     quit_armed: bool,
     balances_asked: Option<(u64, usize)>,
     refreshing: bool,
     excited_since: Option<Instant>,
+    entered: Option<(Screen, Instant)>,
     serving: bool,
 }
 
@@ -429,6 +441,9 @@ impl App {
             refreshing: false,
             excited_since: None,
             serving: false,
+            pixel_cats: false,
+            width: 0,
+            entered: None,
         }
     }
 
@@ -437,6 +452,25 @@ impl App {
     pub fn tick(&mut self, now: Instant) {
         self.frame += 1;
         self.leave_excited(now);
+    }
+
+    /// Records `now` as when the screen up was entered, unless it is the screen last
+    /// recorded.
+    pub fn shown(&mut self, now: Instant) {
+        let _ = now;
+        todo!()
+    }
+
+    /// The pixel cat's frame at `now`: whole [`CAT_FRAME`]s since the screen up was entered,
+    /// 0 before [`App::shown`] has seen it.
+    pub fn cat_frame(&self, now: Instant) -> u32 {
+        let _ = now;
+        todo!()
+    }
+
+    /// The pixel cat the screen up shows, if any: only these screens animate.
+    pub fn cat(&self) -> Option<Pose> {
+        todo!()
     }
 
     /// The keystore decrypted to `address`, or did not.
@@ -1530,6 +1564,80 @@ mod tests {
         assert_eq!(app.screen, Screen::Excited);
         app.tick(now + Duration::from_millis(1500));
         assert_eq!(app.screen, Screen::Ready);
+    }
+
+    #[test]
+    fn the_cat_frame_counts_quarter_seconds_since_the_screen_was_entered() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.unlocked(Ok(SENDER));
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        app.shown(now);
+        assert_eq!(app.cat_frame(now), 0);
+        assert_eq!(app.cat_frame(at(749)), 2);
+        assert_eq!(app.cat_frame(at(750)), 3);
+        app.shown(at(900));
+        assert_eq!(app.cat_frame(at(1000)), 4);
+        app.startup(Startup::FoundStatePeer, at(1000));
+        assert_eq!(app.cat_frame(at(1100)), 0);
+        app.shown(at(1100));
+        assert_eq!(app.cat_frame(at(1100)), 0);
+        assert_eq!(app.cat_frame(at(1850)), 3);
+    }
+
+    #[test]
+    fn only_the_cat_screens_animate_and_only_with_pixel_cats() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.pixel_cats = true;
+        app.width = 100;
+        assert_eq!((app.screen, app.cat()), (Screen::Unlock, None));
+        app.unlocked(Ok(SENDER));
+        assert_eq!(app.cat(), Some(Pose::Dozing));
+        app.pixel_cats = false;
+        assert_eq!(app.cat(), None);
+        app.pixel_cats = true;
+        app.startup(Startup::FoundStatePeer, Instant::now());
+        assert_eq!(app.cat(), Some(Pose::Excited));
+
+        let mut app = ready(Network::Sepolia);
+        app.pixel_cats = true;
+        app.width = 69;
+        assert_eq!((app.screen, app.cat()), (Screen::Ready, None));
+        app.width = 70;
+        assert_eq!(app.cat(), Some(Pose::Idle));
+        submit(&mut app, "1", BOB, Ok(FEE));
+        assert_eq!((app.screen, app.cat()), (Screen::Review, None));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!((app.screen, app.cat()), (Screen::Sending, None));
+        app.sent(Ok(TxHash::ZERO));
+        app.tracked(Tracked::Included);
+        assert_eq!(app.cat(), None);
+        app.tracked(Tracked::Receipt { success: true });
+        assert_eq!(app.cat(), Some(Pose::Happy));
+        press(&mut app, KeyCode::Enter);
+        app.health(101, 0);
+        assert_eq!(
+            (app.screen, app.cat()),
+            (Screen::Paused, Some(Pose::Drowsy))
+        );
+
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.pixel_cats = true;
+        app.width = 100;
+        app.setup(None);
+        assert_eq!((app.screen, app.cat()), (Screen::Menu, None));
+    }
+
+    #[test]
+    fn a_failed_transfer_shows_no_pixel_cat() {
+        let mut app = ready(Network::Sepolia);
+        app.pixel_cats = true;
+        app.width = 100;
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.sent(Ok(TxHash::ZERO));
+        app.tracked(Tracked::Receipt { success: false });
+        assert_eq!(app.cat(), None);
     }
 
     #[test]

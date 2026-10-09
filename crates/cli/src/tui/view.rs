@@ -2,7 +2,7 @@
 //! nothing.
 
 use std::fmt::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::U256;
 use ratatui::Frame;
@@ -68,8 +68,8 @@ pub struct View {
 }
 
 impl View {
-    /// The screen for `app`, with `logs` in the log pane when it is open.
-    pub fn new(app: &App, logs: Vec<String>) -> Self {
+    /// The screen for `app` at `now`, with `logs` in the log pane when it is open.
+    pub fn new(app: &App, logs: Vec<String>, _now: Instant) -> Self {
         Self {
             header: header_line(app),
             body: body_lines(app),
@@ -485,12 +485,12 @@ fn elapsed(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::time::Instant;
 
     use alloy_primitives::{Address, address};
     use chibi_node::{Network, Startup, Token};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     use super::*;
     use crate::tui::app::{Balances, EXCITED_FOR, Sending};
@@ -510,11 +510,7 @@ mod tests {
     }
 
     fn sized(app: &App, logs: &[String], width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| draw(frame, View::new(app, logs.to_vec())))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
+        let buffer = drawn(app, logs, width, height);
         let width = usize::from(buffer.area().width);
         buffer
             .content()
@@ -522,6 +518,18 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn drawn(app: &App, logs: &[String], width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, View::new(app, logs.to_vec(), Instant::now())))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn half_block(symbol: &str) -> bool {
+        matches!(symbol, "▀" | "▄")
     }
 
     fn waiting() -> App {
@@ -560,6 +568,33 @@ mod tests {
         app.tick(now);
         app.tick(now);
         assert!(screen(&app, &[]).contains(" ( o.- )"));
+        assert!(!shown.contains('▀') && !shown.contains('▄'), "{shown}");
+    }
+
+    #[test]
+    fn waiting_with_pixel_cats_draws_the_dozing_cat_in_half_blocks() {
+        const OUTLINE: Color = Color::Rgb(59, 42, 32);
+        let mut app = waiting();
+        app.pixel_cats = true;
+        app.width = 100;
+        let buffer = drawn(&app, &[], 100, 30);
+        let cell = |x: u16, y: u16| {
+            let cell = &buffer[(x, y)];
+            (cell.symbol(), cell.fg, cell.bg)
+        };
+        assert_eq!(cell(0, 3), (" ", Color::Reset, Color::Reset));
+        assert_eq!(cell(3, 3), ("▄", OUTLINE, Color::Reset));
+        assert_eq!(cell(2, 4), ("▀", OUTLINE, OUTLINE));
+        assert_eq!(
+            cell(3, 4),
+            ("▀", Color::Rgb(242, 139, 155), Color::Rgb(242, 139, 155))
+        );
+        let shown = screen(&app, &[]);
+        assert!(
+            shown.contains("looking for a state peer · peers 12 · state peers 0 · 1m20s"),
+            "{shown}"
+        );
+        assert!(!shown.contains("( -.- )"), "{shown}");
     }
 
     #[test]
@@ -600,6 +635,42 @@ mod tests {
     }
 
     #[test]
+    fn the_idle_cat_sits_right_of_the_form_only_on_wide_terminals() {
+        let mut app = ready();
+        app.width = 100;
+        let plain = drawn(&app, &[], 100, 30);
+        app.pixel_cats = true;
+        let with_cat = drawn(&app, &[], 100, 30);
+        let form_right = (1..12)
+            .flat_map(|y| (0..100).map(move |x| (x, y)))
+            .filter(|&at| plain[at].symbol() != " ")
+            .map(|(x, _)| x)
+            .max()
+            .unwrap();
+        let mut cat_cells = 0;
+        for y in 0..30 {
+            for x in 0..100 {
+                if plain[(x, y)].symbol() != " " {
+                    assert_eq!(plain[(x, y)], with_cat[(x, y)], "({x}, {y})");
+                }
+                if half_block(with_cat[(x, y)].symbol()) {
+                    assert!(x > form_right, "({x}, {y}) right of {form_right}");
+                    cat_cells += 1;
+                }
+            }
+        }
+        assert!(cat_cells > 50, "{cat_cells}");
+
+        app.pixel_cats = false;
+        app.width = 60;
+        let narrow = drawn(&app, &[], 60, 30);
+        app.pixel_cats = true;
+        assert_eq!(drawn(&app, &[], 60, 30), narrow);
+        app.width = 100;
+        assert_eq!(drawn(&app, &[], 60, 30), narrow);
+    }
+
+    #[test]
     fn the_token_row_says_more_tokens_appear_until_every_pinned_key_is_held() {
         const HINT: &str = "more tokens appear once their balances are proven";
         let mut app = ready();
@@ -607,7 +678,7 @@ mod tests {
         assert!(screen(&app, &[]).contains(HINT));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|frame| draw(frame, View::new(&app, Vec::new())))
+            .draw(|frame| draw(frame, View::new(&app, Vec::new(), Instant::now())))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let row = (0..30)

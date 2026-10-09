@@ -3,6 +3,7 @@
 //! connected.
 
 pub mod app;
+pub mod cat;
 pub mod transfer;
 pub mod view;
 pub mod wallet;
@@ -266,7 +267,7 @@ pub fn run(
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
     let (input_tx, input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
-    let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+    let (views, latest) = watch::channel(View::new(&app, Vec::new(), Instant::now()));
     let handle = runtime.handle().clone();
     let renderer = Renderer {
         thread: Some(thread::spawn(move || render(terminal, latest, &handle))),
@@ -372,7 +373,7 @@ impl Ui<'_> {
             Vec::new()
         };
         self.views
-            .send(View::new(&self.app, logs))
+            .send(View::new(&self.app, logs, Instant::now()))
             .map_err(|_| eyre::eyre!("the terminal UI stopped drawing"))
     }
 
@@ -717,7 +718,7 @@ mod tests {
         };
         let terminal = open(|| Terminal::new(stalled), || {}).unwrap();
         let app = App::new(Network::Sepolia, 11_155_111, &[], false);
-        let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+        let (views, latest) = watch::channel(View::new(&app, Vec::new(), Instant::now()));
         let handle = Handle::current();
         let renderer = thread::spawn(move || render(terminal, latest, &handle));
         let (_input_tx, input) = mpsc::unbounded_channel();
@@ -799,7 +800,7 @@ mod tests {
         let terminal = open(|| Terminal::new(stalled), restored).unwrap();
         let mut app = App::new(Network::Sepolia, 11_155_111, &[], false);
         app.unlocked(Ok(sender));
-        let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+        let (views, latest) = watch::channel(View::new(&app, Vec::new(), Instant::now()));
         let handle = Handle::current();
         let renderer = thread::spawn(move || render(terminal, latest, &handle));
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -865,7 +866,7 @@ mod tests {
         let handle = runtime.handle().clone();
         let unwound = std::panic::catch_unwind(move || {
             let app = App::new(Network::Sepolia, 11_155_111, &[], false);
-            let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+            let (views, latest) = watch::channel(View::new(&app, Vec::new(), Instant::now()));
             let _renderer = Renderer {
                 thread: Some(thread::spawn(move || render(terminal, latest, &handle))),
                 release_raw: || {},
