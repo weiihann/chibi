@@ -433,7 +433,7 @@ impl Ui<'_> {
                         });
                     }
                     changed = startup.changed(), if startup_open => match changed {
-                        Ok(()) => self.app.startup(*startup.borrow_and_update()),
+                        Ok(()) => self.app.startup(*startup.borrow_and_update(), Instant::now()),
                         Err(_) => startup_open = false,
                     },
                     started = &mut node_rx, if node_pending => {
@@ -478,7 +478,7 @@ impl Ui<'_> {
                         Err(err) => return Err(err).wrap_err("a TUI task failed"),
                     },
                     _ = ticks.tick() => {
-                        self.app.tick();
+                        self.app.tick(Instant::now());
                         if let Some(node) = &node {
                             let health = node.health();
                             self.app.health(health.head.number, health.state_peers);

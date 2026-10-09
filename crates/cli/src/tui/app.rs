@@ -1,7 +1,7 @@
 //! The TUI's screens as a state machine: keys, start-up progress, peer counts and node
 //! results in; what the event loop should do out. No terminal and no network here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, TxHash, U256};
 use chibi_node::{Network, Startup, Token};
@@ -23,6 +23,9 @@ pub const PAUSED: &str = "waiting for a state peer";
 
 /// The longest password accepted, in bytes: its buffer's fixed capacity.
 pub const PASSWORD_BYTES: usize = 256;
+
+/// The shortest time the Excited screen stays up, so a fast anchor still shows it.
+pub const EXCITED_FOR: Duration = Duration::from_millis(1500);
 
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +257,8 @@ pub struct App {
     quit_armed: bool,
     balances_asked: Option<(u64, usize)>,
     refreshing: bool,
+    excited_since: Option<Instant>,
+    serving: bool,
 }
 
 impl App {
@@ -284,12 +289,16 @@ impl App {
             quit_armed: false,
             balances_asked: None,
             refreshing: false,
+            excited_since: None,
+            serving: false,
         }
     }
 
-    /// Advances the animation.
-    pub const fn tick(&mut self) {
+    /// Advances the animation, and leaves Excited once it has been up for [`EXCITED_FOR`]
+    /// and the node is serving.
+    pub fn tick(&mut self, now: Instant) {
         self.frame += 1;
+        let _ = now;
     }
 
     /// The keystore decrypted to `address`, or did not.
@@ -305,8 +314,8 @@ impl App {
         }
     }
 
-    /// The node's start-up progress.
-    pub fn startup(&mut self, startup: Startup) {
+    /// The node's start-up progress, observed at `now`.
+    pub fn startup(&mut self, startup: Startup, now: Instant) {
         match startup {
             Startup::Waiting {
                 peers,
@@ -322,16 +331,35 @@ impl App {
             }
             Startup::FoundStatePeer => {
                 self.state_peers = self.state_peers.max(1);
-                if self.screen == Screen::Waiting {
-                    self.screen = Screen::Excited;
-                }
+                self.excite(now);
             }
             Startup::Serving => {
                 self.state_peers = self.state_peers.max(1);
+                self.serving = true;
                 if matches!(self.screen, Screen::Waiting | Screen::Excited) {
                     self.screen = self.form_screen();
                 }
             }
+        }
+    }
+
+    /// Shows Excited from Waiting, from `now`.
+    fn excite(&mut self, now: Instant) {
+        if self.screen == Screen::Waiting {
+            self.screen = Screen::Excited;
+            self.excited_since = Some(now);
+        }
+    }
+
+    /// Moves from Excited to the form once serving and Excited was up for [`EXCITED_FOR`].
+    fn leave_excited(&mut self, now: Instant) {
+        if self.screen == Screen::Excited
+            && self.serving
+            && self
+                .excited_since
+                .is_some_and(|since| now.duration_since(since) >= EXCITED_FOR)
+        {
+            self.screen = self.form_screen();
         }
     }
 
@@ -966,7 +994,9 @@ mod tests {
     fn ready(network: Network) -> App {
         let mut app = App::new(network, SEPOLIA_ID, REGISTRY, false);
         app.unlocked(Ok(SENDER));
-        app.startup(Startup::Serving);
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        app.tick(now + EXCITED_FOR);
         app.health(100, 1);
         app.balances(Balances {
             eth: Some(eth(3_000)),
@@ -1043,11 +1073,15 @@ mod tests {
         app.unlocked(Ok(SENDER));
         assert_eq!((app.screen, app.sender), (Screen::Waiting, Some(SENDER)));
 
-        app.startup(Startup::Waiting {
-            peers: 7,
-            state_peers: 0,
-            elapsed: Duration::from_secs(80),
-        });
+        let now = Instant::now();
+        app.startup(
+            Startup::Waiting {
+                peers: 7,
+                state_peers: 0,
+                elapsed: Duration::from_secs(80),
+            },
+            now,
+        );
         assert_eq!(
             (app.screen, app.waiting),
             (
@@ -1059,10 +1093,46 @@ mod tests {
                 }
             )
         );
-        app.startup(Startup::FoundStatePeer);
+        app.startup(Startup::FoundStatePeer, now);
         assert_eq!(app.screen, Screen::Excited);
-        app.startup(Startup::Serving);
+        app.startup(Startup::Serving, now + Duration::from_millis(1499));
+        assert_eq!(app.screen, Screen::Excited);
+        app.tick(now + Duration::from_millis(1500));
         assert_eq!(app.screen, Screen::Ready);
+    }
+
+    #[test]
+    fn the_excited_cat_shows_for_a_second_and_a_half_even_when_only_serving_is_seen() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.unlocked(Ok(SENDER));
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        assert_eq!(app.screen, Screen::Excited);
+        app.tick(now + Duration::from_millis(1000));
+        assert_eq!(app.screen, Screen::Excited);
+        app.tick(now + Duration::from_millis(1500));
+        assert_eq!(app.screen, Screen::Ready);
+    }
+
+    #[test]
+    fn the_excited_cat_waits_for_serving_then_pauses_without_a_state_peer() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.unlocked(Ok(SENDER));
+        let now = Instant::now();
+        app.startup(Startup::FoundStatePeer, now);
+        app.tick(now + Duration::from_secs(5));
+        assert_eq!(app.screen, Screen::Excited);
+        app.startup(Startup::Serving, now + Duration::from_secs(6));
+        assert_eq!(app.screen, Screen::Ready);
+
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.unlocked(Ok(SENDER));
+        app.startup(Startup::FoundStatePeer, now);
+        app.startup(Startup::Serving, now + Duration::from_millis(100));
+        app.health(100, 0);
+        assert_eq!(app.screen, Screen::Excited);
+        app.tick(now + Duration::from_millis(1500));
+        assert_eq!(app.screen, Screen::Paused);
     }
 
     #[test]
@@ -1386,7 +1456,9 @@ mod tests {
     fn balances_refresh_on_a_new_head_on_new_held_pinned_keys_and_while_eth_is_unproven() {
         let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
         app.unlocked(Ok(SENDER));
-        app.startup(Startup::Serving);
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        app.tick(now + EXCITED_FOR);
         assert!(app.balances_request(100, 3));
         assert!(!app.balances_request(100, 3));
         app.refreshed(Some(Balances::default()));

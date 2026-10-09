@@ -354,13 +354,15 @@ fn elapsed(elapsed: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use alloy_primitives::{Address, address};
     use chibi_node::{Network, Startup, Token};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::tui::app::{Balances, Sending};
+    use crate::tui::app::{Balances, EXCITED_FOR, Sending};
     use crate::tui::transfer::Draft;
 
     const SENDER: Address = address!("0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025");
@@ -390,11 +392,14 @@ mod tests {
     fn waiting() -> App {
         let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
         app.unlocked(Ok(SENDER));
-        app.startup(Startup::Waiting {
-            peers: 12,
-            state_peers: 0,
-            elapsed: Duration::from_secs(80),
-        });
+        app.startup(
+            Startup::Waiting {
+                peers: 12,
+                state_peers: 0,
+                elapsed: Duration::from_secs(80),
+            },
+            Instant::now(),
+        );
         app
     }
 
@@ -416,15 +421,16 @@ mod tests {
             shown.contains("looking for a state peer · peers 12 · state peers 0 · 1m20s"),
             "{shown}"
         );
-        app.tick();
-        app.tick();
+        let now = Instant::now();
+        app.tick(now);
+        app.tick(now);
         assert!(screen(&app, &[]).contains(" ( o.- )"));
     }
 
     #[test]
     fn excited_shows_the_found_peer() {
         let mut app = waiting();
-        app.startup(Startup::FoundStatePeer);
+        app.startup(Startup::FoundStatePeer, Instant::now());
         let shown = screen(&app, &[]);
         assert!(shown.contains("found a state peer!"), "{shown}");
         assert!(shown.contains("( ^o^ )"), "{shown}");
@@ -432,7 +438,9 @@ mod tests {
 
     fn ready() -> App {
         let mut app = waiting();
-        app.startup(Startup::Serving);
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        app.tick(now + EXCITED_FOR);
         app.health(100, 1);
         app.balances(Balances {
             eth: Some(U256::from(3_000_000_000_000_000_000u64)),
