@@ -139,6 +139,8 @@ Enter checks every field and shows each problem beside its field, keeping what y
 
 Sending works only while a state peer is connected: without one, a sleepy cat says `waiting for a state peer`, Review and sending are disabled, and the form comes back as it was when one returns. chibi checks again just before signing and refuses with the same message if the last state peer has gone. Sending is Sepolia only for now: on mainnet the form shows your balances, and Review says `sending on mainnet is not enabled yet`.
 
+The cats are pixel art drawn with half blocks in 24-bit colour, animated four times a second: a cat dozing under a drifting z while chibi waits, hopping between twinkling stars at `found a state peer!`, nodding off while paused, and bouncing under a rising heart when a transfer succeeds. On a terminal at least 70 columns wide a small cat sits beside the form, where it fits without covering it, and blinks now and then. Pixel cats need a terminal that sets `COLORTERM` to `truecolor` or `24bit`; without that, or with `NO_COLOR` set, the TUI shows plain ASCII cats instead.
+
 Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (the last lines of chibi's log, which goes there instead of the terminal), `q` or Ctrl-C quits and stops chibi as Ctrl-C does in `chibi run`. Quitting with a transfer still pending warns first; the transfer stays in chibi's outbox, which broadcasts it again on the next run. Passwords are at most 256 bytes, and a pasted secret at most 256; their buffers are wiped once used and when you quit.
 
 ## Configuration
