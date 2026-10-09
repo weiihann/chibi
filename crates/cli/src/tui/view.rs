@@ -88,7 +88,8 @@ const SAD: [&str; 4] = ["  /\\_/\\", " ( ;.; )", "  > ^ <", " (\")_(\")"];
 pub struct View {
     header: Line<'static>,
     body: Body,
-    footer: Vec<Line<'static>>,
+    /// The keys the footer names, packed into rows when drawn.
+    keys: &'static [&'static str],
     notice: Option<String>,
     /// The tail of the log buffer, oldest first, while the log pane is open.
     logs: Option<Vec<String>>,
@@ -137,7 +138,7 @@ impl View {
         Self {
             header: header_line(app),
             body: body(app, now),
-            footer: footer_lines(app),
+            keys: keys(app),
             notice: app.notice.clone(),
             logs: app.logs.then_some(logs),
         }
@@ -197,6 +198,10 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
         Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
             .wrap(Wrap { trim: false })
     });
+    let footer = Paragraph::new(footer_lines(view.keys, area.width)).wrap(Wrap { trim: false });
+    let footer_rows = u16::try_from(footer.line_count(area.width))
+        .unwrap_or(u16::MAX)
+        .max(1);
     let free = area.height.saturating_sub(1);
     let rows = notice.as_ref().map_or(0, |paragraph| {
         u16::try_from(paragraph.line_count(area.width))
@@ -204,6 +209,8 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
             .min(free)
     });
     let rest = free - rows;
+    let more = (footer_rows - 1).min(rest.saturating_sub(1));
+    let rest = rest - more;
     let pane = if rest >= 2 { pane.min(rest - 1) } else { 0 };
     let mut next = area.y;
     let mut take = |height: u16| {
@@ -213,7 +220,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     };
     let body = take(rest - pane);
     let notice_area = take(rows);
-    let footer = take(1);
+    let footer_area = take(1 + more);
     let log_area = take(pane);
 
     match view.body {
@@ -227,7 +234,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     if let Some(paragraph) = notice {
         frame.render_widget(paragraph, notice_area);
     }
-    frame.render_widget(Paragraph::new(view.footer), footer);
+    frame.render_widget(footer, footer_area);
     if let Some(logs) = view.logs {
         let shown = usize::from(log_area.height.saturating_sub(2));
         let tail = &logs[logs.len().saturating_sub(shown)..];
@@ -831,25 +838,52 @@ fn sending(app: &App, now: Instant) -> Body {
     }
 }
 
-fn footer_lines(app: &App) -> Vec<Line<'static>> {
-    let keys = match app.screen {
-        Screen::Menu => "up/down choose · Enter select · Esc quit",
-        Screen::Backup => "Enter I wrote them down · Esc back to the menu, discarding them",
-        Screen::Confirm => "Enter check · Esc back to the menu, discarding the phrase",
-        Screen::Import | Screen::Existing => "Enter continue · Esc back to the menu",
-        Screen::Password => "up/down field · Enter continue · Esc back to the menu",
-        Screen::Unlock => "Enter unlock · Esc quit",
-        Screen::Waiting | Screen::Excited | Screen::Paused => "l logs · q quit",
-        Screen::Ready => {
-            "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · l logs · q quit"
+/// The keys the footer names on `app`'s screen.
+fn keys(app: &App) -> &'static [&'static str] {
+    match app.screen {
+        Screen::Menu => &["up/down choose", "Enter select", "Esc quit"],
+        Screen::Backup => &[
+            "Enter I wrote them down",
+            "Esc back to the menu, discarding them",
+        ],
+        Screen::Confirm => &["Enter check", "Esc back to the menu, discarding the phrase"],
+        Screen::Import | Screen::Existing => &["Enter continue", "Esc back to the menu"],
+        Screen::Password => &["up/down field", "Enter continue", "Esc back to the menu"],
+        Screen::Unlock => &["Enter unlock", "Esc quit"],
+        Screen::Waiting | Screen::Excited | Screen::Paused => &["l logs", "q quit"],
+        Screen::Ready => &[
+            "up/down field",
+            "Enter or left/right token",
+            "type amount (or max) and to",
+            "Enter review",
+            "l logs",
+            "q quit",
+        ],
+        Screen::Review => &["y send", "n back", "l logs", "q quit"],
+        Screen::Sending => &["Enter back to the form", "l logs", "q quit"],
+    }
+}
+
+/// `keys` joined by ` · `, dim, as many to a row as fit in `width` columns, none split
+/// across rows.
+fn footer_lines(keys: &[&'static str], width: u16) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let separator = Span::raw(" · ");
+    let mut lines = Vec::new();
+    let mut line = Line::default().style(dim);
+    for &key in keys {
+        let key = Span::raw(key);
+        if !line.spans.is_empty() {
+            if line.width() + separator.width() + key.width() <= usize::from(width) {
+                line.push_span(separator.clone());
+            } else {
+                lines.push(std::mem::replace(&mut line, Line::default().style(dim)));
+            }
         }
-        Screen::Review => "y send · n back · l logs · q quit",
-        Screen::Sending => "Enter back to the form · l logs · q quit",
-    };
-    vec![Line::styled(
-        keys,
-        Style::default().add_modifier(Modifier::DIM),
-    )]
+        line.push_span(key);
+    }
+    lines.push(line);
+    lines
 }
 
 fn error_line(text: &str) -> Line<'static> {
