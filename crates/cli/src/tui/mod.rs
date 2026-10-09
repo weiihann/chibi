@@ -109,8 +109,7 @@ impl Drop for LogWriter {
     }
 }
 
-/// A terminal that `restore` puts back when dropped. ratatui's panic hook restores it on a
-/// panic too.
+/// A terminal that `restore` puts back when dropped, including while a panic unwinds.
 struct Restoring<B: Backend> {
     terminal: Terminal<B>,
     restore: fn(),
@@ -130,6 +129,19 @@ fn open<B: Backend, E>(
     init()
         .map(|terminal| Restoring { terminal, restore })
         .inspect_err(|_| restore())
+}
+
+/// Opens the terminal with ratatui, replacing its panic hook, which writes to stdout and so
+/// can block behind the render thread, with one that only leaves raw mode.
+fn init() -> io::Result<ratatui::DefaultTerminal> {
+    let previous = std::panic::take_hook();
+    let terminal = ratatui::try_init();
+    drop(std::panic::take_hook());
+    std::panic::set_hook(Box::new(move |info| {
+        release_raw();
+        previous(info);
+    }));
+    terminal
 }
 
 /// Draws the latest view until every sender is dropped, then restores the terminal. Runs on
@@ -204,8 +216,7 @@ pub fn run(
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
     let app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
-    let terminal =
-        open(ratatui::try_init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
+    let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
     let (views, latest) = watch::channel(View::new(&app, Vec::new()));
     let handle = runtime.handle().clone();
     let renderer = thread::spawn(move || render(terminal, latest, &handle));
@@ -623,16 +634,17 @@ mod tests {
             input,
             logs: &logs,
         };
-        let unlocked = tokio::time::timeout(
-            Duration::from_secs(5),
-            ui.unlock(Path::new("/nonexistent")),
-        )
-        .await
-        .expect("the prompt ends without input");
+        let unlocked =
+            tokio::time::timeout(Duration::from_secs(5), ui.unlock(Path::new("/nonexistent")))
+                .await
+                .expect("the prompt ends without input");
         assert!(unlocked.is_err());
         drop(ui);
         let err = finish(renderer, || {}).unwrap_err();
-        assert_eq!(format!("{err:#}"), "cannot draw the terminal UI: the terminal is gone");
+        assert_eq!(
+            format!("{err:#}"),
+            "cannot draw the terminal UI: the terminal is gone"
+        );
     }
 
     #[test]
