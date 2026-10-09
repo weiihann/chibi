@@ -13,7 +13,8 @@ These constraints shape the design:
 - A key never fetched is a miss. A miss must never read as zero. A key proven absent is a known zero.
 - Sepolia has no BALs until 2026-10-06 13:53:36 UTC, and mainnet has none until its own Glamsterdam fork. Advancing without BALs is a first-class path.
 - Wallets send concurrent requests.
-- Peers drop clients that never answer, so chibi answers every inbound request with an empty response.
+- Peers drop clients that never answer, so chibi answers every inbound request, with the headers it holds or else an empty response.
+- Nethermind state peers learn a peer's head only from the handshake and from eth/69 `BlockRangeUpdate`. When their peer pool is full they drop one peer every 30 s, and a peer whose advertised head stops moving becomes the lowest once the chain passes the next 32-block boundary.
 - Only peers that speak snap/2, called state peers, can serve the proofs chibi needs; most Sepolia nodes do not. A census on 2026-10-05 found five Sepolia state peers in 12 minutes, all Nethermind. Discovery alone took from about one to several minutes to reach one.
 
 ## Usage
@@ -162,9 +163,15 @@ At start chibi dials the known and remembered state peers as static peers and wa
 
 `NetConfig` carries the user's peer settings to the one reth `NetworkConfigBuilder` in `node::devp2p`: trusted peers (reth's `PeersConfig` trusted nodes, always dialed and kept), `trusted_only` (reth connects to and accepts trusted nodes only, and chibi then dials no built-in or remembered snap/2 peer and starts discovery from no network boot node), boot nodes replacing the network's, outbound and inbound session limits (reth's 100 and 30 by default), a discovery port apart from the RLPx port, and discovery off. The config refuses `trusted_only` without trusted peers, and discovery off when there is nothing else to dial: no trusted peer, and no built-in snap/2 peer (mainnet has none) or `trusted_only`.
 
+### Advertised head
+
+devp2p starts before chibi has a verified header, because fetching one needs a peer. helios hands out block hashes only, so the start-up status carries the light client's latest hash with a number counted from the newest block chibi knows is on chain: the head the last run saved in its snapshot, else the network's Osaka block. `BlockClock::floor` counts nine of every ten slots since that block, which keeps the number at or below the real head unless more than one slot in ten went empty. Sepolia left about one in twenty empty in the year after Osaka, so counting every slot advertised a head about 124k blocks ahead of the real one in a run on 2026-10-09.
+
+`Peers::announce` takes the published store and runs right after anchoring and after every follower step. It updates reth's status for new sessions, passes the range to reth's `update_block_range`, and sends a `BlockRangeUpdate` with the anchor as both earliest and latest block to every live eth/69 or later session as a raw eth message, logging `sent block range` at debug with the peer and head. A new eth/69 session gets the announced range as soon as chibi tracks it. reth on its own changes the status only for new sessions, refreshes a live session's range every 384 s, and ignores a typed `PeerMessage::BlockRangeUpdated` sent from outside. The earliest block is the head because chibi serves no bodies or receipts.
+
 ### Inbound requests
 
-The node installs an `EthRequestHandler` channel and answers every `IncomingEthRequest` variant with an empty response of the matching type, through an exhaustive match.
+The node installs an `EthRequestHandler` channel and answers every `IncomingEthRequest` variant through an exhaustive match. `GetBlockHeaders` by number or hash is answered from the store announced last: the anchor and its up to 256 held ancestors, honouring limit, skip and direction and stopping at the first block not held. A request that starts outside that window, a request before the first announcement, and every other request get an empty response of the matching type. Answering fetches nothing.
 
 ### Errors
 
@@ -204,6 +211,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - We accept that a TUI transfer stuck pending is only reported (`still pending` after 10 heads) and never fee-bumped, in exchange for never signing a second transaction the user did not review. The outbox keeps rebroadcasting it, including after a restart.
 - We accept that `eth_call` and `eth_estimateGas` with `pending` use the anchor's block environment.
 - We accept keeping 8 full copies of the store besides the current one, so a wallet that names a block up to about 96 s old reads state instead of `-32004`. Each copy holds up to 1024 entries of about 140 bytes plus their slot maps, and 257 headers of 800 bytes, so about 0.4 MB, and the 8 cost about 3 MB (estimated from the type sizes, not measured on a live node). `advance` copies the store once per block rather than mutating it in place.
+- We accept a start-up status head up to a tenth of the slots since the counted block below the real head, 134k blocks on a first Sepolia run on 2026-10-09, until the anchor is announced, in exchange for a head that stays behind the chain unless more than one slot in ten went empty.
 
 ## Alternatives considered
 
