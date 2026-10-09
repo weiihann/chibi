@@ -1111,43 +1111,60 @@ mod tests {
     const A: PeerKey = PeerKey(B512::repeat_byte(1));
     const B: PeerKey = PeerKey(B512::repeat_byte(2));
 
-    fn range_at(head: BlockNumber) -> (BlockRangeUpdate, RawCapabilityMessage) {
+    fn range_at(head: BlockNumber, hash: u8) -> (BlockRangeUpdate, RawCapabilityMessage) {
         let update = BlockRangeUpdate {
             earliest: head,
             latest: head,
-            latest_hash: B256::ZERO,
+            latest_hash: B256::repeat_byte(hash),
         };
         let payload = alloy_rlp::encode(&update).into();
         let message = RawCapabilityMessage::eth(EthMessageID::BlockRangeUpdate, payload);
         (update, message)
     }
 
-    fn offer(sessions: &watch::Sender<Sessions>, peer: PeerKey, head: BlockNumber) -> Vec<u64> {
+    fn offer(
+        sessions: &watch::Sender<Sessions>,
+        peer: PeerKey,
+        seq: u64,
+        head: BlockNumber,
+        hash: u8,
+    ) -> Vec<(u64, B256)> {
         let mut sent = Vec::new();
-        offer_range(sessions, peer, &range_at(head), |to, message| {
+        let reported = offer_range(sessions, peer, seq, &range_at(head, hash), |to, message| {
             assert_eq!(to, peer.0);
             let update: BlockRangeUpdate =
                 alloy_rlp::Decodable::decode(&mut &message.payload[..]).unwrap();
-            sent.push(update.latest);
+            sent.push((update.latest, update.latest_hash));
         });
+        assert_eq!(reported, !sent.is_empty());
         sent
     }
 
     #[test]
-    fn a_session_is_never_sent_an_older_or_equal_range_than_it_has() {
+    fn a_session_is_sent_each_later_publication_once() {
         let sessions = snap_sessions(&[A]);
-        assert_eq!(offer(&sessions, A, 105), [105]);
-        assert_eq!(offer(&sessions, A, 104), Vec::<u64>::new());
-        assert_eq!(offer(&sessions, A, 105), Vec::<u64>::new());
-        assert_eq!(offer(&sessions, A, 106), [106]);
+        assert_eq!(offer(&sessions, A, 1, 105, 1), [(105, B256::repeat_byte(1))]);
+        assert_eq!(offer(&sessions, A, 1, 105, 1), []);
+        assert_eq!(offer(&sessions, A, 2, 106, 2), [(106, B256::repeat_byte(2))]);
+    }
+
+    #[test]
+    fn a_reorged_head_at_the_same_or_a_lower_height_is_sent() {
+        let sessions = snap_sessions(&[A]);
+        assert_eq!(offer(&sessions, A, 1, 105, 1), [(105, B256::repeat_byte(1))]);
+        assert_eq!(offer(&sessions, A, 2, 105, 2), [(105, B256::repeat_byte(2))]);
+        assert_eq!(offer(&sessions, A, 3, 104, 3), [(104, B256::repeat_byte(3))]);
     }
 
     #[test]
     fn a_connect_time_range_read_before_a_newer_announce_is_not_sent_after_it() {
         let sessions = snap_sessions(&[A]);
-        let announced = offer(&sessions, A, 105);
-        let connected = offer(&sessions, A, 104);
-        assert_eq!([announced, connected].concat(), [105]);
+        let announced = offer(&sessions, A, 2, 104, 2);
+        let connected = offer(&sessions, A, 1, 105, 1);
+        assert_eq!(
+            [announced, connected].concat(),
+            [(104, B256::repeat_byte(2))]
+        );
     }
 
     #[test]
@@ -1159,8 +1176,8 @@ mod tests {
                 ..session(true)
             },
         )]));
-        assert_eq!(offer(&sessions, A, 105), Vec::<u64>::new());
-        assert_eq!(offer(&sessions, B, 105), Vec::<u64>::new());
+        assert_eq!(offer(&sessions, A, 1, 105, 1), []);
+        assert_eq!(offer(&sessions, B, 1, 105, 1), []);
     }
 
     #[tokio::test]
