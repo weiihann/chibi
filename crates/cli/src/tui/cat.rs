@@ -214,7 +214,7 @@ mod tests {
         let cat = 112 + 32;
         for pose in POSES {
             let overlays = match pose {
-                Pose::Dozing => 7,
+                Pose::Dozing => 10,
                 Pose::Excited => 2 * 5,
                 Pose::Idle | Pose::Drowsy => 0,
                 Pose::Happy => 6,
@@ -262,14 +262,15 @@ mod tests {
 
     #[test]
     fn the_dozing_cat_breathes_and_its_z_drifts_up() {
-        for (n, (x, y)) in [(17, 6), (18, 4), (18, 2), (19, 0), (17, 6)]
+        for (n, (x, y)) in [(17, 6), (17, 4), (18, 2), (18, 0), (17, 6)]
             .into_iter()
             .enumerate()
         {
             let grid = frame(Pose::Dozing, u32::try_from(n).unwrap());
-            assert_eq!(row(&grid, y, x, 3), "zzz", "frame {n}");
-            assert_eq!(row(&grid, y + 1, x, 3), ".z.", "frame {n}");
-            assert_eq!(row(&grid, y + 2, x, 3), "zzz", "frame {n}");
+            assert_eq!(row(&grid, y, x, 4), "zzzz", "frame {n}");
+            assert_eq!(row(&grid, y + 1, x, 4), "..z.", "frame {n}");
+            assert_eq!(row(&grid, y + 2, x, 4), ".z..", "frame {n}");
+            assert_eq!(row(&grid, y + 3, x, 4), "zzzz", "frame {n}");
             let top = if n % 4 < 2 { 3 } else { 4 };
             assert_eq!(grid[top][3], b'k', "frame {n}");
             assert_eq!(grid[top - 1][3], b'.', "frame {n}");
