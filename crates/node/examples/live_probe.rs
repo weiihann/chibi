@@ -10,9 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, address, b256, keccak256};
+use chibi_core::state::Store;
 use chibi_core::verify;
 use chibi_core::wire::{AccountRangeRequest, StorageRangeRequest};
 use chibi_node::beacon::{self, Beacon, BeaconConfig};
@@ -78,7 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     log_sessions(&sessions.borrow());
 
     let header = fetch_header(&net, trusted).await?;
-    net.announce(&header);
+    net.announce(&Arc::new(Store::new(header.clone())));
     let state_root = header.header().state_root;
     info!(
         number = header.number(),

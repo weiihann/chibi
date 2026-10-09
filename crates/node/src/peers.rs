@@ -3,11 +3,12 @@
 //! implements it over in-process tries, so offline tests run the production verifier.
 //! [`Paced`] wraps either one with the timeouts every request gets.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_consensus::Header;
 use alloy_primitives::{B256, B512, Bytes};
-use chibi_core::VerifiedHeader;
+use chibi_core::state::Store;
 use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
     Transaction,
@@ -108,8 +109,9 @@ pub trait Peers: Send + Sync + 'static {
     /// Reports a peer whose reply failed verification.
     fn penalize(&self, peer: PeerKey);
 
-    /// Advertises `head` as chibi's latest block in its status, keeping the fork id current.
-    fn announce(&self, head: &VerifiedHeader);
+    /// Advertises the anchor of `store` as chibi's latest block in its status, keeping the fork
+    /// id current, and answers peers' header requests from the headers `store` holds.
+    fn announce(&self, store: &Arc<Store>);
 
     /// The sessions connected now.
     fn census(&self) -> Census;
@@ -263,8 +265,8 @@ impl<P: Peers> Peers for Paced<P> {
         self.inner.penalize(peer);
     }
 
-    fn announce(&self, head: &VerifiedHeader) {
-        self.inner.announce(head);
+    fn announce(&self, store: &Arc<Store>) {
+        self.inner.announce(store);
     }
 
     fn census(&self) -> Census {
@@ -359,7 +361,7 @@ mod tests {
 
         fn penalize(&self, _: PeerKey) {}
 
-        fn announce(&self, _: &VerifiedHeader) {}
+        fn announce(&self, _: &Arc<Store>) {}
 
         fn census(&self) -> Census {
             Census {

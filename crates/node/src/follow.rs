@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{B256, TxHash};
-use chibi_core::state::{HEADER_WINDOW, Key, Plan};
+use chibi_core::state::{HEADER_WINDOW, Key, Plan, State};
 use chibi_core::tx::Lookup;
 use chibi_core::{TrustedHash, VerifiedHeader};
 use futures::StreamExt as _;
@@ -161,7 +161,7 @@ impl<P: Peers> Follower<P> {
 
         shared.persist().await?;
         shared.save_keys(Some(self.moves)).await?;
-        shared.peers.announce(&anchor);
+        shared.peers.announce(&shared.read(State::snapshot));
         Ok(stepped)
     }
 

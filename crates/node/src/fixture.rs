@@ -9,12 +9,13 @@ use std::time::Duration;
 use alloy_consensus::Header;
 use alloy_eips::eip2718::Encodable2718 as _;
 use alloy_primitives::{Address, B256, B512, Bytes, U256, keccak256};
+use chibi_core::TrustedHash;
+use chibi_core::state::Store;
 use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World, WorldAccount};
 use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
     Transaction,
 };
-use chibi_core::{TrustedHash, VerifiedHeader};
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, oneshot, watch};
 
@@ -486,7 +487,7 @@ impl Peers for FixturePeers {
         self.inner.log.lock().penalized.push(peer);
     }
 
-    fn announce(&self, _head: &VerifiedHeader) {}
+    fn announce(&self, _store: &Arc<Store>) {}
 
     fn census(&self) -> Census {
         Census {

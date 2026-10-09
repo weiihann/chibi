@@ -1,21 +1,22 @@
 //! The devp2p adapter: [`Peers`] over a standalone reth-network.
 //!
 //! reth's wire messages are converted into [`chibi_core::wire`] shapes here, so no reth type
-//! reaches the rest of the node. chibi serves nothing, but it answers every inbound request with
-//! an empty response of the matching type, because peers drop sessions whose requests go
-//! unanswered.
+//! reaches the rest of the node. chibi serves only the headers its store holds, but it answers
+//! every inbound request, with an empty response of the matching type when it holds nothing
+//! asked for, because peers drop sessions whose requests go unanswered.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Header;
+use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{B256, Bytes, U256};
+use chibi_core::state::Store;
 use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
     Transaction,
 };
-use chibi_core::state::Store;
 use chibi_core::{TrustedHash, VerifiedHeader};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -26,8 +27,8 @@ use reth_eth_wire_types::snap::{
     GetStorageRangesMessage, SnapProtocolMessage, StorageRangesMessage,
 };
 use reth_eth_wire_types::{
-    BlockAccessLists, BlockBodies, BlockHeaders, Capability, Cells, NodeData, Receipts, Receipts69,
-    Receipts70,
+    BlockAccessLists, BlockBodies, BlockHeaders, Capability, Cells, GetBlockHeaders,
+    HeadersDirection, NodeData, Receipts, Receipts69, Receipts70,
 };
 use reth_network::eth_requests::IncomingEthRequest;
 use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
@@ -289,6 +290,8 @@ pub struct Devp2p {
     chain: Arc<ChainSpec>,
     sessions: watch::Receiver<Sessions>,
     snap_load: Arc<SnapLoad>,
+    /// The store announced last, whose held headers inbound requests are answered from.
+    served: watch::Sender<Option<Arc<Store>>>,
     tasks: [JoinHandle<()>; 3],
 }
 
@@ -342,6 +345,7 @@ impl Devp2p {
         let handle = manager.handle().clone();
         let events = handle.event_listener();
         let (sessions_tx, sessions) = watch::channel(Sessions::new());
+        let (served, announced) = watch::channel(None);
 
         info!(
             target: "chibi::devp2p",
@@ -353,7 +357,7 @@ impl Devp2p {
         let tasks = [
             tokio::spawn(manager),
             tokio::spawn(track_sessions(events, handle.clone(), sessions_tx)),
-            tokio::spawn(answer_inbound(requests)),
+            tokio::spawn(answer_inbound(requests, announced)),
         ];
         Ok(Self {
             handle,
@@ -361,6 +365,7 @@ impl Devp2p {
             chain: Arc::clone(&spec.chain),
             sessions,
             snap_load: Arc::default(),
+            served,
             tasks,
         })
     }
@@ -621,8 +626,10 @@ impl Peers for Devp2p {
         self.fetch.report_bad_message(peer.0);
     }
 
-    fn announce(&self, head: &VerifiedHeader) {
-        self.handle.update_status(status_head(&self.chain, head));
+    fn announce(&self, store: &Arc<Store>) {
+        self.handle
+            .update_status(status_head(&self.chain, store.anchor()));
+        self.served.send_replace(Some(Arc::clone(store)));
     }
 
     fn census(&self) -> Census {
@@ -744,19 +751,29 @@ async fn dialable(handle: &NetworkHandle, peer: PeerId) -> Option<NodeRecord> {
     }
 }
 
-async fn answer_inbound(mut requests: mpsc::Receiver<IncomingEthRequest>) {
+async fn answer_inbound(
+    mut requests: mpsc::Receiver<IncomingEthRequest>,
+    served: watch::Receiver<Option<Arc<Store>>>,
+) {
     while let Some(request) = requests.recv().await {
-        answer(request, None);
+        let store = served.borrow().clone();
+        answer(request, store.as_deref());
     }
 }
 
-/// Replies to `request` with an empty response of the matching type. Dropping the sender or
-/// replying `Err` would send nothing, and the peer would time out and drop chibi.
-fn answer(request: IncomingEthRequest, _store: Option<&Store>) {
+/// Replies to `request` from the headers `store` holds, and with an empty response of the
+/// matching type to anything else. Dropping the sender or replying `Err` would send nothing,
+/// and the peer would time out and drop chibi.
+fn answer(request: IncomingEthRequest, store: Option<&Store>) {
     let (peer, delivered) = match request {
         IncomingEthRequest::GetBlockHeaders {
-            peer_id, response, ..
-        } => (peer_id, response.send(Ok(BlockHeaders(Vec::new()))).is_ok()),
+            peer_id,
+            request,
+            response,
+        } => {
+            let headers = store.map_or_else(Vec::new, |store| held_headers(store, &request));
+            (peer_id, response.send(Ok(BlockHeaders(headers))).is_ok())
+        }
         IncomingEthRequest::GetBlockBodies {
             peer_id, response, ..
         } => (peer_id, response.send(Ok(BlockBodies(Vec::new()))).is_ok()),
@@ -793,7 +810,29 @@ fn answer(request: IncomingEthRequest, _store: Option<&Store>) {
             response,
         } => (peer_id, response.send(Ok(empty_snap(&request))).is_ok()),
     };
-    trace!(target: "chibi::devp2p", %peer, delivered, "answered inbound request with nothing");
+    trace!(target: "chibi::devp2p", %peer, delivered, "answered inbound request");
+}
+
+/// The headers `request` asks for, as far as `store` holds them: from its start block, stepping
+/// `skip + 1` blocks in its direction, until `limit` headers or the first block not held.
+fn held_headers(store: &Store, request: &GetBlockHeaders) -> Vec<Header> {
+    let start = match request.start_block {
+        BlockHashOrNumber::Hash(hash) => store.headers().rev().find(|held| held.hash() == hash),
+        BlockHashOrNumber::Number(number) => store.header(number),
+    };
+    let Some(start) = start else {
+        return Vec::new();
+    };
+    let step = u64::from(request.skip) + 1;
+    let direction = request.direction;
+    std::iter::successors(Some(start.number()), |number| match direction {
+        HeadersDirection::Rising => number.checked_add(step),
+        HeadersDirection::Falling => number.checked_sub(step),
+    })
+    .map_while(|number| store.header(number))
+    .take(usize::try_from(request.limit).unwrap_or(usize::MAX))
+    .map(|held| held.header().clone())
+    .collect()
 }
 
 /// The empty snap/2 response for `request`. The session routes response-shaped messages to
@@ -833,12 +872,10 @@ fn empty_snap(request: &SnapProtocolMessage) -> SnapResponse {
 
 #[cfg(test)]
 mod tests {
-    use alloy_eips::BlockHashOrNumber;
     use alloy_primitives::{B128, B512};
     use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World};
     use reth_eth_wire_types::{
-        GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetReceipts,
-        GetReceipts70, HeadersDirection,
+        GetBlockAccessLists, GetBlockBodies, GetCells, GetNodeData, GetReceipts, GetReceipts70,
     };
 
     use super::*;
