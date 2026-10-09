@@ -2,7 +2,7 @@
 //!
 //! This file is the contract between the node implementation and the JSON-RPC layer.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +45,10 @@ use crate::peers::{NetError, Paced, Peers, REQUEST_TIMEOUT};
 /// run missed, so this is the depth of a call's dependency chain. A cold ENS reverse lookup
 /// on Sepolia (ENSv2: a proxy, its implementation, then registries and resolvers) took 31.
 const MISS_ROUNDS: u32 = 64;
+
+/// Names and tokens seeding probes at once: half of one snap/2 peer's slots, so a wallet
+/// request always finds the other half.
+const SEED_IN_FLIGHT: usize = 8;
 
 /// Recent blocks sampled for the suggested tip, as reth's gas price oracle does.
 const FEE_BLOCKS: usize = 20;
@@ -1152,43 +1156,29 @@ impl<P: Peers> Shared<P> {
     /// `transfer` to the holder from the holder for every watched address and registry token,
     /// and pins every key any run read, whether or not the run succeeds. That covers proxies,
     /// pause flags, fee parameters, blacklists, nonstandard layouts, and the ENS registry and
-    /// resolvers without per-contract code. When a run cannot complete, the previous seeded
-    /// pins are kept alongside the new reads and this returns false, so the caller retries
-    /// rather than demoting keys a peer could not serve.
+    /// resolvers without per-contract code. Each name and token is probed on its own, up to
+    /// [`SEED_IN_FLIGHT`] at once. When a run cannot complete, the previous seeded pins are
+    /// kept alongside the new reads and this returns false, so the caller retries rather than
+    /// demoting keys a peer could not serve.
     pub(crate) async fn seed(&self) -> bool {
-        let mut seeded = BTreeSet::new();
-        let mut complete = true;
-        for holder in &self.watch.addresses {
-            let mut requests = vec![("ENS name", reverse_name(self.spec.ens_resolver, *holder))];
+        let mut probes = Vec::new();
+        for &holder in &self.watch.addresses {
+            let name = vec![("ENS name", reverse_name(self.spec.ens_resolver, holder))];
+            probes.push(self.probe(holder, name));
             for token in self.spec.tokens {
-                requests.push((token.symbol, balance_of(token, *holder)));
-                requests.push((token.symbol, transfer_to_self(token, *holder)));
-            }
-            for (what, request) in requests {
-                let store = self.read(State::snapshot);
-                let read = self
-                    .resolve(store, |s| {
-                        exec::execute(s, &self.env, &request)
-                            .map(|executed| Executed {
-                                result: executed.read.clone(),
-                                read: executed.read,
-                            })
-                            .map_err(misses)
-                    })
-                    .await;
-                match read {
-                    Ok(read) => seeded.extend(read),
-                    Err(err) => {
-                        complete = false;
-                        warn!(
-                            target: "chibi::node",
-                            what, %holder, %err,
-                            "seeding failed; retrying at the next step",
-                        );
-                    }
-                }
+                let requests = vec![
+                    (token.symbol, balance_of(token, holder)),
+                    (token.symbol, transfer_to_self(token, holder)),
+                ];
+                probes.push(self.probe(holder, requests));
             }
         }
+        let probed: Vec<(HashSet<Key>, bool)> = futures::stream::iter(probes)
+            .buffer_unordered(SEED_IN_FLIGHT)
+            .collect()
+            .await;
+        let complete = probed.iter().all(|(_, complete)| *complete);
+        let mut seeded: BTreeSet<Key> = probed.into_iter().flat_map(|(read, _)| read).collect();
         self.update(|s| {
             if !complete {
                 seeded.extend(s.working().pins());
@@ -1196,6 +1186,42 @@ impl<P: Peers> Shared<P> {
             s.set_seeded(seeded);
         });
         complete
+    }
+
+    /// Runs `requests` for `holder` in order, each over the latest store, and returns every
+    /// key the completed runs read and whether all of them completed.
+    async fn probe(
+        &self,
+        holder: Address,
+        requests: Vec<(&'static str, CallRequest)>,
+    ) -> (HashSet<Key>, bool) {
+        let mut seeded = HashSet::new();
+        let mut complete = true;
+        for (what, request) in requests {
+            let store = self.read(State::snapshot);
+            let read = self
+                .resolve(store, |s| {
+                    exec::execute(s, &self.env, &request)
+                        .map(|executed| Executed {
+                            result: executed.read.clone(),
+                            read: executed.read,
+                        })
+                        .map_err(misses)
+                })
+                .await;
+            match read {
+                Ok(read) => seeded.extend(read),
+                Err(err) => {
+                    complete = false;
+                    warn!(
+                        target: "chibi::node",
+                        what, %holder, %err,
+                        "seeding failed; retrying",
+                    );
+                }
+            }
+        }
+        (seeded, complete)
     }
 
     /// The display snapshot at `store`, computed locally without fetching.
