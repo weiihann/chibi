@@ -430,14 +430,20 @@ impl Ui<'_> {
                     };
                     self.draw()?;
                     let password = self.app.take_password();
+                    let target = config.clone();
                     let (saved, password) = tokio::task::spawn_blocking(move || {
-                        (wallet::save(&secret, &password, &config), password)
+                        (wallet::save(&secret, &password, &target), password)
                     })
                     .await?;
                     self.app.return_password(password);
                     match saved {
                         Ok(Saved::Written(signer, path)) => {
                             self.app.saved(signer.address(), &path);
+                            return Ok(Some(signer));
+                        }
+                        Ok(Saved::Unrecorded(signer, path, reason)) => {
+                            self.app
+                                .unrecorded(signer.address(), &path, &config, &reason);
                             return Ok(Some(signer));
                         }
                         Ok(Saved::Exists(address, path)) => {

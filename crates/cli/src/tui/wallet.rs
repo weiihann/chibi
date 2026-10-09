@@ -129,6 +129,9 @@ pub enum Saved {
     Written(PrivateKeySigner, PathBuf),
     /// A keystore for this address was already at this path and is kept as it was.
     Exists(Address, PathBuf),
+    /// Newly encrypted to this path, with its decrypted signer, but not recorded in the
+    /// config, for this reason.
+    Unrecorded(PrivateKeySigner, PathBuf, String),
 }
 
 /// Why the wallet could not be saved.
@@ -163,7 +166,8 @@ pub enum SaveError {
 
 /// Encrypts `secret`'s key with `password` into `keystores/<checksummed address>.json` beside
 /// the config file at `config` (directory 0700, file 0600), unless a keystore for the address
-/// is already there, then records it as the config's `keystore`.
+/// is already there, then records it as the config's `keystore`. A keystore written but not
+/// recorded is [`Saved::Unrecorded`].
 pub fn save(secret: &Secret, password: &str, config: &Path) -> Result<Saved, SaveError> {
     save_with(secret, password, config, &|_| Ok(()))
 }
@@ -207,18 +211,24 @@ fn save_with(
     drop(derived);
     let published = publish(&temp, &name, &path, key.as_slice(), password, fault);
     let _ = fs::remove_dir_all(&temp);
-    let saved = match published {
-        Ok(signer) => Saved::Written(signer, path.clone()),
+    let signer = match published {
+        Ok(signer) => signer,
         Err(SaveError::Write { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
-            Saved::Exists(address, path.clone())
+            record(config, &path, fault)?;
+            return Ok(Saved::Exists(address, path));
         }
         Err(err) => return Err(err),
     };
-    File::open(&dir)
+    let recorded = File::open(&dir)
         .and_then(|dir| dir.sync_all())
-        .map_err(write_error(&dir))?;
-    record(config, &path, fault)?;
-    Ok(saved)
+        .map_err(write_error(&dir))
+        .and_then(|()| record(config, &path, fault));
+    Ok(match recorded {
+        Ok(()) => Saved::Written(signer, path),
+        Err(SaveError::Write { source, .. }) => Saved::Unrecorded(signer, path, source.to_string()),
+        Err(SaveError::Config { reason, .. }) => Saved::Unrecorded(signer, path, reason),
+        Err(err) => Saved::Unrecorded(signer, path, err.to_string()),
+    })
 }
 
 /// Encrypts `key` to `name` in the private directory `temp`, makes it 0600 and durable,
@@ -231,9 +241,14 @@ fn publish(
     password: &str,
     fault: &dyn Fn(&Path) -> io::Result<()>,
 ) -> Result<PrivateKeySigner, SaveError> {
-    let (signer, _) =
-        PrivateKeySigner::encrypt_keystore(temp, &mut rand::thread_rng(), key, password, Some(name))
-            .map_err(SaveError::Encrypt)?;
+    let (signer, _) = PrivateKeySigner::encrypt_keystore(
+        temp,
+        &mut rand::thread_rng(),
+        key,
+        password,
+        Some(name),
+    )
+    .map_err(SaveError::Encrypt)?;
     let file = temp.join(name);
     fs::set_permissions(&file, Permissions::from_mode(0o600))
         .and_then(|()| File::open(&file)?.sync_all())
@@ -289,6 +304,12 @@ fn record(
 fn replace(path: &Path, text: &str, fault: &dyn Fn(&Path) -> io::Result<()>) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("/"));
     let permissions = match fs::metadata(path) {
+        Ok(metadata) if metadata.permissions().readonly() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the file is read-only",
+            ));
+        }
         Ok(metadata) => Some(metadata.permissions()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => None,
         Err(err) => return Err(err),
@@ -539,7 +560,10 @@ mod tests {
             transfer::unlock(&path, "correct horse").unwrap().address(),
             signer.address()
         );
-        assert!(!reason.is_empty() && !reason.contains("config.toml"), "{reason}");
+        assert!(
+            !reason.is_empty() && !reason.contains("config.toml"),
+            "{reason}"
+        );
         assert_eq!(fs::read_to_string(&config).unwrap(), text);
         assert_eq!(
             fs::metadata(&config).unwrap().permissions().mode() & 0o777,

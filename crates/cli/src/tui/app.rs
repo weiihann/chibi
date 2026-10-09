@@ -471,6 +471,19 @@ impl App {
         ));
     }
 
+    /// The wallet was encrypted to a new keystore at `path` and is unlocked as `address`, but
+    /// the config file at `config` could not name it, for `reason`.
+    pub fn unrecorded(&mut self, address: Address, path: &Path, config: &Path, reason: &str) {
+        self.saved(address, path);
+        self.notice = Some(format!(
+            "saved your wallet {} to {}, but could not record it in {}: {reason}. start with --keystore {} next time.",
+            address.to_checksum(None),
+            path.display(),
+            config.display(),
+            path.display()
+        ));
+    }
+
     /// A keystore for `address` was already at `path`: it is kept, and unlocked as any other.
     pub fn kept(&mut self, address: Address, path: &Path) {
         self.setup.discard();
