@@ -2079,6 +2079,36 @@ mod tests {
     }
 
     #[test]
+    fn a_wallet_saved_to_an_unwritable_config_still_goes_on_and_says_how_to_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "network = \"mainnet\"\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let secret =
+            wallet::parse("test test test test test test test test test test test junk").unwrap();
+        let Ok(wallet::Saved::Unrecorded(signer, path, reason)) =
+            wallet::save(&secret, "password1", &config)
+        else {
+            panic!("the keystore is written but the config is read-only");
+        };
+        let mut app = setting_up(None);
+        app.unrecorded(signer.address(), &path, &config, &reason);
+        assert_eq!(app.screen, Screen::Waiting);
+        assert_eq!(app.sender, Some(ANVIL));
+        assert_eq!(
+            app.notice,
+            Some(format!(
+                "saved your wallet {ANVIL} to {}, but could not record it in {}: {reason}. start with --keystore {} next time.",
+                path.display(),
+                config.display(),
+                path.display()
+            ))
+        );
+    }
+
+    #[test]
     fn esc_from_the_backup_or_the_confirmation_discards_the_phrase() {
         let mut app = setting_up(None);
         press(&mut app, KeyCode::Enter);

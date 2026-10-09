@@ -521,4 +521,29 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn a_keystore_written_beside_a_read_only_config_is_still_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let text = "network = \"mainnet\"\n";
+        fs::write(&config, text).unwrap();
+        fs::set_permissions(&config, Permissions::from_mode(0o400)).unwrap();
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let Ok(Saved::Unrecorded(signer, path, reason)) =
+            save(&parse(key).unwrap(), "correct horse", &config)
+        else {
+            panic!("the keystore is written but the config is read-only");
+        };
+        assert_eq!(
+            transfer::unlock(&path, "correct horse").unwrap().address(),
+            signer.address()
+        );
+        assert!(!reason.is_empty() && !reason.contains("config.toml"), "{reason}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
 }
