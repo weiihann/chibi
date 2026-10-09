@@ -15,6 +15,7 @@ use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
     Transaction,
 };
+use chibi_core::state::Store;
 use chibi_core::{TrustedHash, VerifiedHeader};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -745,13 +746,13 @@ async fn dialable(handle: &NetworkHandle, peer: PeerId) -> Option<NodeRecord> {
 
 async fn answer_inbound(mut requests: mpsc::Receiver<IncomingEthRequest>) {
     while let Some(request) = requests.recv().await {
-        answer_empty(request);
+        answer(request, None);
     }
 }
 
 /// Replies to `request` with an empty response of the matching type. Dropping the sender or
 /// replying `Err` would send nothing, and the peer would time out and drop chibi.
-fn answer_empty(request: IncomingEthRequest) {
+fn answer(request: IncomingEthRequest, _store: Option<&Store>) {
     let (peer, delivered) = match request {
         IncomingEthRequest::GetBlockHeaders {
             peer_id, response, ..
@@ -832,7 +833,9 @@ fn empty_snap(request: &SnapProtocolMessage) -> SnapResponse {
 
 #[cfg(test)]
 mod tests {
+    use alloy_eips::BlockHashOrNumber;
     use alloy_primitives::{B128, B512};
+    use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World};
     use reth_eth_wire_types::{
         GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetReceipts,
         GetReceipts70, HeadersDirection,
@@ -1025,72 +1028,125 @@ mod tests {
     const PEER: PeerId = B512::repeat_byte(7);
     const HASH: B256 = B256::repeat_byte(1);
 
-    /// Hands `answer_empty` a request built around a fresh response channel and returns the
-    /// reply it sent.
+    /// Hands `answer` a request built around a fresh response channel, with `store` announced,
+    /// and returns the reply it sent.
     fn answered<T>(
+        store: Option<&Store>,
         request: impl FnOnce(oneshot::Sender<RequestResult<T>>) -> IncomingEthRequest,
     ) -> RequestResult<T> {
         let (response, mut reply) = oneshot::channel();
-        answer_empty(request(response));
+        super::answer(request(response), store);
         reply
             .try_recv()
-            .expect("answer_empty must reply before returning")
+            .expect("answer must reply before returning")
+    }
+
+    /// A chain of six blocks from genesis and a store anchored at its head holding every
+    /// block but genesis, with the block hashes by height above genesis.
+    fn window() -> (World, Vec<B256>, Store) {
+        let mut world = World::genesis([]);
+        let mut hashes = vec![world.head()];
+        for _ in 0..5 {
+            hashes.push(world.mine(BlockWrites::default()));
+        }
+        let head = world.verified(hashes[5]);
+        let between = world.headers_between(hashes[0], hashes[5]);
+        let mut store = Store::new(head.clone());
+        store
+            .insert_ancestors(chibi_core::verify::ancestors(&head, between).unwrap())
+            .unwrap();
+        (world, hashes, store)
+    }
+
+    fn headers(
+        store: Option<&Store>,
+        start: impl Into<BlockHashOrNumber>,
+        limit: u64,
+        skip: u32,
+        direction: HeadersDirection,
+    ) -> Vec<Header> {
+        let request = GetBlockHeaders {
+            start_block: start.into(),
+            limit,
+            skip,
+            direction,
+        };
+        answered(store, |response| IncomingEthRequest::GetBlockHeaders {
+            peer_id: PEER,
+            request,
+            response,
+        })
+        .unwrap()
+        .0
     }
 
     #[test]
-    fn every_eth_request_gets_an_empty_reply_of_its_type() {
-        let headers = GetBlockHeaders {
-            start_block: HASH.into(),
-            limit: 16,
-            skip: 0,
-            direction: HeadersDirection::Falling,
+    fn header_requests_are_answered_from_the_held_window_only() {
+        use HeadersDirection::{Falling, Rising};
+        let (world, hashes, store) = window();
+        let at = |heights: &[usize]| -> Vec<Header> {
+            heights.iter().map(|&h| world.header(hashes[h])).collect()
         };
+        let number = |height: u64| GENESIS_NUMBER + height;
+        let held = Some(&store);
+        assert_eq!(headers(held, number(2), 3, 0, Rising), at(&[2, 3, 4]));
+        assert_eq!(headers(held, hashes[5], 16, 1, Falling), at(&[5, 3, 1]));
+        assert_eq!(headers(held, number(1), 4, 2, Rising), at(&[1, 4]));
+        assert_eq!(headers(held, hashes[3], 1, 0, Falling), at(&[3]));
+        assert_eq!(headers(held, number(4), 16, 0, Rising), at(&[4, 5]));
+        assert_eq!(headers(held, hashes[2], 16, 0, Falling), at(&[2, 1]));
+        assert_eq!(headers(held, number(5), 16, u32::MAX, Falling), at(&[5]));
+        assert_eq!(headers(held, number(5), 16, u32::MAX, Rising), at(&[5]));
+        assert_eq!(headers(held, number(5), 0, 0, Falling), at(&[]));
+        assert_eq!(headers(held, number(0), 16, 0, Rising), at(&[]));
+        assert_eq!(headers(held, hashes[0], 16, 0, Rising), at(&[]));
+        assert_eq!(headers(held, number(6), 16, 0, Falling), at(&[]));
+        assert_eq!(headers(held, HASH, 16, 0, Falling), at(&[]));
+        assert_eq!(headers(None, hashes[5], 16, 0, Falling), at(&[]));
+    }
+
+    #[test]
+    fn every_other_eth_request_gets_an_empty_reply_of_its_type() {
+        let (_, hashes, store) = window();
+        let (head, held) = (hashes[5], Some(&store));
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetBlockHeaders {
+            answered(held, |response| IncomingEthRequest::GetBlockBodies {
                 peer_id: PEER,
-                request: headers,
-                response,
-            }),
-            Ok(BlockHeaders(Vec::new())),
-        );
-        assert_eq!(
-            answered(|response| IncomingEthRequest::GetBlockBodies {
-                peer_id: PEER,
-                request: GetBlockBodies(vec![HASH]),
+                request: GetBlockBodies(vec![head]),
                 response,
             }),
             Ok(BlockBodies(Vec::new())),
         );
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetNodeData {
+            answered(held, |response| IncomingEthRequest::GetNodeData {
                 peer_id: PEER,
-                request: GetNodeData(vec![HASH]),
+                request: GetNodeData(vec![head]),
                 response,
             }),
             Ok(NodeData(Vec::new())),
         );
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetReceipts {
+            answered(held, |response| IncomingEthRequest::GetReceipts {
                 peer_id: PEER,
-                request: GetReceipts(vec![HASH]),
+                request: GetReceipts(vec![head]),
                 response,
             }),
             Ok(Receipts(Vec::new())),
         );
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetReceipts69 {
+            answered(held, |response| IncomingEthRequest::GetReceipts69 {
                 peer_id: PEER,
-                request: GetReceipts(vec![HASH]),
+                request: GetReceipts(vec![head]),
                 response,
             }),
             Ok(Receipts69(Vec::new())),
         );
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetReceipts70 {
+            answered(held, |response| IncomingEthRequest::GetReceipts70 {
                 peer_id: PEER,
                 request: GetReceipts70 {
                     first_block_receipt_index: 3,
-                    block_hashes: vec![HASH]
+                    block_hashes: vec![head]
                 },
                 response,
             }),
@@ -1100,18 +1156,18 @@ mod tests {
             }),
         );
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetBlockAccessLists {
+            answered(held, |response| IncomingEthRequest::GetBlockAccessLists {
                 peer_id: PEER,
-                request: GetBlockAccessLists(vec![HASH]),
+                request: GetBlockAccessLists(vec![head]),
                 response,
             }),
             Ok(BlockAccessLists(Vec::new())),
         );
         assert_eq!(
-            answered(|response| IncomingEthRequest::GetCells {
+            answered(held, |response| IncomingEthRequest::GetCells {
                 peer_id: PEER,
                 request: GetCells {
-                    hashes: vec![HASH],
+                    hashes: vec![head],
                     cell_mask: B128::repeat_byte(0xff)
                 },
                 response,
@@ -1170,7 +1226,7 @@ mod tests {
             }),
         ];
         for (request, expected) in requests.into_iter().zip(expected) {
-            let reply = answered(|response| IncomingEthRequest::GetSnap {
+            let reply = answered(None, |response| IncomingEthRequest::GetSnap {
                 peer_id: PEER,
                 request,
                 response,
