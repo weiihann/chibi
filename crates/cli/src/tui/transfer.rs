@@ -110,7 +110,7 @@ pub enum TransferError {
 #[derive(Debug, thiserror::Error)]
 pub enum UnlockError {
     /// The keystore file cannot be read.
-    #[error("cannot read the keystore {}: {source}", path.display())]
+    #[error("cannot read the keystore {}", path.display())]
     Unreadable {
         /// The keystore path.
         path: PathBuf,
@@ -422,10 +422,11 @@ mod tests {
         ));
 
         let missing = dir.path().join("missing.json");
-        let error = unlock(&missing, "hunter2").unwrap_err().to_string();
-        assert!(
-            error.starts_with(&format!("cannot read the keystore {}: ", missing.display())),
-            "{error}"
+        let error = unlock(&missing, "hunter2").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("cannot read the keystore {}", missing.display())
         );
+        assert!(matches!(error, UnlockError::Unreadable { .. }));
     }
 }
