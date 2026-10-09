@@ -98,6 +98,9 @@ pub enum TransferError {
     /// The transfer reverts at the head; nothing is signed.
     #[error("the transfer reverts: {0}")]
     Reverts(String),
+    /// No state peer is connected, so nothing is signed.
+    #[error("{}", super::app::PAUSED)]
+    NoStatePeer,
     /// The node could not estimate, sign for, or submit the transfer.
     #[error(transparent)]
     Node(#[from] NodeError),
@@ -190,7 +193,8 @@ pub async fn estimate<P: Peers>(
     })
 }
 
-/// Signs the transfer with `signer` at its next pending nonce and submits it.
+/// Signs the transfer with `signer` at its next pending nonce and submits it, refusing to
+/// sign while the node counts no state peer.
 pub async fn send<P: Peers>(
     node: &Node<P>,
     signer: &PrivateKeySigner,
@@ -201,6 +205,9 @@ pub async fn send<P: Peers>(
         .transaction_count(signer.address(), BlockSel::Pending)
         .await?;
     let (to, value, input) = draft.call();
+    if node.health().state_peers == 0 {
+        return Err(TransferError::NoStatePeer);
+    }
     let tx = TxEip1559 {
         chain_id: node.chain_id(),
         nonce,

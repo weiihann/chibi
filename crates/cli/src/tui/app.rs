@@ -17,6 +17,9 @@ pub const STILL_PENDING_HEADS: u64 = 10;
 /// Shown on Review instead of signing on any network but Sepolia.
 pub const MAINNET_REFUSED: &str = "sending on mainnet is not enabled yet";
 
+/// Why nothing is sent while no state peer is connected.
+pub const PAUSED: &str = "waiting for a state peer";
+
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -222,6 +225,8 @@ pub struct App {
     pub balances: Balances,
     /// The latest head number seen.
     pub head: u64,
+    /// State peers connected at the latest health tick or start-up report.
+    pub state_peers: usize,
     /// The transfer form.
     pub form: Form,
     /// The fee estimate for the form's draft.
@@ -254,6 +259,7 @@ impl App {
             sender: None,
             balances: Balances::default(),
             head: 0,
+            state_peers: 0,
             form: Form::default(),
             estimate: None,
             estimating: false,
@@ -284,24 +290,31 @@ impl App {
 
     /// The node's start-up progress.
     pub fn startup(&mut self, startup: Startup) {
-        match (startup, self.screen) {
-            (
-                Startup::Waiting {
-                    peers,
-                    state_peers,
-                    elapsed,
-                },
-                _,
-            ) => {
+        match startup {
+            Startup::Waiting {
+                peers,
+                state_peers,
+                elapsed,
+            } => {
+                self.state_peers = state_peers;
                 self.waiting = WaitCounts {
                     peers,
                     state_peers,
                     elapsed,
+                };
+            }
+            Startup::FoundStatePeer => {
+                self.state_peers = self.state_peers.max(1);
+                if self.screen == Screen::Waiting {
+                    self.screen = Screen::Excited;
                 }
             }
-            (Startup::FoundStatePeer, Screen::Waiting) => self.screen = Screen::Excited,
-            (Startup::Serving, Screen::Waiting | Screen::Excited) => self.screen = Screen::Ready,
-            (Startup::FoundStatePeer | Startup::Serving, _) => {}
+            Startup::Serving => {
+                self.state_peers = self.state_peers.max(1);
+                if matches!(self.screen, Screen::Waiting | Screen::Excited) {
+                    self.screen = self.form_screen();
+                }
+            }
         }
     }
 
@@ -317,19 +330,27 @@ impl App {
             }
             self.head = head;
         }
+        self.state_peers = state_peers;
         match self.screen {
-            Screen::Ready | Screen::Review if state_peers == 0 => {
+            Screen::Review if state_peers == 0 => {
                 self.review = None;
                 self.screen = Screen::Paused;
             }
-            Screen::Paused if state_peers > 0 => self.screen = Screen::Ready,
+            Screen::Ready | Screen::Paused => self.screen = self.form_screen(),
             Screen::Unlock
             | Screen::Waiting
             | Screen::Excited
-            | Screen::Ready
-            | Screen::Paused
             | Screen::Review
             | Screen::Sending => {}
+        }
+    }
+
+    /// The form when a state peer is connected, else Paused.
+    const fn form_screen(&self) -> Screen {
+        if self.state_peers == 0 {
+            Screen::Paused
+        } else {
+            Screen::Ready
         }
     }
 
@@ -593,7 +614,7 @@ impl App {
             }
             Key::Char('n') | Key::Esc => {
                 self.review = None;
-                self.screen = Screen::Ready;
+                self.screen = self.form_screen();
                 None
             }
             Key::Char(_)
@@ -617,7 +638,7 @@ impl App {
             self.form.amount.clear();
             self.form.to.clear();
         }
-        self.screen = Screen::Ready;
+        self.screen = self.form_screen();
     }
 
     /// Checks every field; on success shows Review. The fee is only judged once the other

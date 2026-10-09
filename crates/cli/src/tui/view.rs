@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::app::{App, Field, Screen, SendState, show};
+use super::app::{App, Field, PAUSED, Screen, SendState, show};
 use super::transfer::{Asset, Fee};
 use crate::format_units;
 
@@ -121,7 +121,7 @@ fn body_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Paused => {
             lines.extend(cat(pick(&SLEEPY, app.frame)));
             lines.push(Line::default());
-            lines.push(Line::raw("waiting for a state peer"));
+            lines.push(Line::raw(PAUSED));
             lines.push(Line::raw(
                 "nothing can be proven or sent until one connects; your form is kept",
             ));
