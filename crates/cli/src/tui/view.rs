@@ -71,7 +71,7 @@ impl View {
     pub fn new(app: &App, logs: Vec<String>) -> Self {
         Self {
             header: header_line(app),
-            body: body_lines(app),
+            body: with_notice(app, body_lines(app)),
             footer: footer_lines(app),
             logs: app.logs.then_some(logs),
         }
@@ -88,7 +88,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     let [header, body, footer, log_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(pane),
     ])
     .areas(frame.area());
@@ -419,12 +419,22 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Review => "y send · n back · l logs · q quit",
         Screen::Sending => "Enter back to the form · l logs · q quit",
     };
-    vec![
-        app.notice.as_deref().map_or_else(Line::default, |notice| {
-            Line::styled(notice.to_owned(), Style::default().fg(Color::Yellow))
-        }),
-        Line::styled(keys, Style::default().add_modifier(Modifier::DIM)),
-    ]
+    vec![Line::styled(
+        keys,
+        Style::default().add_modifier(Modifier::DIM),
+    )]
+}
+
+/// Ends the body with the notice, if any, so it wraps like the rest of the body.
+fn with_notice(app: &App, mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if let Some(notice) = app.notice.as_deref() {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            notice.to_owned(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines
 }
 
 fn error_line(text: &str) -> Line<'static> {
