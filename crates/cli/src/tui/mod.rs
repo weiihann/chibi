@@ -175,6 +175,21 @@ fn join_within<T>(
     Ok(thread.join())
 }
 
+/// The render thread, joined for at most [`RESTORE_WAIT`] if a panic unwinds past it, so the
+/// terminal is restored before the process exits. Declare it before the views sender, so the
+/// sender drops first and the thread ends.
+struct Renderer<T> {
+    thread: Option<thread::JoinHandle<T>>,
+    release_raw: fn(),
+}
+
+impl<T> Renderer<T> {
+    /// Hands the thread to [`finish`] on the normal path.
+    fn take(mut self) -> thread::JoinHandle<T> {
+        self.thread.take().expect("the render thread is taken once")
+    }
+}
+
 /// Joins the render thread for at most [`RESTORE_WAIT`]. One still blocked writing is left
 /// behind with raw mode released by `release_raw`, which writes nothing to the terminal.
 fn finish<E: std::error::Error + Send + Sync + 'static>(
@@ -219,7 +234,10 @@ pub fn run(
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
     let (views, latest) = watch::channel(View::new(&app, Vec::new()));
     let handle = runtime.handle().clone();
-    let renderer = thread::spawn(move || render(terminal, latest, &handle));
+    let renderer = Renderer {
+        thread: Some(thread::spawn(move || render(terminal, latest, &handle))),
+        release_raw,
+    };
     let (input_tx, input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
     let mut ui = Ui {
@@ -265,7 +283,7 @@ pub fn run(
         ui.drive(node_task, Arc::new(signer)).await
     });
     drop(ui);
-    let rendered = finish(renderer, release_raw);
+    let rendered = finish(renderer.take(), release_raw);
     if reader.join().is_err() {
         tracing::warn!("the key reader panicked");
     }
@@ -755,6 +773,29 @@ mod tests {
         while RESTORED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::sleep(JOIN_POLL);
         }
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panic_restores_the_terminal_before_it_unwinds_further() {
+        static RESTORED: AtomicUsize = AtomicUsize::new(0);
+        fn restored() {
+            RESTORED.fetch_add(1, Ordering::SeqCst);
+        }
+        let runtime = Runtime::new().unwrap();
+        let terminal = open(|| Terminal::new(TestBackend::new(20, 5)), restored).unwrap();
+        let handle = runtime.handle().clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let app = App::new(Network::Sepolia, 11_155_111, &[], false);
+            let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+            let _renderer = Renderer {
+                thread: Some(thread::spawn(move || render(terminal, latest, &handle))),
+                release_raw: || {},
+            };
+            let _views = views;
+            panic!("the control thread fails");
+        });
+        assert!(unwound.is_err());
         assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
     }
 
