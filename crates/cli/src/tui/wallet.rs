@@ -1,9 +1,9 @@
 //! The wallet the TUI's setup makes: a new recovery phrase, an imported private key or
 //! phrase, and the encrypted keystore it saves beside the config.
 
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, hex};
@@ -165,6 +165,17 @@ pub enum SaveError {
 /// the config file at `config` (directory 0700, file 0600), unless a keystore for the address
 /// is already there, then records it as the config's `keystore`.
 pub fn save(secret: &Secret, password: &str, config: &Path) -> Result<Saved, SaveError> {
+    save_with(secret, password, config, &|_| Ok(()))
+}
+
+/// [`save`], calling `fault` with each temporary file once it is written, before it is
+/// published.
+fn save_with(
+    secret: &Secret,
+    password: &str,
+    config: &Path,
+    fault: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<Saved, SaveError> {
     let derived = signer(secret).map_err(SaveError::Derive)?;
     let address = derived.address();
     let dir = config
@@ -183,36 +194,56 @@ pub fn save(secret: &Secret, password: &str, config: &Path) -> Result<Saved, Sav
         .map_err(write_error(&dir))?;
     let name = format!("{}.json", address.to_checksum(None));
     let path = dir.join(&name);
-    let created = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path);
-    let saved = match created {
-        Ok(file) => {
-            drop(file);
-            let key = Zeroizing::new(derived.to_bytes().0);
-            drop(derived);
-            let (signer, _) = PrivateKeySigner::encrypt_keystore(
-                &dir,
-                &mut rand::thread_rng(),
-                key.as_slice(),
-                password,
-                Some(&name),
-            )
-            .map_err(|err| {
-                let _ = fs::remove_file(&path);
-                SaveError::Encrypt(err)
-            })?;
-            Saved::Written(signer, path.clone())
-        }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+    if path.symlink_metadata().is_ok() {
+        record(config, &path)?;
+        return Ok(Saved::Exists(address, path));
+    }
+    let temp = dir.join(format!(".{name}.{:016x}", rand::random::<u64>()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&temp)
+        .map_err(write_error(&temp))?;
+    let key = Zeroizing::new(derived.to_bytes().0);
+    drop(derived);
+    let published = publish(&temp, &name, &path, key.as_slice(), password, fault);
+    let _ = fs::remove_dir_all(&temp);
+    let saved = match published {
+        Ok(signer) => Saved::Written(signer, path.clone()),
+        Err(SaveError::Write { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
             Saved::Exists(address, path.clone())
         }
-        Err(err) => return Err(write_error(&path)(err)),
+        Err(err) => return Err(err),
     };
+    File::open(&dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(write_error(&dir))?;
     record(config, &path)?;
     Ok(saved)
+}
+
+/// Encrypts `key` to `name` in the private directory `temp`, makes it 0600 and durable,
+/// then hard-links it to `path`, which fails with `AlreadyExists` if anything is there.
+fn publish(
+    temp: &Path,
+    name: &str,
+    path: &Path,
+    key: &[u8],
+    password: &str,
+    fault: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<PrivateKeySigner, SaveError> {
+    let (signer, _) =
+        PrivateKeySigner::encrypt_keystore(temp, &mut rand::thread_rng(), key, password, Some(name))
+            .map_err(SaveError::Encrypt)?;
+    let file = temp.join(name);
+    fs::set_permissions(&file, Permissions::from_mode(0o600))
+        .and_then(|()| File::open(&file)?.sync_all())
+        .and_then(|()| fault(&file))
+        .and_then(|()| fs::hard_link(&file, path))
+        .map_err(|source| SaveError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(signer)
 }
 
 /// Sets `keystore` in the config file at `config`, keeping everything else in it, or creates
