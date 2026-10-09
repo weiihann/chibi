@@ -243,7 +243,9 @@ impl Ui<'_> {
         }
     }
 
-    /// Runs the node and the UI together until the node stops.
+    /// Runs the node on its own task and the UI here until the node stops. The UI reaches the
+    /// node only through channels and the [`Node`] handle, so a terminal that blocks a draw
+    /// stalls the screen but not the node, its JSON-RPC, or its shutdown on a signal.
     async fn drive(
         &mut self,
         node_config: NodeConfig,
@@ -264,7 +266,7 @@ impl Ui<'_> {
                 _ = quit_rx => Ok("the TUI's quit key"),
             }
         };
-        let serving = run::serve(
+        let mut serving = tokio::spawn(run::serve(
             node_config,
             served,
             false,
@@ -273,81 +275,100 @@ impl Ui<'_> {
             move |node: &Node| {
                 let _ = node_tx.send(node.clone());
             },
-        );
-        tokio::pin!(serving);
+        ));
         let (done_tx, mut done) = mpsc::unbounded_channel::<Done>();
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            self.draw()?;
-            tokio::select! {
-                result = &mut serving => return result,
-                changed = startup.changed(), if startup_open => match changed {
-                    Ok(()) => self.app.startup(*startup.borrow_and_update()),
-                    Err(_) => startup_open = false,
-                },
-                started = &mut node_rx, if node_pending => {
-                    node_pending = false;
-                    node = started.ok();
-                }
-                Some(event) = self.input.recv() => {
-                    let Event::Key(key) = event else { continue };
-                    match self.app.key(key) {
-                        Some(Action::Quit) => {
-                            if let Some(quit) = quit_tx.take() {
-                                let _ = quit.send(());
-                                self.app.notice = Some("shutting down...".to_owned());
+        let ui: eyre::Result<eyre::Result<()>> = async {
+            loop {
+                self.draw()?;
+                tokio::select! {
+                    joined = &mut serving => {
+                        return Ok(match joined {
+                            Ok(served) => served,
+                            Err(err) => Err(err).wrap_err("the node task failed"),
+                        });
+                    }
+                    changed = startup.changed(), if startup_open => match changed {
+                        Ok(()) => self.app.startup(*startup.borrow_and_update()),
+                        Err(_) => startup_open = false,
+                    },
+                    started = &mut node_rx, if node_pending => {
+                        node_pending = false;
+                        node = started.ok();
+                    }
+                    Some(event) = self.input.recv() => {
+                        let Event::Key(key) = event else { continue };
+                        match self.app.key(key) {
+                            Some(Action::Quit) => {
+                                if let Some(quit) = quit_tx.take() {
+                                    let _ = quit.send(());
+                                    self.app.notice = Some("shutting down...".to_owned());
+                                }
+                            }
+                            Some(Action::Send(draft, fee)) => {
+                                if let Some(node) = node.clone() {
+                                    let signer = Arc::clone(&signer);
+                                    let done_tx = done_tx.clone();
+                                    tokio::spawn(async move {
+                                        let sent = transfer::send(&node, &signer, &draft, &fee)
+                                            .await
+                                            .map_err(|err| err.to_string());
+                                        let _ = done_tx.send(Done::Sent(sent));
+                                    });
+                                }
+                            }
+                            Some(Action::Unlock) | None => {}
+                        }
+                    }
+                    Some(finished) = done.recv() => match finished {
+                        Done::Balances(balances) => self.app.refreshed(balances),
+                        Done::Estimated(quote, head, quoted) => {
+                            self.app.estimated(quote, head, quoted);
+                        }
+                        Done::Sent(sent) => self.app.sent(sent),
+                    },
+                    _ = ticks.tick() => {
+                        self.app.tick();
+                        if let Some(node) = &node {
+                            let health = node.health();
+                            self.app.health(health.head.number, health.state_peers);
+                            if self.app.balances_request(health.head.number, health.pinned.held) {
+                                refresh_balances(node, &signer, self.app.registry, &done_tx);
+                            }
+                            if let Some(hash) = self.app.tracking()
+                                && let Some(tracked) = transfer::track(node, hash)
+                            {
+                                self.app.tracked(tracked);
                             }
                         }
-                        Some(Action::Send(draft, fee)) => {
-                            if let Some(node) = node.clone() {
-                                let signer = Arc::clone(&signer);
-                                let done_tx = done_tx.clone();
-                                tokio::spawn(async move {
-                                    let sent = transfer::send(&node, &signer, &draft, &fee)
-                                        .await
-                                        .map_err(|err| err.to_string());
-                                    let _ = done_tx.send(Done::Sent(sent));
-                                });
-                            }
-                        }
-                        Some(Action::Unlock) | None => {}
                     }
                 }
-                Some(finished) = done.recv() => match finished {
-                    Done::Balances(balances) => self.app.refreshed(balances),
-                    Done::Estimated(quote, head, quoted) => {
-                        self.app.estimated(quote, head, quoted);
-                    }
-                    Done::Sent(sent) => self.app.sent(sent),
-                },
-                _ = ticks.tick() => {
-                    self.app.tick();
-                    if let Some(node) = &node {
-                        let health = node.health();
-                        self.app.health(health.head.number, health.state_peers);
-                        if self.app.balances_request(health.head.number, health.pinned.held) {
-                            refresh_balances(node, &signer, self.app.registry, &done_tx);
-                        }
-                        if let Some(hash) = self.app.tracking()
-                            && let Some(tracked) = transfer::track(node, hash)
-                        {
-                            self.app.tracked(tracked);
-                        }
-                    }
+                if let (Some(node), Some(quote)) = (&node, self.app.estimate_request()) {
+                    let node = node.clone();
+                    let from = signer.address();
+                    let head = self.app.head;
+                    let done_tx = done_tx.clone();
+                    tokio::spawn(async move {
+                        let quoted = transfer::quote(&node, from, &quote)
+                            .await
+                            .map_err(|err| err.to_string());
+                        let _ = done_tx.send(Done::Estimated(quote, head, quoted));
+                    });
                 }
             }
-            if let (Some(node), Some(quote)) = (&node, self.app.estimate_request()) {
-                let node = node.clone();
-                let from = signer.address();
-                let head = self.app.head;
-                let done_tx = done_tx.clone();
-                tokio::spawn(async move {
-                    let quoted = transfer::quote(&node, from, &quote)
-                        .await
-                        .map_err(|err| err.to_string());
-                    let _ = done_tx.send(Done::Estimated(quote, head, quoted));
-                });
+        }
+        .await;
+        match ui {
+            Ok(served) => served,
+            Err(err) => {
+                if let Some(quit) = quit_tx.take() {
+                    let _ = quit.send(());
+                }
+                if let Ok(Err(served)) = serving.await {
+                    tracing::warn!(%served, "the node stopped with an error after the UI failed");
+                }
+                Err(err)
             }
         }
     }
