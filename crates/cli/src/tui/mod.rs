@@ -25,7 +25,7 @@ use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
 use self::app::{Action, App, Balances, Tracked};
-use self::transfer::{Draft, Fee, UnlockError};
+use self::transfer::{Quote, Quoted, UnlockError};
 use crate::run::{self, STARTING, Served};
 
 /// Log lines kept for the log pane.
@@ -112,7 +112,7 @@ impl Drop for Terminal {
 /// What a background task finished.
 enum Done {
     Balances(u64, Balances),
-    Estimated(Draft, u64, Result<Fee, String>),
+    Estimated(Quote, u64, Result<Quoted, String>),
     Sent(Result<TxHash, String>),
 }
 
@@ -313,7 +313,9 @@ impl Ui<'_> {
                         balances_head = Some(head);
                         self.app.balances(balances);
                     }
-                    Done::Estimated(draft, head, fee) => self.app.estimated(draft, head, fee),
+                    Done::Estimated(quote, head, quoted) => {
+                        self.app.estimated(quote, head, quoted);
+                    }
                     Done::Sent(sent) => self.app.sent(sent),
                 },
                 _ = ticks.tick() => {
@@ -333,16 +335,16 @@ impl Ui<'_> {
                     }
                 }
             }
-            if let (Some(node), Some(draft)) = (&node, self.app.estimate_request()) {
+            if let (Some(node), Some(quote)) = (&node, self.app.estimate_request()) {
                 let node = node.clone();
                 let from = signer.address();
                 let head = self.app.head;
                 let done_tx = done_tx.clone();
                 tokio::spawn(async move {
-                    let fee = transfer::estimate(&node, from, &draft)
+                    let quoted = transfer::quote(&node, from, &quote)
                         .await
                         .map_err(|err| err.to_string());
-                    let _ = done_tx.send(Done::Estimated(draft, head, fee));
+                    let _ = done_tx.send(Done::Estimated(quote, head, quoted));
                 });
             }
         }

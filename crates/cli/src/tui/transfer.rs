@@ -13,6 +13,8 @@ use chibi_core::exec::{CallRequest, EstimateError};
 use chibi_core::wire;
 use chibi_node::{BlockSel, Node, NodeError, Peers, Token};
 
+use super::app::show;
+
 alloy_sol_types::sol! {
     function transfer(address to, uint256 amount) returns (bool);
 }
@@ -92,6 +94,29 @@ impl Fee {
     }
 }
 
+/// What the form asks a fee for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quote {
+    /// Exactly this draft.
+    Exact(Draft),
+    /// All the ETH `balance` can send to `to` once the fee of sending it is paid.
+    MaxEth {
+        /// The recipient.
+        to: Address,
+        /// The sender's ETH balance.
+        balance: U256,
+    },
+}
+
+/// A draft with the fee estimated for exactly it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quoted {
+    /// The transfer.
+    pub draft: Draft,
+    /// Its gas and fee caps.
+    pub fee: Fee,
+}
+
 /// Why a transfer was not estimated or sent.
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
@@ -101,6 +126,18 @@ pub enum TransferError {
     /// No state peer is connected, so nothing is signed.
     #[error("{}", super::app::PAUSED)]
     NoStatePeer,
+    /// `max` ETH: the balance does not cover the fee of sending it.
+    #[error(
+        "your balance of {} does not cover the max fee {}",
+        show(*.balance, Asset::Eth),
+        show(*.max_fee, Asset::Eth)
+    )]
+    FeeOverBalance {
+        /// The ETH balance.
+        balance: U256,
+        /// The max fee.
+        max_fee: U256,
+    },
     /// The node could not estimate, sign for, or submit the transfer.
     #[error(transparent)]
     Node(#[from] NodeError),
@@ -191,6 +228,41 @@ pub async fn estimate<P: Peers>(
         max_fee_per_gas: next_base_fee.saturating_mul(2).saturating_add(tip),
         max_priority_fee_per_gas: tip,
     })
+}
+
+/// Answers `quote` with the draft to sign and its fee.
+pub async fn quote<P: Peers>(
+    node: &Node<P>,
+    from: Address,
+    quote: &Quote,
+) -> Result<Quoted, TransferError> {
+    let (to, balance) = match *quote {
+        Quote::Exact(draft) => {
+            let fee = estimate(node, from, &draft).await?;
+            return Ok(Quoted { draft, fee });
+        }
+        Quote::MaxEth { to, balance } => (to, balance),
+    };
+    let mut draft = Draft {
+        asset: Asset::Eth,
+        to,
+        amount: U256::ZERO,
+    };
+    let fee = estimate(node, from, &draft).await?;
+    draft.amount = left_after(balance, &fee)?;
+    Ok(Quoted { draft, fee })
+}
+
+/// The ETH `balance` leaves once `fee` is paid, if any.
+fn left_after(balance: U256, fee: &Fee) -> Result<U256, TransferError> {
+    let left = balance.saturating_sub(fee.max_cost());
+    if left.is_zero() {
+        return Err(TransferError::FeeOverBalance {
+            balance,
+            max_fee: fee.max_cost(),
+        });
+    }
+    Ok(left)
 }
 
 /// Signs the transfer with `signer` at its next pending nonce and submits it, refusing to

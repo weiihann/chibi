@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{AddressError, parse_address};
 use crate::format_units;
-use crate::tui::transfer::{Asset, Draft, Fee};
+use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
 
 /// Heads a sent transfer may stay pending before the screen says it is still pending.
 pub const STILL_PENDING_HEADS: u64 = 10;
@@ -114,15 +114,15 @@ impl Default for Form {
     }
 }
 
-/// The fee estimate for one draft at one head.
+/// The fee quote for the form at one head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Estimate {
-    /// The draft estimated: `max` ETH is estimated with a zero amount.
-    pub draft: Draft,
+    /// What was asked.
+    pub quote: Quote,
     /// The head it was asked at.
     pub head: u64,
-    /// The latest answer for this draft, `None` while the first is outstanding.
-    pub fee: Option<Result<Fee, String>>,
+    /// The latest answer for this quote, `None` while the first is outstanding.
+    pub quoted: Option<Result<Quoted, String>>,
 }
 
 /// A transfer ready to sign, or refused on this network.
@@ -359,15 +359,15 @@ impl App {
         self.balances = balances;
     }
 
-    /// The draft to estimate when the form's draft or the head changed since the last
-    /// estimate, marking it asked. Only while the form is up.
-    pub fn estimate_request(&mut self) -> Option<Draft> {
+    /// The quote to ask when the form's quote or the head changed since the last one,
+    /// marking it asked. Only while the form is up.
+    pub fn estimate_request(&mut self) -> Option<Quote> {
         if self.screen != Screen::Ready {
             return None;
         }
-        let draft = self.estimate_draft()?;
+        let quote = self.quote()?;
         match &mut self.estimate {
-            Some(estimate) if estimate.draft == draft => {
+            Some(estimate) if estimate.quote == quote => {
                 if estimate.head == self.head || self.estimating {
                     return None;
                 }
@@ -375,25 +375,25 @@ impl App {
             }
             slot => {
                 *slot = Some(Estimate {
-                    draft,
+                    quote,
                     head: self.head,
-                    fee: None,
+                    quoted: None,
                 });
             }
         }
         self.estimating = true;
-        Some(draft)
+        Some(quote)
     }
 
-    /// The estimate asked for `draft` at `head` answered.
-    pub fn estimated(&mut self, draft: Draft, head: u64, result: Result<Fee, String>) {
+    /// The quote asked at `head` answered.
+    pub fn estimated(&mut self, quote: Quote, head: u64, result: Result<Quoted, String>) {
         self.estimating = false;
         if let Some(estimate) = self
             .estimate
             .as_mut()
-            .filter(|e| e.draft == draft && e.head == head)
+            .filter(|e| e.quote == quote && e.head == head)
         {
-            estimate.fee = Some(result);
+            estimate.quoted = Some(result);
             self.form.fee_error = None;
         }
     }
@@ -459,13 +459,19 @@ impl App {
         }
     }
 
-    /// The fee answered for the form's current draft.
-    pub fn fee(&self) -> Option<&Result<Fee, String>> {
-        let draft = self.estimate_draft()?;
+    /// The answer for the form's current quote.
+    pub fn quoted(&self) -> Option<&Result<Quoted, String>> {
+        let quote = self.quote()?;
         self.estimate
             .as_ref()
-            .filter(|estimate| estimate.draft == draft)
-            .and_then(|estimate| estimate.fee.as_ref())
+            .filter(|estimate| estimate.quote == quote)
+            .and_then(|estimate| estimate.quoted.as_ref())
+    }
+
+    /// The fee answered for the form's current quote.
+    pub fn fee(&self) -> Option<Result<&Fee, &String>> {
+        self.quoted()
+            .map(|quoted| quoted.as_ref().map(|quoted| &quoted.fee))
     }
 
     /// A warning about the recipient that does not stop the transfer.
@@ -641,34 +647,35 @@ impl App {
         self.screen = self.form_screen();
     }
 
-    /// Checks every field; on success shows Review. The fee is only judged once the other
-    /// fields make a draft to estimate.
+    /// Checks every field; on success shows Review with the quoted draft and fee. The fee is
+    /// only judged once the other fields make a quote to ask.
     fn submit(&mut self) {
         let to = parse_recipient(&self.form.to);
-        let fee = self.estimate_draft().map(|_| match self.fee() {
-            Some(Ok(fee)) => Ok(*fee),
+        let quoted = self.quote().map(|_| match self.quoted() {
+            Some(Ok(quoted)) => Ok(*quoted),
             Some(Err(reason)) => Err(reason.clone()),
             None => Err("waiting for the fee estimate".to_owned()),
         });
-        let known_fee = fee.as_ref().and_then(|fee| fee.as_ref().ok());
+        let known_fee = quoted
+            .as_ref()
+            .and_then(|quoted| quoted.as_ref().ok())
+            .map(|quoted| &quoted.fee);
         let amount = match self.amount() {
-            Ok(Amount::Exact(amount)) => self.check_amount(amount, known_fee).map(Some),
-            Ok(Amount::Max) => known_fee.map_or(Ok(None), |fee| self.max_amount(fee).map(Some)),
+            Ok(Amount::Exact(amount)) => self.check_amount(amount, known_fee),
+            Ok(Amount::Max) => self.check_max(),
             Err(reason) => Err(reason),
         };
         self.form.to_error = to.as_ref().err().cloned();
-        self.form.fee_error = fee.as_ref().and_then(|fee| fee.as_ref().err().cloned());
+        self.form.fee_error = quoted
+            .as_ref()
+            .and_then(|quoted| quoted.as_ref().err().cloned());
         self.form.amount_error = amount.as_ref().err().cloned();
-        let (Ok(to), Ok(Some(amount)), Some(Ok(fee))) = (to, amount, fee) else {
+        let (Ok(_), Ok(()), Some(Ok(quoted))) = (to, amount, quoted) else {
             return;
         };
         self.review = Some(Review {
-            draft: Draft {
-                asset: self.form.asset,
-                to,
-                amount,
-            },
-            fee,
+            draft: quoted.draft,
+            fee: quoted.fee,
             refused: (self.network != Network::Sepolia).then_some(MAINNET_REFUSED),
         });
         self.screen = Screen::Review;
@@ -696,7 +703,7 @@ impl App {
 
     /// An exact amount checked against the balance, and for ETH against the balance less the
     /// max fee.
-    fn check_amount(&self, amount: U256, fee: Option<&Fee>) -> Result<U256, String> {
+    fn check_amount(&self, amount: U256, fee: Option<&Fee>) -> Result<(), String> {
         let asset = self.form.asset;
         if amount.is_zero() {
             return Err("the amount must be more than 0".to_owned());
@@ -719,44 +726,39 @@ impl App {
                 show(balance, Asset::Eth)
             ));
         }
-        Ok(amount)
+        Ok(())
     }
 
-    /// `max`: the whole token balance, or the ETH balance less the max fee.
-    fn max_amount(&self, fee: &Fee) -> Result<U256, String> {
+    /// `max` needs a proven balance, and a token one held. Whether the ETH balance covers its
+    /// fee is the quote's to answer.
+    fn check_max(&self) -> Result<(), String> {
         let asset = self.form.asset;
         let balance = self
             .balance(asset)
             .ok_or_else(|| "the balance is not proven yet".to_owned())?;
-        let max = match asset {
-            Asset::Eth => balance.saturating_sub(fee.max_cost()),
-            Asset::Token(_) => balance,
-        };
-        if max.is_zero() {
-            return Err(match asset {
-                Asset::Eth => format!(
-                    "your balance of {} does not cover the max fee {}",
-                    show(balance, Asset::Eth),
-                    show(fee.max_cost(), Asset::Eth)
-                ),
-                Asset::Token(_) => format!("you hold no {}", asset.symbol()),
-            });
+        match asset {
+            Asset::Token(_) if balance.is_zero() => Err(format!("you hold no {}", asset.symbol())),
+            Asset::Eth | Asset::Token(_) => Ok(()),
         }
-        Ok(max)
     }
 
-    /// The draft the fee is estimated for: the form's, with `max` ETH as zero.
-    fn estimate_draft(&self) -> Option<Draft> {
+    /// What the fee is quoted for: the form's draft, `max` of a token as its balance, and
+    /// `max` ETH as the balance less the fee of sending it.
+    fn quote(&self) -> Option<Quote> {
         let to = parse_recipient(&self.form.to).ok()?;
         let asset = self.form.asset;
-        let amount = match self.amount().ok()? {
-            Amount::Exact(amount) => amount,
-            Amount::Max => match asset {
-                Asset::Eth => U256::ZERO,
-                Asset::Token(_) => self.balance(asset)?,
+        Some(match (self.amount().ok()?, asset) {
+            (Amount::Exact(amount), _) => Quote::Exact(Draft { asset, to, amount }),
+            (Amount::Max, Asset::Eth) => Quote::MaxEth {
+                to,
+                balance: self.balance(asset)?,
             },
-        };
-        Some(Draft { asset, to, amount })
+            (Amount::Max, Asset::Token(_)) => Quote::Exact(Draft {
+                asset,
+                to,
+                amount: self.balance(asset)?,
+            }),
+        })
     }
 }
 
@@ -905,14 +907,26 @@ mod tests {
         app
     }
 
-    /// Fills the form, answers its estimate with `fee`, and presses Enter.
+    /// Fills the form, answers its quote with `fee` as a node whose fee does not depend on the
+    /// amount, and presses Enter.
     fn submit(app: &mut App, amount: &str, to: &str, fee: Result<Fee, String>) {
         app.form.field = Field::Amount;
         typed(app, amount);
         app.form.field = Field::To;
         typed(app, to);
-        if let Some(draft) = app.estimate_request() {
-            app.estimated(draft, app.head, fee);
+        if let Some(quote) = app.estimate_request() {
+            let quoted = fee.map(|fee| Quoted {
+                draft: match quote {
+                    Quote::Exact(draft) => draft,
+                    Quote::MaxEth { to, balance } => Draft {
+                        asset: Asset::Eth,
+                        to,
+                        amount: balance.saturating_sub(fee.max_cost()),
+                    },
+                },
+                fee,
+            });
+            app.estimated(quote, app.head, quoted);
         }
         press(app, KeyCode::Enter);
     }
@@ -1199,17 +1213,22 @@ mod tests {
             eth: Some(U256::from(1_000)),
             tokens: Vec::new(),
         });
-        submit(&mut app, "max", BOB, Ok(FEE));
+        let short =
+            "your balance of 0.000000000000001 ETH does not cover the max fee 0.00005775 ETH";
+        submit(&mut app, "max", BOB, Err(short.to_owned()));
         assert_eq!(
-            errors(&app),
-            [
-                Some(
-                    "your balance of 0.000000000000001 ETH does not cover the max fee 0.00005775 ETH"
-                ),
-                None,
-                None
-            ]
+            (app.screen, errors(&app)),
+            (Screen::Ready, [None, None, Some(short)])
         );
+
+        let mut app = ready(Network::Sepolia);
+        app.form.asset = Asset::Token(TKN);
+        app.balances(Balances {
+            eth: Some(eth(3_000)),
+            tokens: Vec::new(),
+        });
+        submit(&mut app, "max", BOB, Ok(FEE));
+        assert_eq!(errors(&app), [Some("you hold no TKN"), None, None]);
     }
 
     #[test]
