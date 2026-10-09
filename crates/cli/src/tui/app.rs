@@ -962,6 +962,23 @@ mod tests {
     }
 
     #[test]
+    fn the_password_never_outgrows_its_buffer_and_is_wiped_on_quit() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        let capacity = app.password.capacity();
+        typed(&mut app, &"é".repeat(200));
+        assert_eq!(
+            (app.password.len(), app.password.capacity()),
+            (256, capacity)
+        );
+        press(&mut app, KeyCode::Backspace);
+        typed(&mut app, "abc");
+        assert_eq!(app.password.len(), 256);
+        assert!(app.password.ends_with("éab"));
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::Quit));
+        assert!(app.password.is_empty());
+    }
+
+    #[test]
     fn unlock_then_wait_then_perk_up_then_serve() {
         let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
         assert_eq!(app.screen, Screen::Unlock);
