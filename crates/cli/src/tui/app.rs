@@ -1014,6 +1014,24 @@ mod tests {
     }
 
     #[test]
+    fn losing_every_state_peer_while_sending_pauses_the_form_after_it() {
+        let mut app = ready(Network::Sepolia);
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.health(101, 0);
+        assert_eq!(app.screen, Screen::Sending);
+        app.sent(Ok(TxHash::ZERO));
+        app.tracked(Tracked::Receipt { success: false });
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Paused);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(press(&mut app, KeyCode::Char('y')), None);
+        assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Paused, "1"));
+        app.health(102, 1);
+        assert_eq!(app.screen, Screen::Ready);
+    }
+
+    #[test]
     fn each_field_says_why_it_cannot_be_sent_and_keeps_its_input() {
         let checksum = "0x7f02C3E3c98b133055B8B348B2Ac625669Ed295d";
         for (asset, amount, to, expected) in [

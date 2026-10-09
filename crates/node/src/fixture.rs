@@ -44,6 +44,8 @@ pub enum Fault {
     WithholdBodies,
     /// The next account reply for this address claims this balance, sent by [`LIAR`].
     LieAboutBalance(Address, U256),
+    /// The census counts no state peer.
+    NoStatePeers,
 }
 
 /// A transaction the fixture was asked to broadcast.
@@ -92,6 +94,7 @@ struct Faults {
     withhold_bals: bool,
     withhold_bodies: bool,
     lie: Option<(B256, U256)>,
+    no_state_peers: bool,
 }
 
 #[derive(Debug)]
@@ -226,6 +229,7 @@ impl Fixture {
             }
             Fault::WithholdBals => faults.withhold_bals = true,
             Fault::WithholdBodies => faults.withhold_bodies = true,
+            Fault::NoStatePeers => faults.no_state_peers = true,
             Fault::LieAboutBalance(address, balance) => {
                 faults.lie = Some((keccak256(address), balance));
             }
@@ -487,7 +491,7 @@ impl Peers for FixturePeers {
     fn census(&self) -> Census {
         Census {
             peers: 1,
-            state_peers: 1,
+            state_peers: usize::from(!self.inner.faults.lock().no_state_peers),
             snap_records: Vec::new(),
         }
     }

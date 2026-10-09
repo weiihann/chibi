@@ -232,7 +232,7 @@ mod tests {
     use chibi_core::testing::{
         WorldAccount, eth, mapping_slot, pausable_token_code, transfer_calldata,
     };
-    use chibi_node::fixture::{Fixture, FixturePeers};
+    use chibi_node::fixture::{Fault, Fixture, FixturePeers};
     use chibi_node::{Disk, Follower, Watchlist};
 
     use super::*;
@@ -325,6 +325,31 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_signed_without_a_state_peer() {
+        let signer = signer();
+        let sender = signer.address();
+        let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _follower) = start(&fixture, dir.path(), sender).await;
+        let draft = Draft {
+            asset: Asset::Eth,
+            to: BOB,
+            amount: eth(1),
+        };
+        let fee = estimate(&node, sender, &draft).await.unwrap();
+        fixture.fault(Fault::NoStatePeers);
+        let error = send(&node, &signer, &draft, &fee).await.unwrap_err();
+        assert_eq!(error.to_string(), "waiting for a state peer");
+        assert!(fixture.log().broadcasts.is_empty());
+        assert_eq!(
+            node.transaction_count(sender, BlockSel::Pending)
+                .await
+                .unwrap(),
+            0
         );
     }
 
