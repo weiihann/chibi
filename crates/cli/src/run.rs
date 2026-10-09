@@ -705,25 +705,32 @@ mod tests {
     }
 
     #[test]
-    fn the_keystore_comes_from_the_flag_or_the_config_and_the_tui_needs_one() {
+    fn the_keystore_comes_from_the_flag_or_the_config_and_without_one_the_tui_sets_one_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "keystore = \"/keys/a.json\"\n").unwrap();
+        let keystore = dir.path().join("a.json");
+        fs::write(&keystore, "{}").unwrap();
+        fs::write(&path, format!("keystore = {keystore:?}\n")).unwrap();
         let config = load(&path, true, &run_args(&["--tui"])).unwrap();
-        assert_eq!(config.keystore, Some(PathBuf::from("/keys/a.json")));
-        assert_eq!(tui_keystore(&config).unwrap(), Path::new("/keys/a.json"));
+        assert_eq!(config.keystore, Some(keystore.clone()));
+        assert_eq!(
+            tui_wallet(&config, &path).unwrap(),
+            Wallet::Keystore(keystore)
+        );
 
         let args = run_args(&["--tui", "--logs", "--keystore", "b.json"]);
         assert!(args.tui && args.logs);
         let config = load(&path, true, &args).unwrap();
-        let flagged = config.keystore.unwrap();
+        let flagged = config.keystore.clone().unwrap();
         assert!(flagged.is_absolute() && flagged.ends_with("b.json"));
+        let error = tui_wallet(&config, &path).unwrap_err().to_string();
+        assert!(error.starts_with("cannot read the keystore"), "{error}");
 
         fs::write(&path, "").unwrap();
         let config = load(&path, true, &run_args(&["--tui"])).unwrap();
         assert_eq!(
-            tui_keystore(&config).unwrap_err().to_string(),
-            "--tui needs a keystore: pass --keystore PATH, or set keystore in the config (`chibi init --keystore PATH` writes it)"
+            tui_wallet(&config, &path).unwrap(),
+            Wallet::Setup(path.clone())
         );
 
         fs::write(&path, "keystore = \"a.json\"\n").unwrap();

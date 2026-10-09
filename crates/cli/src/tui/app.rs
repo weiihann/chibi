@@ -1545,4 +1545,279 @@ mod tests {
             Some(Action::Quit)
         );
     }
+
+    const ANVIL: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
+    const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn setting_up(home: Option<std::path::PathBuf>) -> App {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.setup(home);
+        app
+    }
+
+    fn phrase_words(app: &App) -> Vec<String> {
+        app.setup
+            .phrase
+            .as_ref()
+            .expect("a generated phrase")
+            .split(' ')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_setup_menu_moves_with_the_arrows_and_esc_quits() {
+        let mut app = setting_up(None);
+        assert_eq!(app.screen, Screen::Menu);
+        assert_eq!(app.setup.choice, Choice::Create);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.setup.choice, Choice::Import);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.setup.choice, Choice::Existing);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.setup.choice, Choice::Create);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.setup.choice, Choice::Existing);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert_eq!(app.screen, Screen::Menu);
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::Quit));
+    }
+
+    #[test]
+    fn creating_backs_up_and_confirms_the_phrase_then_asks_the_password_twice() {
+        let mut app = setting_up(None);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.screen, Screen::Backup);
+        let words = phrase_words(&app);
+        assert_eq!(words.len(), 12);
+        assert!(matches!(
+            wallet::parse(&words.join(" ")),
+            Ok(Secret::Phrase(_))
+        ));
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Confirm);
+        let [first, second] = app.setup.asked;
+        assert_ne!(first, second);
+        assert!(first < 12 && second < 12);
+        assert_eq!(app.setup.asking, 0);
+
+        let wrong = if words[first] == "zoo" {
+            "abandon"
+        } else {
+            "zoo"
+        };
+        typed(&mut app, wrong);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Confirm);
+        assert_eq!(app.setup.asking, 0);
+        assert_eq!(
+            app.setup.error,
+            Some(format!(
+                "that is not word {}; check what you wrote down",
+                first + 1
+            ))
+        );
+        assert!(app.setup.input.is_empty());
+
+        typed(&mut app, &words[first]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Confirm);
+        assert_eq!(app.setup.asking, 1);
+        assert_eq!(app.setup.error, None);
+        typed(&mut app, &words[second]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Password);
+        assert!(app.setup.phrase.is_none());
+        assert_eq!(app.setup.entry, Entry::First);
+
+        typed(&mut app, "password1");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.setup.entry, Entry::Again);
+        typed(&mut app, "password2");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            app.setup.error.as_deref(),
+            Some("the passwords do not match; enter them again")
+        );
+        assert_eq!(app.setup.entry, Entry::First);
+        assert!(app.password.is_empty() && app.setup.again.is_empty());
+
+        typed(&mut app, "short");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.setup.error.as_deref(),
+            Some("a password needs at least 8 characters")
+        );
+        assert_eq!(app.setup.entry, Entry::First);
+        assert!(app.password.is_empty());
+
+        typed(&mut app, "password1");
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "password1");
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::Save));
+        assert!(app.setup.saving);
+        assert_eq!(app.setup.error, None);
+        assert!(app.setup.again.is_empty());
+        let Some(Secret::Phrase(phrase)) = app.take_secret() else {
+            panic!("the confirmed phrase is the secret");
+        };
+        assert_eq!(phrase.as_str(), words.join(" "));
+        assert_eq!(app.take_password().as_str(), "password1");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+
+        let path = std::path::PathBuf::from(
+            "/cfg/keystores/0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266.json",
+        );
+        app.saved(ANVIL, &path);
+        assert_eq!(app.screen, Screen::Waiting);
+        assert_eq!(app.sender, Some(ANVIL));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "saved the keystore for 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 to /cfg/keystores/0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266.json"
+            )
+        );
+    }
+
+    #[test]
+    fn esc_from_the_backup_or_the_confirmation_discards_the_phrase() {
+        let mut app = setting_up(None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Backup);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.setup.phrase.is_none());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Confirm);
+        typed(&mut app, "abc");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.setup.phrase.is_none());
+        assert!(app.setup.input.is_empty());
+    }
+
+    #[test]
+    fn import_tells_a_key_from_a_phrase_and_says_what_it_expected() {
+        for (text, key) in [
+            (ANVIL_KEY, true),
+            (&ANVIL_KEY[2..], true),
+            (ANVIL_PHRASE, false),
+            (
+                "  Test test TEST test test test test test test test test junk ",
+                false,
+            ),
+        ] {
+            let mut app = setting_up(None);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen, Screen::Import);
+            typed(&mut app, text);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen, Screen::Password, "{text}");
+            assert!(app.setup.input.is_empty());
+            match app.take_secret() {
+                Some(Secret::Key(_)) => assert!(key, "{text}"),
+                Some(Secret::Phrase(phrase)) => {
+                    assert!(!key, "{text}");
+                    assert_eq!(phrase.as_str(), ANVIL_PHRASE);
+                }
+                None => panic!("no secret for {text}"),
+            }
+        }
+
+        for (text, expected) in [
+            (
+                "test test test test test test test test test test test test",
+                "the recovery phrase's checksum does not match; check the words and their order",
+            ),
+            (
+                "test test test",
+                "a recovery phrase has 12 or 24 words; this has 3",
+            ),
+            (
+                "test test test test test test test test test test test chibi",
+                "word 12 is not in the English BIP-39 word list",
+            ),
+            (
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478",
+                "expected a private key (64 hex digits) or a recovery phrase (12 or 24 words)",
+            ),
+            (
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "this is not a valid private key",
+            ),
+        ] {
+            let mut app = setting_up(None);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            typed(&mut app, text);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.screen, Screen::Import, "{text}");
+            assert_eq!(app.setup.error.as_deref(), Some(expected), "{text}");
+            assert!(app.setup.input.is_empty());
+            assert!(app.take_secret().is_none());
+            assert_eq!(press(&mut app, KeyCode::Esc), None);
+            assert_eq!(app.screen, Screen::Menu);
+        }
+    }
+
+    #[test]
+    fn an_existing_keystore_must_be_a_file_and_goes_to_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key.json");
+        std::fs::write(&key, "{}").unwrap();
+        let missing = dir.path().join("missing.json");
+        let mut app = setting_up(Some(dir.path().to_owned()));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Existing);
+
+        typed(&mut app, &missing.display().to_string());
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.screen, Screen::Existing);
+        assert_eq!(
+            app.setup.error,
+            Some(format!("no file at {}", missing.display()))
+        );
+
+        app.setup.path.clear();
+        typed(&mut app, "key.json");
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            app.setup.error.as_deref(),
+            Some("enter an absolute path, or one starting with ~/")
+        );
+
+        app.setup.path.clear();
+        typed(&mut app, "~/key.json");
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::Open(key)));
+        assert_eq!(app.screen, Screen::Unlock);
+        assert_eq!(app.setup.error, None);
+    }
+
+    #[test]
+    fn a_kept_keystore_asks_its_password_and_a_failed_save_says_why() {
+        let path = std::path::PathBuf::from("/cfg/keystores/a.json");
+        let mut app = setting_up(None);
+        app.kept(ANVIL, &path);
+        assert_eq!(app.screen, Screen::Unlock);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "a keystore for 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 is already at /cfg/keystores/a.json and was not overwritten; enter its password"
+            )
+        );
+
+        let mut app = setting_up(None);
+        app.save_failed("disk full");
+        assert_eq!(app.screen, Screen::Menu);
+        assert_eq!(
+            app.setup.error.as_deref(),
+            Some("cannot save the keystore: disk full")
+        );
+    }
 }

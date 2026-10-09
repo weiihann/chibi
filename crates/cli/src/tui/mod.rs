@@ -5,6 +5,7 @@
 pub mod app;
 pub mod transfer;
 pub mod view;
+pub mod wallet;
 
 use std::collections::VecDeque;
 use std::io;

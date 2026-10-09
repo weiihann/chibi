@@ -543,4 +543,88 @@ mod tests {
         assert_eq!(elapsed(Duration::from_secs(80)), "1m20s");
         assert_eq!(elapsed(Duration::from_secs(3_725)), "1h02m05s");
     }
+
+    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
+
+    fn setting_up() -> App {
+        let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
+        app.setup(None);
+        app
+    }
+
+    #[test]
+    fn setup_offers_three_ways_to_get_a_wallet() {
+        let mut app = setting_up();
+        let shown = screen(&app, &[]);
+        for expected in [
+            "no keystore yet: set up the wallet to send from",
+            "> create a new wallet",
+            "  import a private key or recovery phrase",
+            "  use an existing keystore file",
+            "up/down choose · Enter select · Esc quit",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        app.setup.choice = Choice::Existing;
+        assert!(screen(&app, &[]).contains("> use an existing keystore file"));
+    }
+
+    #[test]
+    fn the_backup_shows_the_twelve_words_numbered_once() {
+        let mut app = setting_up();
+        app.screen = Screen::Backup;
+        app.setup.phrase = Some(zeroize::Zeroizing::new(
+            ANVIL_PHRASE.replace("test junk", "test chibi"),
+        ));
+        let shown = screen(&app, &[]);
+        for expected in [
+            " 1. test",
+            " 9. test",
+            "11. test",
+            "12. chibi",
+            "write these words down. anyone with them controls this wallet. chibi will not show them again.",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        assert_eq!(shown.matches("chibi").count(), 3, "{shown}");
+    }
+
+    #[test]
+    fn the_confirmation_names_the_positions_and_masks_the_word() {
+        let mut app = setting_up();
+        app.screen = Screen::Confirm;
+        app.setup.phrase = Some(zeroize::Zeroizing::new(ANVIL_PHRASE.to_owned()));
+        app.setup.asked = [2, 8];
+        app.setup.input.push_str("tset");
+        let shown = screen(&app, &[]);
+        assert!(
+            shown.contains("confirm your recovery phrase: enter words 3 and 9"),
+            "{shown}"
+        );
+        assert!(shown.contains("word 3  ****"), "{shown}");
+        assert!(!shown.contains("tset"), "{shown}");
+        app.setup.asking = 1;
+        app.setup.input.clear();
+        assert!(screen(&app, &[]).contains("word 9  "));
+    }
+
+    #[test]
+    fn secret_and_password_fields_never_render_their_text() {
+        let mut app = setting_up();
+        app.screen = Screen::Import;
+        app.setup.input.push_str("deadbeef");
+        let shown = screen(&app, &[]);
+        assert!(shown.contains("secret  ********"), "{shown}");
+        assert!(!shown.contains("deadbeef"), "{shown}");
+
+        app.setup.input.clear();
+        app.screen = Screen::Password;
+        app.password.push_str("hunter22");
+        app.setup.again.push_str("hunter2");
+        app.setup.entry = Entry::Again;
+        let shown = screen(&app, &[]);
+        assert!(shown.contains("  password  ********"), "{shown}");
+        assert!(shown.contains("> again     *******"), "{shown}");
+        assert!(!shown.contains("hunter"), "{shown}");
+    }
 }
