@@ -48,6 +48,9 @@ const PICKER_TITLE: &str = "choose a token";
 /// The token list's keys, on its bottom border.
 const PICKER_KEYS: &str = "type to filter · Enter pick · Esc cancel";
 
+/// The columns between a form row's values on one line.
+const VALUE_GAP: &str = "   ";
+
 /// A backup row's bytes: three columns of a 2-digit number and a word padded to 10.
 const BACKUP_ROW_BYTES: usize = 3 * 16;
 
@@ -101,15 +104,51 @@ enum Body {
     /// A cat with a few lines under it, centered in the body: Waiting, Excited, Paused, and
     /// Sending once the receipt is verified.
     Scene { cat: Cat, lines: Vec<Line<'static>> },
-    /// Lines from the top left: setup, unlock, the form, review, and Sending until the
+    /// Rows from the top left: setup, unlock, the form, review, and Sending until the
     /// receipt is verified.
     Page {
-        lines: Vec<Line<'static>>,
+        rows: Vec<Row>,
         /// The idle cat's frame, drawn right of the form where it fits.
         side: Option<u32>,
         /// The token list, drawn over the form.
         picker: Option<Popup>,
     },
+}
+
+/// A page row.
+#[derive(Clone, Debug)]
+enum Row {
+    /// A line word-wrapped to the body's width.
+    Text(Line<'static>),
+    /// A form row: its label, then its values [`VALUE_GAP`] apart, each kept whole. A value
+    /// that does not fit on the line starts the next one, under the first value.
+    Form {
+        label: Span<'static>,
+        values: Vec<Span<'static>>,
+    },
+}
+
+impl Row {
+    /// Pushes its lines for a body `width` columns wide.
+    fn lay_out(self, width: usize, lines: &mut Vec<Line<'static>>) {
+        let (label, values) = match self {
+            Self::Text(line) => return lines.push(line),
+            Self::Form { label, values } => (label, values),
+        };
+        let mut line = Line::from(label);
+        let indent = line.width();
+        for (at, value) in values.into_iter().enumerate() {
+            if at > 0 {
+                if line.width() + VALUE_GAP.len() + value.width() <= width {
+                    line.push_span(VALUE_GAP);
+                } else {
+                    lines.push(std::mem::replace(&mut line, Line::raw(" ".repeat(indent))));
+                }
+            }
+            line.push_span(value);
+        }
+        lines.push(line);
+    }
 }
 
 /// A scene's cat: frame `n` of a pixel cat pose, or an ASCII cat.
@@ -122,7 +161,7 @@ enum Cat {
 /// The token list drawn in a bordered box over the body, below one of its lines.
 #[derive(Clone, Debug)]
 struct Popup {
-    /// The body line it opens below.
+    /// The page row it opens below.
     below: usize,
     filter: Line<'static>,
     /// One line per match, or why there is none.
@@ -225,11 +264,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
 
     match view.body {
         Body::Scene { cat, lines } => scene(frame, cat, lines, body),
-        Body::Page {
-            lines,
-            side,
-            picker,
-        } => page(frame, lines, side, picker, body),
+        Body::Page { rows, side, picker } => page(frame, rows, side, picker, body),
     }
     if let Some(paragraph) = notice {
         frame.render_widget(paragraph, notice_area);
@@ -295,26 +330,28 @@ fn cat_scale(body: Rect) -> usize {
         .unwrap_or(1)
 }
 
-/// Draws `lines` from the top left of `body`, the side cat right of them where it fits,
+/// Draws `rows` from the top left of `body`, the side cat right of them where it fits,
 /// and the token list over them.
 fn page(
     frame: &mut Frame<'_>,
-    lines: Vec<Line<'static>>,
+    rows: Vec<Row>,
     side: Option<u32>,
     picker: Option<Popup>,
     body: Rect,
 ) {
+    let mut lines = Vec::with_capacity(rows.len());
+    let mut above = 0;
+    for (at, row) in rows.into_iter().enumerate() {
+        row.lay_out(usize::from(body.width), &mut lines);
+        if picker.as_ref().is_some_and(|popup| popup.below == at) {
+            above = lines.len();
+        }
+    }
     let side = side.and_then(|n| side_cat(&lines, &cat::frame(Pose::Idle, n), body));
     let picker = picker.map(|popup| {
-        let above = Paragraph::new(
-            lines
-                .iter()
-                .take(popup.below + 1)
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false })
-        .line_count(body.width);
+        let above = Paragraph::new(lines[..above].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(body.width);
         let top = body
             .y
             .saturating_add(u16::try_from(above).unwrap_or(u16::MAX));
@@ -413,7 +450,7 @@ fn plain(write: impl FnOnce(&mut Vec<Line<'static>>)) -> Body {
     let mut lines = vec![Line::default()];
     write(&mut lines);
     Body::Page {
-        lines,
+        rows: lines.into_iter().map(Row::Text).collect(),
         side: None,
         picker: None,
     }
@@ -452,16 +489,12 @@ fn body(app: &App, now: Instant) -> Body {
             ],
         },
         Screen::Ready => {
-            let mut lines = vec![Line::default()];
-            let token_row = form(app, &mut lines);
+            let mut rows = vec![Row::Text(Line::default())];
+            let token_row = form(app, &mut rows);
             let picker = picker_popup(app, token_row);
             let side =
                 (app.cat() == Some(Pose::Idle) && picker.is_none()).then(|| app.cat_frame(now));
-            Body::Page {
-                lines,
-                side,
-                picker,
-            }
+            Body::Page { rows, side, picker }
         }
         Screen::Review => plain(|lines| review(app, lines)),
         Screen::Sending => sending(app, now),
@@ -578,50 +611,55 @@ fn unlock(app: &App, lines: &mut Vec<Line<'static>>) {
 }
 
 /// Pushes the form, returning the index of its token row.
-fn form(app: &App, lines: &mut Vec<Line<'static>>) -> usize {
+fn form(app: &App, rows: &mut Vec<Row>) -> usize {
     let from = app
         .sender
         .map(|sender| sender.to_checksum(None))
         .unwrap_or_default();
-    lines.push(Line::raw(format!(
-        "  from    {from}   {}",
-        balance(app.balance(Asset::Eth), Asset::Eth)
-    )));
+    rows.push(Row::Form {
+        label: Span::raw("  from    "),
+        values: vec![
+            Span::raw(from),
+            Span::raw(balance(app.balance(Asset::Eth), Asset::Eth)),
+        ],
+    });
     let asset = app.form.asset;
-    let field = |name: Field, label: &str, value: String| {
+    let field = |name: Field, label: &str, values: Vec<Span<'static>>| {
         let marker = if app.form.field == name { ">" } else { " " };
-        Line::raw(format!("{marker} {label:<7} {value}"))
+        Row::Form {
+            label: Span::raw(format!("{marker} {label:<7} ")),
+            values,
+        }
     };
-    let mut token = field(
-        Field::Token,
-        "token",
-        format!(
-            "< {} >   {}",
-            asset.symbol(),
-            balance(app.balance(asset), asset)
-        ),
-    );
+    let mut token = vec![
+        Span::raw(format!("< {} >", asset.symbol())),
+        Span::raw(balance(app.balance(asset), asset)),
+    ];
     let dim = Style::default().add_modifier(Modifier::DIM);
     if app.form.field == Field::Token {
-        token.push_span(Span::styled("   Enter to choose", dim));
+        token.push(Span::styled("Enter to choose", dim));
     }
     if app.tokens_unproven {
-        token.push_span(Span::styled(format!("   {TOKENS_UNPROVEN}"), dim));
+        token.push(Span::styled(TOKENS_UNPROVEN, dim));
     }
-    let token_row = lines.len();
-    lines.push(token);
-    lines.push(field(Field::Amount, "amount", app.form.amount.clone()));
+    let token_row = rows.len();
+    rows.push(field(Field::Token, "token", token));
+    rows.push(field(
+        Field::Amount,
+        "amount",
+        vec![Span::raw(app.form.amount.clone())],
+    ));
     if let Some(error) = &app.form.amount_error {
-        lines.push(error_line(error));
+        rows.push(Row::Text(error_line(error)));
     }
-    lines.push(field(Field::To, "to", app.form.to.clone()));
+    rows.push(field(Field::To, "to", vec![Span::raw(app.form.to.clone())]));
     if let Some(error) = &app.form.to_error {
-        lines.push(error_line(error));
+        rows.push(Row::Text(error_line(error)));
     } else if let Some(warning) = app.to_warning() {
-        lines.push(Line::styled(
+        rows.push(Row::Text(Line::styled(
             format!("          {warning}"),
             Style::default().fg(Color::Yellow),
-        ));
+        )));
     }
     let fee = match app.fee() {
         Some(Ok(fee)) => fee_text(fee),
@@ -629,9 +667,12 @@ fn form(app: &App, lines: &mut Vec<Line<'static>>) -> usize {
         None if app.form.to.is_empty() || app.form.amount.is_empty() => String::new(),
         None => "estimating...".to_owned(),
     };
-    lines.push(Line::raw(format!("  fee     {fee}")));
+    rows.push(Row::Form {
+        label: Span::raw("  fee     "),
+        values: vec![Span::raw(fee)],
+    });
     if let Some(error) = &app.form.fee_error {
-        lines.push(error_line(error));
+        rows.push(Row::Text(error_line(error)));
     }
     token_row
 }
