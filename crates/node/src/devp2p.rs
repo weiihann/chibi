@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{B256, Bytes, U256};
+use alloy_primitives::{B256, BlockNumber, Bytes, U256};
 use chibi_core::state::Store;
 use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
@@ -171,6 +171,8 @@ pub struct Session {
     /// The record chibi dialed for a snap/2 session it opened, `None` otherwise. Only such
     /// records are worth remembering for the next start.
     pub dialable: Option<NodeRecord>,
+    /// The head of the last block range sent to the peer.
+    pub range_sent: Option<BlockNumber>,
 }
 
 /// Established sessions by peer.
@@ -300,7 +302,7 @@ pub struct Devp2p {
     handle: NetworkHandle,
     fetch: FetchClient,
     chain: Arc<ChainSpec>,
-    sessions: watch::Receiver<Sessions>,
+    sessions: Arc<watch::Sender<Sessions>>,
     snap_load: Arc<SnapLoad>,
     /// The store announced last, whose held headers inbound requests are answered from.
     served: watch::Sender<Option<Arc<Store>>>,
@@ -356,7 +358,7 @@ impl Devp2p {
         let fetch = manager.fetch_client();
         let handle = manager.handle().clone();
         let events = handle.event_listener();
-        let (sessions_tx, sessions) = watch::channel(Sessions::new());
+        let sessions = Arc::new(watch::Sender::new(Sessions::new()));
         let (served, announced) = watch::channel(None);
 
         info!(
@@ -371,7 +373,7 @@ impl Devp2p {
             tokio::spawn(track_sessions(
                 events,
                 handle.clone(),
-                sessions_tx,
+                Arc::clone(&sessions),
                 served.subscribe(),
             )),
             tokio::spawn(answer_inbound(requests, announced)),
@@ -389,7 +391,7 @@ impl Devp2p {
 
     /// The established sessions, updated as peers connect and disconnect.
     pub fn sessions(&self) -> watch::Receiver<Sessions> {
-        self.sessions.clone()
+        self.sessions.subscribe()
     }
 
     /// Asks the network to dial `records` as static peers, such as snap/2 peers pinned in the
@@ -423,7 +425,7 @@ impl Devp2p {
     /// flight. reth's fetcher would hold each peer to one request at a time.
     async fn snap(&self, request: SnapProtocolMessage) -> Result<(PeerId, SnapResponse), NetError> {
         self.snap_load
-            .submit(self.sessions.clone(), |peer| {
+            .submit(self.sessions.subscribe(), |peer| {
                 let (response, reply) = oneshot::channel();
                 self.handle
                     .send_request(peer, PeerRequest::GetSnap { request, response });
@@ -649,10 +651,12 @@ impl Peers for Devp2p {
         let range = block_range(head);
         self.handle.update_block_range(range.0.clone());
         self.served.send_replace(Some(Arc::clone(store)));
-        for (peer, session) in self.sessions.borrow().iter() {
-            if session.eth >= ETH_69 {
-                send_range(&self.handle, peer.0, &range);
-            }
+        let peers: Vec<PeerKey> = self.sessions.borrow().keys().copied().collect();
+        for peer in peers {
+            offer_range(&self.sessions, peer, &range, |peer, message| {
+                self.handle
+                    .send_eth_message(peer, PeerMessage::Other(message.clone()));
+            });
         }
     }
 
@@ -699,16 +703,28 @@ fn block_range(head: &VerifiedHeader) -> (BlockRangeUpdate, RawCapabilityMessage
     (update, message)
 }
 
-/// Sends `range` to `peer` now. reth only refreshes a live session's range every 384 s, and
-/// drops a typed `PeerMessage::BlockRangeUpdated` sent from outside, so it goes as a raw eth
-/// message.
-fn send_range(
-    handle: &NetworkHandle,
-    peer: PeerId,
+/// Sends `range` to `peer` through `send` if it is an eth/69 session not yet sent this head or
+/// a later one. Check, send and record happen under the sessions lock, so a range read before
+/// a newer one was sent cannot follow it. reth only refreshes a live session's range every
+/// 384 s, and drops a typed `PeerMessage::BlockRangeUpdated` sent from outside, so `send`
+/// takes it as a raw eth message.
+fn offer_range(
+    sessions: &watch::Sender<Sessions>,
+    peer: PeerKey,
     (update, message): &(BlockRangeUpdate, RawCapabilityMessage),
+    send: impl FnOnce(PeerId, &RawCapabilityMessage),
 ) {
-    handle.send_eth_message(peer, PeerMessage::Other(message.clone()));
-    debug!(target: "chibi::devp2p", %peer, head = update.latest, "sent block range");
+    sessions.send_if_modified(|sessions| {
+        if let Some(session) = sessions.get_mut(&peer)
+            && session.eth >= ETH_69
+            && session.range_sent.is_none_or(|sent| update.latest > sent)
+        {
+            send(peer.0, message);
+            session.range_sent = Some(update.latest);
+            debug!(target: "chibi::devp2p", peer = %peer.0, head = update.latest, "sent block range");
+        }
+        false
+    });
 }
 
 fn net_error(err: &RequestError, capability: &'static str) -> NetError {
@@ -751,7 +767,7 @@ fn both_failed(snap: NetError, eth: NetError) -> NetError {
 async fn track_sessions(
     events: impl futures::Stream<Item = NetworkEvent>,
     handle: NetworkHandle,
-    sessions: watch::Sender<Sessions>,
+    sessions: Arc<watch::Sender<Sessions>>,
     served: watch::Receiver<Option<Arc<Store>>>,
 ) {
     let mut events = std::pin::pin!(events);
@@ -769,15 +785,19 @@ async fn track_sessions(
                     dialable = session.dialable.is_some(),
                     "session established",
                 );
-                let eth = session.eth;
                 sessions.send_modify(|sessions| {
                     sessions.insert(PeerKey(peer), session);
                 });
                 let store = served.borrow().clone();
-                if eth >= ETH_69
-                    && let Some(store) = store
-                {
-                    send_range(&handle, peer, &block_range(store.anchor()));
+                if let Some(store) = store {
+                    offer_range(
+                        &sessions,
+                        PeerKey(peer),
+                        &block_range(store.anchor()),
+                        |peer, message| {
+                            handle.send_eth_message(peer, PeerMessage::Other(message.clone()));
+                        },
+                    );
                 }
             }
             NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
@@ -797,6 +817,7 @@ fn session(info: &SessionInfo) -> (PeerId, Session) {
         eth: info.version as u8,
         snap: info.capabilities.capabilities().contains(&SNAP_2),
         dialable: None,
+        range_sent: None,
     };
     (info.peer_id, session)
 }
@@ -948,6 +969,7 @@ mod tests {
             eth: 69,
             snap,
             dialable: None,
+            range_sent: None,
         }
     }
 
@@ -1104,7 +1126,8 @@ mod tests {
         let mut sent = Vec::new();
         offer_range(sessions, peer, &range_at(head), |to, message| {
             assert_eq!(to, peer.0);
-            let update = BlockRangeUpdate::decode(&mut &message.payload[..]).unwrap();
+            let update: BlockRangeUpdate =
+                alloy_rlp::Decodable::decode(&mut &message.payload[..]).unwrap();
             sent.push(update.latest);
         });
         sent

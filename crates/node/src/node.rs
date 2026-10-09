@@ -1693,6 +1693,7 @@ mod tests {
             eth: 69,
             snap,
             dialable: None,
+            range_sent: None,
         }
     }
 
