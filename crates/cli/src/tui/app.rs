@@ -298,7 +298,7 @@ impl App {
     /// and the node is serving.
     pub fn tick(&mut self, now: Instant) {
         self.frame += 1;
-        let _ = now;
+        self.leave_excited(now);
     }
 
     /// The keystore decrypted to `address`, or did not.
@@ -336,9 +336,8 @@ impl App {
             Startup::Serving => {
                 self.state_peers = self.state_peers.max(1);
                 self.serving = true;
-                if matches!(self.screen, Screen::Waiting | Screen::Excited) {
-                    self.screen = self.form_screen();
-                }
+                self.excite(now);
+                self.leave_excited(now);
             }
         }
     }
