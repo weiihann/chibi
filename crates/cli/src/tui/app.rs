@@ -602,9 +602,9 @@ impl App {
         self.balances = balances;
     }
 
-    /// The node holds `held` of its `total` pinned keys.
-    pub const fn pinned(&mut self, held: usize, total: usize) {
-        self.tokens_unproven = held < total;
+    /// The node holds `held` of its `total` pinned keys, which are complete once `seeded`.
+    pub const fn pinned(&mut self, held: usize, total: usize, seeded: bool) {
+        self.tokens_unproven = !seeded || held < total;
     }
 
     /// Whether to refresh the balances at `head` with `pinned_held` pinned keys held,

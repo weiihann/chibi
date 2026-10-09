@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Transaction as _;
@@ -340,6 +341,8 @@ pub struct Health {
     pub learned: Held,
     /// Pinned keys the anchor's store lacks, configured ones first.
     pub unheld_pinned: Vec<Key>,
+    /// Whether a seed run has completed since the node started.
+    pub seeded: bool,
 }
 
 /// How many of a group of working-set keys the anchor's store holds, out of how many.
@@ -383,6 +386,8 @@ pub(crate) struct Shared<P> {
     /// Wakes the follower to warm keys a request learned.
     pub(crate) wake: Notify,
     keys_saved: Mutex<KeysSaved>,
+    /// Whether a seed run has completed.
+    seeded: AtomicBool,
 }
 
 /// The working set's counts when the learned keys were last saved, and when that was.
@@ -596,6 +601,7 @@ impl<P: Peers> Node<P> {
             fees: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             keys_saved: Mutex::new(keys_saved),
+            seeded: AtomicBool::new(false),
         });
         shared.restore_outbox(&outbox).await;
         shared.persist().await?;
@@ -996,6 +1002,7 @@ impl<P: Peers> Node<P> {
             pinned,
             learned,
             unheld_pinned,
+            seeded: self.shared.seeded.load(Ordering::Acquire),
         }
     }
 }
@@ -1195,6 +1202,9 @@ impl<P: Peers> Shared<P> {
             }
             s.set_seeded(seeded);
         });
+        if complete {
+            self.seeded.store(true, Ordering::Release);
+        }
         complete
     }
 
