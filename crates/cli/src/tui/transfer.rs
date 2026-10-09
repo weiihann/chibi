@@ -500,6 +500,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_eth_is_quoted_to_a_recipient_that_rejects_zero_value() {
+        let signer = signer();
+        let sender = signer.address();
+        let reverts_on_zero_value = alloy_primitives::hex!("3460095760006000fd5b00").to_vec();
+        let fixture = Fixture::genesis([
+            (sender, WorldAccount::eoa(eth(3))),
+            (BOB, WorldAccount::contract(reverts_on_zero_value)),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _follower) = start(&fixture, dir.path(), sender).await;
+        let zero = Draft {
+            asset: Asset::Eth,
+            to: BOB,
+            amount: U256::ZERO,
+        };
+        assert_eq!(
+            estimate(&node, sender, &zero).await.unwrap_err().to_string(),
+            "the transfer reverts: no reason given"
+        );
+
+        let max = Quote::MaxEth {
+            to: BOB,
+            balance: eth(3),
+        };
+        let quoted = quote(&node, sender, &max).await.unwrap();
+        assert_eq!(
+            quoted.fee,
+            estimate(&node, sender, &quoted.draft).await.unwrap()
+        );
+        assert_eq!(quoted.fee.gas_limit, 21_016);
+        assert_eq!(quoted.draft.amount + quoted.fee.max_cost(), eth(3));
+    }
+
+    #[tokio::test]
     async fn a_transfer_replaced_through_json_rpc_is_tracked_as_dropped() {
         let signer = signer();
         let sender = signer.address();
