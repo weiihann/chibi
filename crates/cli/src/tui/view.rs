@@ -80,24 +80,24 @@ pub struct View {
     picker: Option<Popup>,
 }
 
-/// Lines drawn in a bordered box over the body, below one of its lines.
+/// The token list drawn in a bordered box over the body, below one of its lines.
 #[derive(Clone, Debug)]
 struct Popup {
     /// The body line it opens below.
     below: usize,
-    lines: Vec<Line<'static>>,
+    filter: Line<'static>,
+    /// One line per match, or why there is none.
+    rows: Vec<Line<'static>>,
+    /// The highlighted entry of `rows`.
+    highlighted: usize,
+    hint: Option<Line<'static>>,
 }
 
 impl View {
     /// The screen for `app` at `now`, with `logs` in the log pane when it is open.
     pub fn new(app: &App, logs: Vec<String>, now: Instant) -> Self {
         let (body, token_row) = body_lines(app, now);
-        let picker = token_row.and_then(|below| {
-            Some(Popup {
-                below,
-                lines: picker_lines(app)?,
-            })
-        });
+        let picker = token_row.and_then(|below| picker_popup(app, below));
         let side = if app.cat() == Some(Pose::Idle) && picker.is_none() {
             cat::cropped(&cat::frame(Pose::Idle, app.cat_frame(now)))
         } else {
@@ -159,7 +159,12 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
         )
         .wrap(Wrap { trim: false })
         .line_count(body.width);
-        (popup_area(&popup.lines, above, body, area), popup.lines)
+        let top = body
+            .y
+            .saturating_add(u16::try_from(above).unwrap_or(u16::MAX));
+        let room = body.bottom().saturating_sub(top).saturating_sub(2);
+        let lines = popup.lines(usize::from(room));
+        (popup_area(popup.widest(), lines.len(), top, body), lines)
     });
     frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
     if let Some(side) = side {
@@ -207,23 +212,17 @@ fn side_area(lines: &[Line<'_>], side: &[Line<'_>], body: Rect) -> Option<Rect> 
     fits.then(|| Rect::new(body.x + x, body.y + 1, width, height))
 }
 
-/// Where a box around `lines` goes: `above` rows into `body`, two columns in, as wide as
-/// its lines, title and keys need up to two columns less than `area`, clipped to `area`.
-fn popup_area(lines: &[Line<'_>], above: usize, body: Rect, area: Rect) -> Rect {
-    let widest = lines
-        .iter()
-        .map(Line::width)
-        .chain([PICKER_TITLE.chars().count(), PICKER_KEYS.chars().count()])
-        .max()
-        .unwrap_or(0);
+/// Where a box `height` lines tall goes: from row `top`, two columns into `body`, as wide as
+/// `widest`, title and keys need up to two columns less than `body`, clipped to `body`.
+fn popup_area(widest: usize, height: usize, top: u16, body: Rect) -> Rect {
+    let widest = [PICKER_TITLE.chars().count(), PICKER_KEYS.chars().count()]
+        .into_iter()
+        .fold(widest, usize::max);
     let width = u16::try_from(widest + 2)
         .unwrap_or(u16::MAX)
-        .min(area.width.saturating_sub(2));
-    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let top = body
-        .y
-        .saturating_add(u16::try_from(above).unwrap_or(u16::MAX));
-    Rect::new(body.x.saturating_add(2), top, width, height).intersection(area)
+        .min(body.width.saturating_sub(2));
+    let height = u16::try_from(height + 2).unwrap_or(u16::MAX);
+    Rect::new(body.x.saturating_add(2), top, width, height).intersection(body)
 }
 
 fn header_line(app: &App) -> Line<'static> {
@@ -466,9 +465,9 @@ fn form(app: &App, lines: &mut Vec<Line<'static>>) -> usize {
     token_row
 }
 
-/// The open token list: the filter, then each matching asset with its balance, the
-/// highlighted one marked.
-fn picker_lines(app: &App) -> Option<Vec<Line<'static>>> {
+/// The open token list below body line `below`: the filter, then each matching asset with
+/// its balance, the highlighted one marked.
+fn picker_popup(app: &App, below: usize) -> Option<Popup> {
     let picker = app.form.picker.as_ref()?;
     let assets = app.assets();
     let width = |text: fn(Asset) -> &'static str| {
@@ -479,28 +478,86 @@ fn picker_lines(app: &App) -> Option<Vec<Line<'static>>> {
             .unwrap_or(0)
     };
     let (symbols, names) = (width(Asset::symbol), width(Asset::name));
-    let mut lines = vec![Line::raw(format!("filter  {}", picker.filter))];
     let matches = picker.matches(&assets);
-    if matches.is_empty() {
-        lines.push(Line::raw("no token matches"));
-    }
     let highlighted = picker.position(&matches);
-    for (at, asset) in matches.into_iter().enumerate() {
-        let marker = if at == highlighted { ">" } else { " " };
-        lines.push(Line::raw(format!(
-            "{marker} {:<symbols$}  {:<names$}  {}",
-            asset.symbol(),
-            asset.name(),
-            balance(app.balance(asset), asset)
-        )));
+    let mut rows: Vec<Line<'static>> = matches
+        .into_iter()
+        .enumerate()
+        .map(|(at, asset)| {
+            let marker = if at == highlighted { ">" } else { " " };
+            Line::raw(format!(
+                "{marker} {:<symbols$}  {:<names$}  {}",
+                asset.symbol(),
+                asset.name(),
+                balance(app.balance(asset), asset)
+            ))
+        })
+        .collect();
+    if rows.is_empty() {
+        rows.push(Line::raw("no token matches"));
     }
-    if app.tokens_unproven {
-        lines.push(Line::styled(
-            TOKENS_UNPROVEN,
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+    Some(Popup {
+        below,
+        filter: Line::raw(format!("filter  {}", picker.filter)),
+        rows,
+        highlighted,
+        hint: app.tokens_unproven.then(|| {
+            Line::styled(
+                TOKENS_UNPROVEN,
+                Style::default().add_modifier(Modifier::DIM),
+            )
+        }),
+    })
+}
+
+impl Popup {
+    /// The widest line it can show.
+    fn widest(&self) -> usize {
+        std::iter::once(&self.filter)
+            .chain(&self.rows)
+            .chain(&self.hint)
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
     }
-    Some(lines)
+
+    /// Its lines in at most `room` rows where it can: when the rows do not fit, a window
+    /// keeping the highlighted one, with a dim count above and below for those left out.
+    fn lines(&self, room: usize) -> Vec<Line<'static>> {
+        let fit = room
+            .saturating_sub(1 + usize::from(self.hint.is_some()))
+            .max(1);
+        let (count, at) = (self.rows.len(), self.highlighted);
+        let (start, end) = if count <= fit {
+            (0, count)
+        } else {
+            let shown = fit.saturating_sub(1).max(1);
+            if at < shown {
+                (0, shown)
+            } else if at >= count - shown {
+                (count - shown, count)
+            } else {
+                let shown = fit.saturating_sub(2).max(1);
+                (at + 1 - shown, at + 1)
+            }
+        };
+        let more = |arrow: &str, hidden: usize| {
+            Line::styled(
+                format!("{arrow} {hidden} more"),
+                Style::default().add_modifier(Modifier::DIM),
+            )
+        };
+        let mut lines = vec![self.filter.clone()];
+        if start > 0 {
+            lines.push(more("↑", start));
+        }
+        lines.extend_from_slice(&self.rows[start..end]);
+        if end < count {
+            lines.push(more("↓", count - end));
+        }
+        lines.extend(self.hint.clone());
+        lines
+    }
 }
 
 fn review(app: &App, lines: &mut Vec<Line<'static>>) {

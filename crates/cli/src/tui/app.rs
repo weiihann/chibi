@@ -2101,10 +2101,12 @@ mod tests {
 
     fn picker(app: &App) -> Option<(&str, usize)> {
         let assets = app.assets();
-        app.form
-            .picker
-            .as_ref()
-            .map(|picker| (picker.filter.as_str(), picker.position(&picker.matches(&assets))))
+        app.form.picker.as_ref().map(|picker| {
+            (
+                picker.filter.as_str(),
+                picker.position(&picker.matches(&assets)),
+            )
+        })
     }
 
     #[test]
