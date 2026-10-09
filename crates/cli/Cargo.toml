@@ -21,6 +21,10 @@ alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace = true
+alloy-signer = "2.5"
+alloy-signer-local = { version = "2.5", features = ["keystore"] }
+eth-keystore = "0.5"
 
 tokio.workspace = true
 tracing.workspace = true
@@ -38,12 +42,13 @@ http = "1.3"
 url = { workspace = true, features = ["serde"] }
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm"] }
 nix = { version = "0.31.3", features = ["signal"] }
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
 chibi-core = { workspace = true, features = ["test-utils"] }
 chibi-node = { workspace = true, features = ["test-utils"] }
-alloy-signer = "2.5"
-alloy-signer-local = "2.5"
 tower = { workspace = true, features = ["util"] }
 tempfile.workspace = true
 revm.workspace = true
+rand = "0.8"

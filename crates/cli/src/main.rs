@@ -10,6 +10,7 @@ mod config;
 mod init;
 mod rpc;
 mod run;
+mod tui;
 
 use std::ffi::OsString;
 use std::fmt;
