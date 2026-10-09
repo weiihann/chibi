@@ -1,6 +1,790 @@
 //! The TUI's screens as a state machine: keys, start-up progress, peer counts and node
 //! results in; what the event loop should do out. No terminal and no network here.
 
+use std::time::Duration;
+
+use alloy_primitives::{Address, TxHash, U256};
+use chibi_node::{Network, Startup, Token};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::config::{AddressError, parse_address};
+use crate::format_units;
+use crate::tui::transfer::{Asset, Draft, Fee};
+
+/// Heads a sent transfer may stay pending before the screen says it is still pending.
+pub const STILL_PENDING_HEADS: u64 = 10;
+
+/// Shown on Review instead of signing on any network but Sepolia.
+pub const MAINNET_REFUSED: &str = "sending on mainnet is not enabled yet";
+
+/// Which screen is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    /// The keystore password prompt, before the node starts.
+    Unlock,
+    /// Waiting for the first state peer.
+    Waiting,
+    /// A state peer connected; the node is anchoring.
+    Excited,
+    /// The transfer form.
+    Ready,
+    /// No state peer connected: nothing can be proven, so nothing is sent.
+    Paused,
+    /// The transfer as it will be signed.
+    Review,
+    /// A signed transfer, tracked until its receipt is verified.
+    Sending,
+}
+
+/// A form field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    /// ETH or a held registry token.
+    Token,
+    /// A decimal amount, or `max`.
+    Amount,
+    /// The recipient address.
+    To,
+}
+
+/// What the event loop should do after a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Decrypt the keystore with this password.
+    Unlock(String),
+    /// Sign and submit this transfer.
+    Send(Draft, Fee),
+    /// Shut the node down and leave.
+    Quit,
+}
+
+/// Peer counts while waiting for the first state peer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WaitCounts {
+    /// Connected devp2p sessions.
+    pub peers: usize,
+    /// Connected state peers.
+    pub state_peers: usize,
+    /// Time waited so far.
+    pub elapsed: Duration,
+}
+
+/// The sender's balances at the latest display snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Balances {
+    /// ETH in wei, `None` until proven.
+    pub eth: Option<U256>,
+    /// Registry tokens with a nonzero balance, in registry order.
+    pub tokens: Vec<(Token, U256)>,
+}
+
+/// The transfer form's input and the messages shown beside each field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Form {
+    /// The focused field.
+    pub field: Field,
+    /// What is sent.
+    pub asset: Asset,
+    /// The amount as typed.
+    pub amount: String,
+    /// The recipient as typed.
+    pub to: String,
+    /// Why the amount cannot be sent.
+    pub amount_error: Option<String>,
+    /// Why the recipient cannot be sent to.
+    pub to_error: Option<String>,
+    /// Why the fee is not known.
+    pub fee_error: Option<String>,
+}
+
+impl Default for Form {
+    fn default() -> Self {
+        Self {
+            field: Field::Amount,
+            asset: Asset::Eth,
+            amount: String::new(),
+            to: String::new(),
+            amount_error: None,
+            to_error: None,
+            fee_error: None,
+        }
+    }
+}
+
+/// The fee estimate for one draft at one head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Estimate {
+    /// The draft estimated: `max` ETH is estimated with a zero amount.
+    pub draft: Draft,
+    /// The head it was asked at.
+    pub head: u64,
+    /// The latest answer for this draft, `None` while the first is outstanding.
+    pub fee: Option<Result<Fee, String>>,
+}
+
+/// A transfer ready to sign, or refused on this network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Review {
+    /// The transfer.
+    pub draft: Draft,
+    /// Its gas and fee caps.
+    pub fee: Fee,
+    /// Why it cannot be sent here, if it cannot.
+    pub refused: Option<&'static str>,
+}
+
+/// Where a sent transfer is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendState {
+    /// Being signed and submitted.
+    Signing,
+    /// Submitted, not yet in a verified block.
+    Pending,
+    /// In a verified block; its receipt is not verified yet.
+    Included,
+    /// The verified receipt has status 1.
+    Succeeded,
+    /// The verified receipt has status 0.
+    Failed,
+    /// The node refused it; nothing was sent.
+    Rejected(String),
+}
+
+/// What the node reports for a sent transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tracked {
+    /// Not yet in a verified block.
+    Pending,
+    /// In a verified block, receipt not verified.
+    Included,
+    /// The receipt is verified with this status.
+    Receipt {
+        /// Status 1.
+        success: bool,
+    },
+}
+
+/// The latest transfer sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sending {
+    /// What was sent.
+    pub draft: Draft,
+    /// The transaction hash, once submitted.
+    pub hash: Option<TxHash>,
+    /// Where it is.
+    pub state: SendState,
+    /// Heads seen while it was pending.
+    pub pending_heads: u64,
+}
+
+impl Sending {
+    /// Whether the transfer may still be waiting in the outbox.
+    pub const fn in_flight(&self) -> bool {
+        matches!(
+            self.state,
+            SendState::Signing | SendState::Pending | SendState::Included
+        )
+    }
+
+    /// Whether it has stayed pending for [`STILL_PENDING_HEADS`].
+    pub const fn still_pending(&self) -> bool {
+        matches!(self.state, SendState::Pending) && self.pending_heads >= STILL_PENDING_HEADS
+    }
+}
+
+/// The whole TUI state.
+///
+/// Not `Debug`: it holds the password being typed.
+pub struct App {
+    /// The screen up.
+    pub screen: Screen,
+    /// The followed network.
+    pub network: Network,
+    /// Its chain id.
+    pub chain_id: u64,
+    /// The network's registry tokens.
+    pub registry: &'static [Token],
+    /// Ticks so far, for animation.
+    pub frame: u64,
+    /// Whether the log pane is open.
+    pub logs: bool,
+    /// The password typed so far.
+    pub password: String,
+    /// Whether the keystore is being decrypted.
+    pub unlocking: bool,
+    /// Why the last unlock failed.
+    pub unlock_error: Option<String>,
+    /// Peer counts while waiting for a state peer.
+    pub waiting: WaitCounts,
+    /// The unlocked address.
+    pub sender: Option<Address>,
+    /// The sender's balances.
+    pub balances: Balances,
+    /// The latest head number seen.
+    pub head: u64,
+    /// The transfer form.
+    pub form: Form,
+    /// The fee estimate for the form's draft.
+    pub estimate: Option<Estimate>,
+    /// Whether an estimate is outstanding.
+    pub estimating: bool,
+    /// The transfer on the Review screen.
+    pub review: Option<Review>,
+    /// The latest transfer sent.
+    pub sending: Option<Sending>,
+    /// A one-line message under the screen.
+    pub notice: Option<String>,
+    quit_armed: bool,
+}
+
+impl App {
+    /// The Unlock screen for `network`.
+    pub fn new(network: Network, chain_id: u64, registry: &'static [Token], logs: bool) -> Self {
+        Self {
+            screen: Screen::Unlock,
+            network,
+            chain_id,
+            registry,
+            frame: 0,
+            logs,
+            password: String::new(),
+            unlocking: false,
+            unlock_error: None,
+            waiting: WaitCounts::default(),
+            sender: None,
+            balances: Balances::default(),
+            head: 0,
+            form: Form::default(),
+            estimate: None,
+            estimating: false,
+            review: None,
+            sending: None,
+            notice: None,
+            quit_armed: false,
+        }
+    }
+
+    /// Advances the animation.
+    pub const fn tick(&mut self) {
+        self.frame += 1;
+    }
+
+    /// The keystore decrypted to `address`, or did not.
+    pub fn unlocked(&mut self, result: Result<Address, String>) {
+        self.unlocking = false;
+        match result {
+            Ok(address) => {
+                self.sender = Some(address);
+                self.unlock_error = None;
+                self.screen = Screen::Waiting;
+            }
+            Err(reason) => self.unlock_error = Some(format!("{reason}, try again")),
+        }
+    }
+
+    /// The node's start-up progress.
+    pub fn startup(&mut self, startup: Startup) {
+        match (startup, self.screen) {
+            (
+                Startup::Waiting {
+                    peers,
+                    state_peers,
+                    elapsed,
+                },
+                _,
+            ) => {
+                self.waiting = WaitCounts {
+                    peers,
+                    state_peers,
+                    elapsed,
+                }
+            }
+            (Startup::FoundStatePeer, Screen::Waiting) => self.screen = Screen::Excited,
+            (Startup::Serving, Screen::Waiting | Screen::Excited) => self.screen = Screen::Ready,
+            (Startup::FoundStatePeer | Startup::Serving, _) => {}
+        }
+    }
+
+    /// The node's head and state peer count, read each tick once serving.
+    pub fn health(&mut self, head: u64, state_peers: usize) {
+        if head > self.head {
+            if let Some(sending) = self.sending.as_mut().filter(|s| s.state == SendState::Pending)
+            {
+                sending.pending_heads += head - self.head;
+            }
+            self.head = head;
+        }
+        match self.screen {
+            Screen::Ready | Screen::Review if state_peers == 0 => {
+                self.review = None;
+                self.screen = Screen::Paused;
+            }
+            Screen::Paused if state_peers > 0 => self.screen = Screen::Ready,
+            Screen::Unlock
+            | Screen::Waiting
+            | Screen::Excited
+            | Screen::Ready
+            | Screen::Paused
+            | Screen::Review
+            | Screen::Sending => {}
+        }
+    }
+
+    /// The sender's balances at a new snapshot.
+    pub fn balances(&mut self, balances: Balances) {
+        self.balances = balances;
+    }
+
+    /// The draft to estimate when the form's draft or the head changed since the last
+    /// estimate, marking it asked. Only while the form is up.
+    pub fn estimate_request(&mut self) -> Option<Draft> {
+        if self.screen != Screen::Ready {
+            return None;
+        }
+        let draft = self.estimate_draft()?;
+        match &mut self.estimate {
+            Some(estimate) if estimate.draft == draft => {
+                if estimate.head == self.head || self.estimating {
+                    return None;
+                }
+                estimate.head = self.head;
+            }
+            slot => {
+                *slot = Some(Estimate {
+                    draft,
+                    head: self.head,
+                    fee: None,
+                });
+            }
+        }
+        self.estimating = true;
+        Some(draft)
+    }
+
+    /// The estimate asked for `draft` at `head` answered.
+    pub fn estimated(&mut self, draft: Draft, head: u64, result: Result<Fee, String>) {
+        self.estimating = false;
+        if let Some(estimate) = self
+            .estimate
+            .as_mut()
+            .filter(|e| e.draft == draft && e.head == head)
+        {
+            estimate.fee = Some(result);
+            self.form.fee_error = None;
+        }
+    }
+
+    /// The node answered the submission.
+    pub fn sent(&mut self, result: Result<TxHash, String>) {
+        let Some(sending) = self.sending.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(hash) => {
+                sending.hash = Some(hash);
+                sending.state = SendState::Pending;
+            }
+            Err(reason) => sending.state = SendState::Rejected(reason),
+        }
+    }
+
+    /// The node's view of the sent transfer.
+    pub fn tracked(&mut self, tracked: Tracked) {
+        let Some(sending) = self.sending.as_mut().filter(|s| s.hash.is_some()) else {
+            return;
+        };
+        sending.state = match tracked {
+            Tracked::Pending => SendState::Pending,
+            Tracked::Included => SendState::Included,
+            Tracked::Receipt { success: true } => SendState::Succeeded,
+            Tracked::Receipt { success: false } => SendState::Failed,
+        };
+    }
+
+    /// The hash to track, while the transfer has no verified receipt.
+    pub fn tracking(&self) -> Option<TxHash> {
+        self.sending
+            .as_ref()
+            .filter(|s| matches!(s.state, SendState::Pending | SendState::Included))
+            .and_then(|s| s.hash)
+    }
+
+    /// ETH, then each held registry token: the choices for the token field.
+    pub fn assets(&self) -> Vec<Asset> {
+        std::iter::once(Asset::Eth)
+            .chain(
+                self.balances
+                    .tokens
+                    .iter()
+                    .map(|(token, _)| Asset::Token(*token)),
+            )
+            .collect()
+    }
+
+    /// The sender's balance of `asset`; zero for a token it no longer holds.
+    pub fn balance(&self, asset: Asset) -> Option<U256> {
+        match asset {
+            Asset::Eth => self.balances.eth,
+            Asset::Token(token) => Some(
+                self.balances
+                    .tokens
+                    .iter()
+                    .find(|(held, _)| *held == token)
+                    .map_or(U256::ZERO, |(_, amount)| *amount),
+            ),
+        }
+    }
+
+    /// The fee answered for the form's current draft.
+    pub fn fee(&self) -> Option<&Result<Fee, String>> {
+        let draft = self.estimate_draft()?;
+        self.estimate
+            .as_ref()
+            .filter(|estimate| estimate.draft == draft)
+            .and_then(|estimate| estimate.fee.as_ref())
+    }
+
+    /// A warning about the recipient that does not stop the transfer.
+    pub fn to_warning(&self) -> Option<String> {
+        let Asset::Token(token) = self.form.asset else {
+            return None;
+        };
+        let to = parse_address(&self.form.to).ok()?;
+        (to == token.address).then(|| {
+            format!(
+                "this is the {} contract itself; tokens sent to it are usually lost",
+                token.symbol
+            )
+        })
+    }
+
+    /// Handles one key press.
+    pub fn key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c'));
+        if self.screen == Screen::Unlock {
+            return self.unlock_key(key, ctrl_c);
+        }
+        if ctrl_c || key.code == KeyCode::Char('q') {
+            return self.quit();
+        }
+        self.quit_armed = false;
+        if key.code == KeyCode::Char('l') {
+            self.logs = !self.logs;
+            return None;
+        }
+        match self.screen {
+            Screen::Ready => self.form_key(key),
+            Screen::Review => self.review_key(key),
+            Screen::Sending => {
+                self.sending_key(key);
+                None
+            }
+            Screen::Unlock | Screen::Waiting | Screen::Excited | Screen::Paused => None,
+        }
+    }
+
+    fn unlock_key(&mut self, key: KeyEvent, ctrl_c: bool) -> Option<Action> {
+        if ctrl_c || key.code == KeyCode::Esc {
+            return Some(Action::Quit);
+        }
+        if self.unlocking {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char(c) => self.password.push(c),
+            KeyCode::Backspace => {
+                self.password.pop();
+            }
+            KeyCode::Enter if !self.password.is_empty() => {
+                self.unlocking = true;
+                return Some(Action::Unlock(std::mem::take(&mut self.password)));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn quit(&mut self) -> Option<Action> {
+        let in_flight = self.sending.as_ref().is_some_and(Sending::in_flight);
+        if in_flight && !self.quit_armed {
+            self.quit_armed = true;
+            self.notice = Some(
+                "a transfer is still pending; chibi's outbox rebroadcasts it on the next run. press q again to quit"
+                    .to_owned(),
+            );
+            return None;
+        }
+        Some(Action::Quit)
+    }
+
+    fn form_key(&mut self, key: KeyEvent) -> Option<Action> {
+        const FIELDS: [Field; 3] = [Field::Token, Field::Amount, Field::To];
+        let at = FIELDS
+            .iter()
+            .position(|field| *field == self.form.field)
+            .unwrap_or_default();
+        match key.code {
+            KeyCode::Down | KeyCode::Tab => self.form.field = FIELDS[(at + 1) % FIELDS.len()],
+            KeyCode::Up | KeyCode::BackTab => {
+                self.form.field = FIELDS[(at + FIELDS.len() - 1) % FIELDS.len()];
+            }
+            KeyCode::Left | KeyCode::Right if self.form.field == Field::Token => {
+                let assets = self.assets();
+                let at = assets
+                    .iter()
+                    .position(|asset| *asset == self.form.asset)
+                    .unwrap_or_default();
+                let step = if key.code == KeyCode::Right {
+                    1
+                } else {
+                    assets.len() - 1
+                };
+                self.form.asset = assets[(at + step) % assets.len()];
+                self.form.amount_error = None;
+            }
+            KeyCode::Char(c) => match self.form.field {
+                Field::Amount if c.is_ascii_digit() || matches!(c, '.' | 'm' | 'a' | 'x') => {
+                    self.form.amount.push(c);
+                    self.form.amount_error = None;
+                }
+                Field::To if c.is_ascii_hexdigit() || c == 'x' => {
+                    self.form.to.push(c);
+                    self.form.to_error = None;
+                }
+                Field::Token | Field::Amount | Field::To => {}
+            },
+            KeyCode::Backspace => match self.form.field {
+                Field::Amount => {
+                    self.form.amount.pop();
+                    self.form.amount_error = None;
+                }
+                Field::To => {
+                    self.form.to.pop();
+                    self.form.to_error = None;
+                }
+                Field::Token => {}
+            },
+            KeyCode::Enter => self.submit(),
+            _ => {}
+        }
+        None
+    }
+
+    fn review_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Char('y') => {
+                let review = self.review.filter(|review| review.refused.is_none())?;
+                self.review = None;
+                self.sending = Some(Sending {
+                    draft: review.draft,
+                    hash: None,
+                    state: SendState::Signing,
+                    pending_heads: 0,
+                });
+                self.notice = None;
+                self.screen = Screen::Sending;
+                Some(Action::Send(review.draft, review.fee))
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.review = None;
+                self.screen = Screen::Ready;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn sending_key(&mut self, key: KeyEvent) {
+        let Some(sending) = &self.sending else {
+            return;
+        };
+        if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) || sending.state == SendState::Signing
+        {
+            return;
+        }
+        if sending.state == SendState::Succeeded {
+            self.form.amount.clear();
+            self.form.to.clear();
+        }
+        self.screen = Screen::Ready;
+    }
+
+    /// Checks every field; on success shows Review. The fee is only judged once the other
+    /// fields make a draft to estimate.
+    fn submit(&mut self) {
+        let to = parse_recipient(&self.form.to);
+        let fee = self.estimate_draft().map(|_| match self.fee() {
+            Some(Ok(fee)) => Ok(*fee),
+            Some(Err(reason)) => Err(reason.clone()),
+            None => Err("waiting for the fee estimate".to_owned()),
+        });
+        let known_fee = fee.as_ref().and_then(|fee| fee.as_ref().ok());
+        let amount = match self.amount() {
+            Ok(Amount::Exact(amount)) => self.check_amount(amount, known_fee).map(Some),
+            Ok(Amount::Max) => known_fee.map_or(Ok(None), |fee| self.max_amount(fee).map(Some)),
+            Err(reason) => Err(reason),
+        };
+        self.form.to_error = to.as_ref().err().cloned();
+        self.form.fee_error = fee.as_ref().and_then(|fee| fee.as_ref().err().cloned());
+        self.form.amount_error = amount.as_ref().err().cloned();
+        let (Ok(to), Ok(Some(amount)), Some(Ok(fee))) = (to, amount, fee) else {
+            return;
+        };
+        self.review = Some(Review {
+            draft: Draft {
+                asset: self.form.asset,
+                to,
+                amount,
+            },
+            fee,
+            refused: (self.network != Network::Sepolia).then_some(MAINNET_REFUSED),
+        });
+        self.screen = Screen::Review;
+    }
+
+    /// The amount field parsed for the chosen asset.
+    fn amount(&self) -> Result<Amount, String> {
+        let text = self.form.amount.trim();
+        if text == "max" {
+            return Ok(Amount::Max);
+        }
+        let asset = self.form.asset;
+        parse_units(text, asset.decimals())
+            .map(Amount::Exact)
+            .map_err(|err| match err {
+                UnitsError::Empty => "enter an amount".to_owned(),
+                UnitsError::Malformed => "not a decimal amount".to_owned(),
+                UnitsError::Decimals => format!(
+                    "{} has at most {} decimals",
+                    asset.symbol(),
+                    asset.decimals()
+                ),
+            })
+    }
+
+    /// An exact amount checked against the balance, and for ETH against the balance less the
+    /// max fee.
+    fn check_amount(&self, amount: U256, fee: Option<&Fee>) -> Result<U256, String> {
+        let asset = self.form.asset;
+        if amount.is_zero() {
+            return Err("the amount must be more than 0".to_owned());
+        }
+        let balance = self
+            .balance(asset)
+            .ok_or_else(|| "the balance is not proven yet".to_owned())?;
+        if amount > balance {
+            return Err(format!(
+                "more than your balance of {}",
+                show(balance, asset)
+            ));
+        }
+        if let (Asset::Eth, Some(fee)) = (asset, fee)
+            && amount + fee.max_cost() > balance
+        {
+            return Err(format!(
+                "the amount plus the max fee {} is more than your balance of {}",
+                show(fee.max_cost(), Asset::Eth),
+                show(balance, Asset::Eth)
+            ));
+        }
+        Ok(amount)
+    }
+
+    /// `max`: the whole token balance, or the ETH balance less the max fee.
+    fn max_amount(&self, fee: &Fee) -> Result<U256, String> {
+        let asset = self.form.asset;
+        let balance = self
+            .balance(asset)
+            .ok_or_else(|| "the balance is not proven yet".to_owned())?;
+        let max = match asset {
+            Asset::Eth => balance.saturating_sub(fee.max_cost()),
+            Asset::Token(_) => balance,
+        };
+        if max.is_zero() {
+            return Err(match asset {
+                Asset::Eth => format!(
+                    "your balance of {} does not cover the max fee {}",
+                    show(balance, Asset::Eth),
+                    show(fee.max_cost(), Asset::Eth)
+                ),
+                Asset::Token(_) => format!("you hold no {}", asset.symbol()),
+            });
+        }
+        Ok(max)
+    }
+
+    /// The draft the fee is estimated for: the form's, with `max` ETH as zero.
+    fn estimate_draft(&self) -> Option<Draft> {
+        let to = parse_recipient(&self.form.to).ok()?;
+        let asset = self.form.asset;
+        let amount = match self.amount().ok()? {
+            Amount::Exact(amount) => amount,
+            Amount::Max => match asset {
+                Asset::Eth => U256::ZERO,
+                Asset::Token(_) => self.balance(asset)?,
+            },
+        };
+        Some(Draft { asset, to, amount })
+    }
+}
+
+/// The amount field: a number, or everything that can be sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Amount {
+    Exact(U256),
+    Max,
+}
+
+/// `amount` of `asset` for display, with its symbol.
+pub fn show(amount: U256, asset: Asset) -> String {
+    format!("{} {}", format_units(amount, asset.decimals()), asset.symbol())
+}
+
+/// The recipient field as an address, with the reason it cannot be sent to.
+fn parse_recipient(text: &str) -> Result<Address, String> {
+    if text.trim().is_empty() {
+        return Err("enter the recipient's address".to_owned());
+    }
+    match parse_address(text) {
+        Ok(Address::ZERO) => Err("refusing to send to the zero address".to_owned()),
+        Ok(address) => Ok(address),
+        Err(AddressError::Malformed(_)) => Err("expected 0x followed by 40 hex digits".to_owned()),
+        Err(AddressError::Checksum(_)) => Err(
+            "the checksum does not match; check the address, or type it all lowercase".to_owned(),
+        ),
+    }
+}
+
+/// Why a decimal amount did not parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitsError {
+    Empty,
+    Malformed,
+    Decimals,
+}
+
+/// A decimal amount in base units of a token with `decimals` decimals.
+fn parse_units(text: &str, decimals: u8) -> Result<U256, UnitsError> {
+    if text.is_empty() {
+        return Err(UnitsError::Empty);
+    }
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if whole.is_empty() && fraction.is_empty() || !digits(whole) || !digits(fraction) {
+        return Err(UnitsError::Malformed);
+    }
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.len() > usize::from(decimals) {
+        return Err(UnitsError::Decimals);
+    }
+    let padded = format!(
+        "{whole}{fraction}{}",
+        "0".repeat(usize::from(decimals) - fraction.len())
+    );
+    U256::from_str_radix(&padded, 10).map_err(|_| UnitsError::Malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, b256};
