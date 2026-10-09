@@ -135,7 +135,7 @@ impl<P: Peers> Follower<P> {
             self.seed_due = true;
         }
         if self.seed_due {
-            self.seed_due = !shared.seed().await;
+            self.seed().await;
         }
         shared.warm(self.heads.latest.clone()).await;
 
@@ -163,6 +163,12 @@ impl<P: Peers> Follower<P> {
         shared.save_keys(Some(self.moves)).await?;
         shared.peers.announce(&anchor);
         Ok(stepped)
+    }
+
+    /// Seeds, recording when, and leaves seeding due if it could not complete.
+    pub(crate) async fn seed(&mut self) {
+        self.seeded_at = tokio::time::Instant::now();
+        self.seed_due = !self.shared.seed().await;
     }
 
     /// Searches every unsearched block between `anchor` and the oldest submission not yet

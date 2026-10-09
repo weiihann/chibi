@@ -221,6 +221,8 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) unreceipted: Vec<VerifiedBody>,
     /// Seeding has not completed at the current anchor's store yet.
     pub(crate) seed_due: bool,
+    /// When seeding last ran.
+    pub(crate) seeded_at: tokio::time::Instant,
 }
 
 /// Fee data for `eth_feeHistory`, oldest block first.
@@ -614,6 +616,7 @@ impl<P: Peers> Node<P> {
                 search: Search::new(floor),
                 unreceipted: Vec::new(),
                 seed_due: true,
+                seeded_at: tokio::time::Instant::now(),
             },
         ))
     }
@@ -1017,6 +1020,9 @@ impl<P: Peers> Follower<P> {
                         break;
                     }
                     () = self.shared.wake.notified() => {
+                        if self.seed_due && self.seeded_at.elapsed() >= SEED_RETRY {
+                            self.seed().await;
+                        }
                         self.shared.warm(self.heads.latest.clone()).await;
                     }
                 }
