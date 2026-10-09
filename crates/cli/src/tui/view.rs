@@ -841,10 +841,27 @@ mod tests {
     }
 
     #[test]
-    fn notice_rows_wrap_at_words_and_split_long_ones() {
-        assert_eq!(notice_rows("press q again", 20), 1);
-        assert_eq!(notice_rows("aaaa bbbb cccc", 9), 2);
-        assert_eq!(notice_rows("aaaa bbbb cccc", 4), 3);
-        assert_eq!(notice_rows("0123456789abcdef", 5), 4);
+    fn a_notice_with_runs_of_spaces_and_wide_characters_shows_whole() {
+        let mut app = ready();
+        let notice = "could not write  /tmp/日本日本日本日本日本/a.json:  denied";
+        app.notice = Some(notice.to_owned());
+        let shown = squeezed(&sized(&app, &[], 20, 30));
+        assert!(shown.contains(&squeezed(notice)), "{shown}");
+    }
+
+    #[test]
+    fn a_notice_fits_exactly_between_the_header_and_the_footer() {
+        let mut app = ready();
+        let notice = "press q again to quit; a transfer is pending";
+        app.notice = Some(notice.to_owned());
+        let tall = sized(&app, &[], 30, 30);
+        let tall: Vec<&str> = tall.lines().collect();
+        app.logs = true;
+        let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
+        let shown = sized(&app, &logs, 30, 4);
+        let rows: Vec<&str> = shown.lines().collect();
+        assert_eq!(rows[0], tall[0], "{shown}");
+        assert_eq!(squeezed(&rows[1..3].concat()), squeezed(notice), "{shown}");
+        assert_eq!(rows[3], tall[29], "{shown}");
     }
 }
