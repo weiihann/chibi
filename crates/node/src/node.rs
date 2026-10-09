@@ -607,6 +607,7 @@ impl<P: Peers> Node<P> {
         shared.persist().await?;
         let (keys, restored) = shared.read(|s| (s.working().len(), s.txs().has_pending()));
         info!(target: "chibi::node", head = anchor.number(), keys, "anchored");
+        shared.peers.announce(&shared.read(State::snapshot));
         // Restored transactions may already sit in blocks this run never passed; the search
         // reaches back to their submission anchors.
         let floor = (!restored).then(|| anchor.num_hash());

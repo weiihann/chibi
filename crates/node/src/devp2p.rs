@@ -28,11 +28,12 @@ use reth_eth_wire_types::snap::{
 };
 use reth_eth_wire_types::{
     BlockAccessLists, BlockBodies, BlockHeaders, BlockRangeUpdate, Capability, Cells, EthMessageID,
-    GetBlockHeaders, HeadersDirection, NodeData, RawCapabilityMessage, Receipts, Receipts69,
-    Receipts70,
+    EthVersion, GetBlockHeaders, HeadersDirection, NodeData, RawCapabilityMessage, Receipts,
+    Receipts69, Receipts70,
 };
 use reth_network::eth_requests::IncomingEthRequest;
 use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
+use reth_network::message::PeerMessage;
 use reth_network::{
     FetchClient, NetworkConfigBuilder, NetworkEventListenerProvider, NetworkHandle, NetworkManager,
     PeersConfig,
@@ -45,6 +46,7 @@ use reth_network_p2p::error::{RequestError, RequestResult};
 use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
 use reth_network_p2p::receipts::client::ReceiptsClient;
 use reth_network_p2p::snap::client::SnapResponse;
+use reth_network_p2p::sync::NetworkSyncUpdater as _;
 pub use reth_network_peers::NodeRecord;
 use reth_network_peers::{PeerId, TrustedPeer};
 use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
@@ -66,6 +68,9 @@ const BROADCAST_FANOUT: usize = 8;
 
 /// Inbound requests buffered before reth drops new ones; reth's own handler uses the same.
 const INBOUND_CAPACITY: usize = 256;
+
+/// The first eth version with `BlockRangeUpdate`.
+const ETH_69: u8 = EthVersion::Eth69 as u8;
 
 const ETH: &str = "eth";
 const SNAP: &str = "state (snap/2)";
@@ -357,7 +362,12 @@ impl Devp2p {
         );
         let tasks = [
             tokio::spawn(manager),
-            tokio::spawn(track_sessions(events, handle.clone(), sessions_tx)),
+            tokio::spawn(track_sessions(
+                events,
+                handle.clone(),
+                sessions_tx,
+                served.subscribe(),
+            )),
             tokio::spawn(answer_inbound(requests, announced)),
         ];
         Ok(Self {
@@ -628,9 +638,16 @@ impl Peers for Devp2p {
     }
 
     fn announce(&self, store: &Arc<Store>) {
-        self.handle
-            .update_status(status_head(&self.chain, store.anchor()));
+        let head = store.anchor();
+        self.handle.update_status(status_head(&self.chain, head));
+        let range = block_range(head);
+        self.handle.update_block_range(range.0.clone());
         self.served.send_replace(Some(Arc::clone(store)));
+        for (peer, session) in self.sessions.borrow().iter() {
+            if session.eth >= ETH_69 {
+                send_range(&self.handle, peer.0, &range);
+            }
+        }
     }
 
     fn census(&self) -> Census {
@@ -662,13 +679,30 @@ fn total_difficulty(chain: &ChainSpec) -> U256 {
     chain.final_paris_total_difficulty().unwrap_or_default()
 }
 
-/// The eth/69 `BlockRangeUpdate` for `head` and its encoding as a raw eth message.
+/// The eth/69 `BlockRangeUpdate` for `head` and its encoding as a raw eth message. The head is
+/// both the earliest and the latest block chibi serves: it holds no bodies or receipts, and
+/// state only near the head.
 fn block_range(head: &VerifiedHeader) -> (BlockRangeUpdate, RawCapabilityMessage) {
-    let _ = head;
-    (
-        BlockRangeUpdate::default(),
-        RawCapabilityMessage::eth(EthMessageID::BlockRangeUpdate, Default::default()),
-    )
+    let update = BlockRangeUpdate {
+        earliest: head.number(),
+        latest: head.number(),
+        latest_hash: head.hash(),
+    };
+    let payload = alloy_rlp::encode(&update).into();
+    let message = RawCapabilityMessage::eth(EthMessageID::BlockRangeUpdate, payload);
+    (update, message)
+}
+
+/// Sends `range` to `peer` now. reth only refreshes a live session's range every 384 s, and
+/// drops a typed `PeerMessage::BlockRangeUpdated` sent from outside, so it goes as a raw eth
+/// message.
+fn send_range(
+    handle: &NetworkHandle,
+    peer: PeerId,
+    (update, message): &(BlockRangeUpdate, RawCapabilityMessage),
+) {
+    handle.send_eth_message(peer, PeerMessage::Other(message.clone()));
+    debug!(target: "chibi::devp2p", %peer, head = update.latest, "sent block range");
 }
 
 fn net_error(err: &RequestError, capability: &'static str) -> NetError {
@@ -706,10 +740,13 @@ fn both_failed(snap: NetError, eth: NetError) -> NetError {
     }
 }
 
+/// Keeps `sessions` current and sends each new eth/69 session the range of the store in
+/// `served`, if one was announced yet.
 async fn track_sessions(
     events: impl futures::Stream<Item = NetworkEvent>,
     handle: NetworkHandle,
     sessions: watch::Sender<Sessions>,
+    served: watch::Receiver<Option<Arc<Store>>>,
 ) {
     let mut events = std::pin::pin!(events);
     while let Some(event) = events.next().await {
@@ -726,9 +763,16 @@ async fn track_sessions(
                     dialable = session.dialable.is_some(),
                     "session established",
                 );
+                let eth = session.eth;
                 sessions.send_modify(|sessions| {
                     sessions.insert(PeerKey(peer), session);
                 });
+                let store = served.borrow().clone();
+                if eth >= ETH_69
+                    && let Some(store) = store
+                {
+                    send_range(&handle, peer, &block_range(store.anchor()));
+                }
             }
             NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
                 debug!(target: "chibi::devp2p", peer = %peer_id, ?reason, "session closed");
@@ -885,8 +929,8 @@ mod tests {
     use alloy_primitives::{B128, B512, b256};
     use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World};
     use reth_eth_wire_types::{
-        EthMessage, EthNetworkPrimitives, EthVersion, GetBlockAccessLists, GetBlockBodies,
-        GetCells, GetNodeData, GetReceipts, GetReceipts70, ProtocolMessage,
+        EthMessage, EthNetworkPrimitives, GetBlockAccessLists, GetBlockBodies, GetCells,
+        GetNodeData, GetReceipts, GetReceipts70, ProtocolMessage,
     };
 
     use super::*;
