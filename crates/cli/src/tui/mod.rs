@@ -508,7 +508,6 @@ fn balances(holding: &Holding, registry: &[Token]) -> Balances {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
@@ -524,8 +523,8 @@ mod tests {
 
     use super::*;
 
-    /// A test terminal whose flush tells `entered`, then blocks until `release` is sent to or
-    /// dropped.
+    /// A test terminal whose flush tells `entered`, then blocks until `release` is sent to,
+    /// and fails once `release` is dropped.
     struct Stalled {
         screen: TestBackend,
         entered: std_mpsc::Sender<()>,
@@ -533,55 +532,91 @@ mod tests {
     }
 
     impl Backend for Stalled {
-        type Error = Infallible;
+        type Error = io::Error;
 
-        fn draw<'a, I>(&mut self, content: I) -> Result<(), Infallible>
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
         where
             I: Iterator<Item = (u16, u16, &'a Cell)>,
         {
-            self.screen.draw(content)
+            self.screen.draw(content).map_err(io::Error::other)
         }
 
-        fn hide_cursor(&mut self) -> Result<(), Infallible> {
-            self.screen.hide_cursor()
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.screen.hide_cursor().map_err(io::Error::other)
         }
 
-        fn show_cursor(&mut self) -> Result<(), Infallible> {
-            self.screen.show_cursor()
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.screen.show_cursor().map_err(io::Error::other)
         }
 
-        fn get_cursor_position(&mut self) -> Result<Position, Infallible> {
-            self.screen.get_cursor_position()
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.screen.get_cursor_position().map_err(io::Error::other)
         }
 
-        fn set_cursor_position<P: Into<Position>>(
-            &mut self,
-            position: P,
-        ) -> Result<(), Infallible> {
-            self.screen.set_cursor_position(position)
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.screen
+                .set_cursor_position(position)
+                .map_err(io::Error::other)
         }
 
-        fn clear(&mut self) -> Result<(), Infallible> {
-            self.screen.clear()
+        fn clear(&mut self) -> io::Result<()> {
+            self.screen.clear().map_err(io::Error::other)
         }
 
-        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Infallible> {
-            self.screen.clear_region(clear_type)
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.screen
+                .clear_region(clear_type)
+                .map_err(io::Error::other)
         }
 
-        fn size(&self) -> Result<Size, Infallible> {
-            self.screen.size()
+        fn size(&self) -> io::Result<Size> {
+            self.screen.size().map_err(io::Error::other)
         }
 
-        fn window_size(&mut self) -> Result<WindowSize, Infallible> {
-            self.screen.window_size()
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.screen.window_size().map_err(io::Error::other)
         }
 
-        fn flush(&mut self) -> Result<(), Infallible> {
+        fn flush(&mut self) -> io::Result<()> {
             let _ = self.entered.send(());
-            let _ = self.release.recv();
-            Ok(())
+            self.release
+                .recv()
+                .map_err(|_| io::Error::other("the terminal is gone"))
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renderer_that_fails_ends_the_unlock_prompt() {
+        let (entered, _entered) = std_mpsc::channel();
+        let (_, release) = std_mpsc::channel();
+        let stalled = Stalled {
+            screen: TestBackend::new(100, 30),
+            entered,
+            release,
+        };
+        let terminal = open(|| Terminal::new(stalled), || {}).unwrap();
+        let app = App::new(Network::Sepolia, 11_155_111, &[], false);
+        let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+        let handle = Handle::current();
+        let renderer = thread::spawn(move || render(terminal, latest, &handle));
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let logs = LogBuffer::default();
+        let mut ui = Ui {
+            views,
+            app,
+            input,
+            logs: &logs,
+        };
+        let unlocked = tokio::time::timeout(
+            Duration::from_secs(5),
+            ui.unlock(Path::new("/nonexistent")),
+        )
+        .await
+        .expect("the prompt ends without input");
+        assert!(unlocked.is_err());
+        drop(ui);
+        let err = finish(renderer, || {}).unwrap_err();
+        assert_eq!(format!("{err:#}"), "cannot draw the terminal UI: the terminal is gone");
     }
 
     #[test]
@@ -606,8 +641,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn quitting_releases_the_node_while_the_terminal_blocks() {
         static RESTORED: AtomicUsize = AtomicUsize::new(0);
+        static RAW_RELEASED: AtomicUsize = AtomicUsize::new(0);
         fn restored() {
             RESTORED.fetch_add(1, Ordering::SeqCst);
+        }
+        fn raw_released() {
+            RAW_RELEASED.fetch_add(1, Ordering::SeqCst);
         }
         let signer = PrivateKeySigner::from_slice(&[0x42; 32]).unwrap();
         let sender = signer.address();
@@ -680,14 +719,14 @@ mod tests {
         assert!(Disk::running(dir.path()).unwrap().is_none());
 
         drop(ui);
-        let renderer = join_within(renderer, Duration::from_millis(100))
-            .expect_err("the render thread is still blocked");
+        finish(renderer, raw_released).unwrap();
+        assert_eq!(RAW_RELEASED.load(Ordering::SeqCst), 1);
         assert_eq!(RESTORED.load(Ordering::SeqCst), 0);
         drop(release);
-        assert!(matches!(
-            join_within(renderer, Duration::from_secs(5)),
-            Ok(Ok(Ok(())))
-        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while RESTORED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(JOIN_POLL);
+        }
         assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
     }
 
