@@ -432,6 +432,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn max_eth_is_quoted_for_the_value_it_sends() {
+        let signer = signer();
+        let sender = signer.address();
+        let stores_nonzero_value = alloy_primitives::hex!("34600557005b3460005500").to_vec();
+        let fixture = Fixture::genesis([
+            (sender, WorldAccount::eoa(eth(3))),
+            (BOB, WorldAccount::contract(stores_nonzero_value)),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _follower) = start(&fixture, dir.path(), sender).await;
+        let max = Quote::MaxEth {
+            to: BOB,
+            balance: eth(3),
+        };
+
+        let quoted = quote(&node, sender, &max).await.unwrap();
+        assert_eq!(quoted.fee, estimate(&node, sender, &quoted.draft).await.unwrap());
+        assert_eq!(quoted.fee.gas_limit, 43_497);
+        assert_eq!(quoted.draft.amount + quoted.fee.max_cost(), eth(3));
+
+        let short = Quote::MaxEth {
+            to: BOB,
+            balance: U256::from(1_000),
+        };
+        assert_eq!(
+            quote(&node, sender, &short).await.unwrap_err().to_string(),
+            "your balance of 0.000000000000001 ETH does not cover the max fee 0.000058245 ETH"
+        );
+    }
+
     fn token_world(holder: Address, balance: u64) -> Fixture {
         Fixture::genesis([
             (holder, WorldAccount::eoa(eth(3))),
