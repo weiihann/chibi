@@ -187,6 +187,17 @@ impl Picker {
     }
 }
 
+impl Form {
+    /// Sends `asset` instead, dropping the errors judged for the previous one.
+    fn choose(&mut self, asset: Asset) {
+        if asset != self.asset {
+            self.asset = asset;
+            self.amount_error = None;
+            self.fee_error = None;
+        }
+    }
+}
+
 impl Default for Form {
     fn default() -> Self {
         Self {
@@ -1177,8 +1188,7 @@ impl App {
                 } else {
                     assets.len() - 1
                 };
-                self.form.asset = assets[(at + step) % assets.len()];
-                self.form.amount_error = None;
+                self.form.choose(assets[(at + step) % assets.len()]);
             }
             Key::Char(c) => match self.form.field {
                 Field::Amount if c.is_ascii_digit() || matches!(c, '.' | 'm' | 'a' | 'x') => {
@@ -1242,8 +1252,7 @@ impl App {
             Key::Enter => {
                 if let Some(&asset) = matches.get(at) {
                     self.form.picker = None;
-                    self.form.asset = asset;
-                    self.form.amount_error = None;
+                    self.form.choose(asset);
                     self.form.field = Field::Amount;
                 }
             }
