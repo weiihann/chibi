@@ -275,6 +275,62 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    fn entries(dir: &Path) -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    fn injected(path: &Path) -> io::Result<()> {
+        Err(io::Error::other(format!("injected at {}", path.display())))
+    }
+
+    #[test]
+    fn a_keystore_is_published_whole_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let keystores = dir.path().join("keystores");
+        let failed = save_with(&parse(ANVIL_KEY).unwrap(), PASSWORD, &config, &|path| {
+            if path.starts_with(&keystores) {
+                injected(path)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(failed, Err(SaveError::Write { .. })));
+        assert_eq!(entries(&keystores), Vec::<PathBuf>::new());
+        assert!(!config.exists());
+
+        let Saved::Written(_, path) = save(&parse(ANVIL_KEY).unwrap(), PASSWORD, &config).unwrap()
+        else {
+            panic!("a fresh directory has no keystore");
+        };
+        assert_eq!(entries(&keystores), vec![path.clone()]);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(transfer::unlock(&path, PASSWORD).unwrap().address(), ANVIL);
+    }
+
+    #[test]
+    fn a_file_already_at_the_keystore_path_is_left_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let keystores = dir.path().join("keystores");
+        fs::create_dir(&keystores).unwrap();
+        let path = keystores.join("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266.json");
+        fs::write(&path, "not a keystore").unwrap();
+        let saved = save(
+            &parse(ANVIL_KEY).unwrap(),
+            PASSWORD,
+            &dir.path().join("config.toml"),
+        )
+        .unwrap();
+        assert!(matches!(saved, Saved::Exists(ANVIL, ref kept) if *kept == path));
+        assert_eq!(fs::read(&path).unwrap(), b"not a keystore");
+        assert_eq!(entries(&keystores), vec![path]);
+    }
+
     #[test]
     fn the_anvil_phrase_and_its_first_key_give_the_same_address() {
         assert!(matches!(parse(ANVIL_PHRASE), Ok(Secret::Phrase(_))));
