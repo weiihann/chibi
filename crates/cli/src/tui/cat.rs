@@ -56,7 +56,7 @@ const EYES_HALF: [&str; 2] = ["kooooooooooooook", "kooeeooooooeeook"];
 const EYES_HAPPY: [&str; 2] = ["kookkoooooookkok", "kokooooooooookok"];
 const EYES_WIDE: [&str; 2] = ["koeeeooooooeeeok", "koewwooooooewwok"];
 
-const Z: [&str; 3] = ["zzz", ".z.", "zzz"];
+const Z: [&str; 4] = ["zzzz", "..z.", ".z..", "zzzz"];
 const STAR: [&str; 3] = [".*.", "***", ".*."];
 const HEART: [&str; 3] = ["h.h", "hhh", ".h."];
 
@@ -81,7 +81,7 @@ pub fn frame(pose: Pose, n: u32) -> Grid {
     match pose {
         Pose::Dozing => {
             cat(&mut grid, EYES_CLOSED, 1, nth([3, 3, 4, 4], n));
-            let (x, y) = nth([(17, 6), (18, 4), (18, 2), (19, 0)], n);
+            let (x, y) = nth([(17, 6), (17, 4), (18, 2), (18, 0)], n);
             stamp(&mut grid, &Z, x, y);
         }
         Pose::Excited => {
