@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn unlock_masks_the_password() {
         let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
-        app.password = "hunter2".to_owned();
+        app.password.push_str("hunter2");
         let shown = screen(&app, &[]);
         assert!(shown.contains("password  *******"), "{shown}");
         assert!(!shown.contains("hunter2"), "{shown}");

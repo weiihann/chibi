@@ -6,6 +6,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, TxHash, U256};
 use chibi_node::{Network, Startup, Token};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{AddressError, parse_address};
 use crate::format_units;
@@ -19,6 +20,9 @@ pub const MAINNET_REFUSED: &str = "sending on mainnet is not enabled yet";
 
 /// Why nothing is sent while no state peer is connected.
 pub const PAUSED: &str = "waiting for a state peer";
+
+/// The longest password accepted, in bytes: its buffer's fixed capacity.
+pub const PASSWORD_BYTES: usize = 256;
 
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,8 +57,8 @@ pub enum Field {
 /// What the event loop should do after a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Decrypt the keystore with this password.
-    Unlock(String),
+    /// Decrypt the keystore with [`App::take_password`].
+    Unlock,
     /// Sign and submit this transfer.
     Send(Draft, Fee),
     /// Shut the node down and leave.
@@ -215,8 +219,9 @@ pub struct App {
     pub frame: u64,
     /// Whether the log pane is open.
     pub logs: bool,
-    /// The password typed so far.
-    pub password: String,
+    /// The password typed so far, in a buffer of [`PASSWORD_BYTES`] that is never
+    /// reallocated and is wiped on unlock, on quit and on drop.
+    pub password: Zeroizing<String>,
     /// Whether the keystore is being decrypted.
     pub unlocking: bool,
     /// Why the last unlock failed.
@@ -258,7 +263,7 @@ impl App {
             registry,
             frame: 0,
             logs,
-            password: String::new(),
+            password: Zeroizing::new(String::with_capacity(PASSWORD_BYTES)),
             unlocking: false,
             unlock_error: None,
             waiting: WaitCounts::default(),
@@ -551,23 +556,36 @@ impl App {
 
     fn unlock_key(&mut self, key: Option<Key>, ctrl_c: bool) -> Option<Action> {
         if ctrl_c || key == Some(Key::Esc) {
+            self.password.zeroize();
             return Some(Action::Quit);
         }
         if self.unlocking {
             return None;
         }
         match key? {
-            Key::Char(c) => self.password.push(c),
-            Key::Backspace => {
-                self.password.pop();
+            Key::Char(c) if self.password.len() + c.len_utf8() <= PASSWORD_BYTES => {
+                self.password.push(c);
             }
+            Key::Backspace => erase_last(&mut self.password),
             Key::Enter if !self.password.is_empty() => {
                 self.unlocking = true;
-                return Some(Action::Unlock(std::mem::take(&mut self.password)));
+                return Some(Action::Unlock);
             }
-            Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+            Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
         }
         None
+    }
+
+    /// The typed password, to decrypt the keystore with while [`App::unlocking`]. It comes
+    /// back through [`App::return_password`].
+    pub fn take_password(&mut self) -> Zeroizing<String> {
+        std::mem::take(&mut self.password)
+    }
+
+    /// Wipes the password buffer after decrypting and keeps it for the next attempt.
+    pub fn return_password(&mut self, mut password: Zeroizing<String>) {
+        password.zeroize();
+        self.password = password;
     }
 
     fn quit(&mut self) -> Option<Action> {
@@ -843,6 +861,16 @@ pub fn show(amount: U256, asset: Asset) -> String {
     )
 }
 
+/// Removes the last character and overwrites its bytes, which would otherwise stay in the
+/// buffer's spare capacity. Writes within the capacity, so it never reallocates.
+fn erase_last(password: &mut String) {
+    if let Some(c) = password.pop() {
+        let len = password.len();
+        password.extend(std::iter::repeat_n('\0', c.len_utf8()));
+        password.truncate(len);
+    }
+}
+
 /// The recipient field as an address, with the reason it cannot be sent to.
 fn parse_recipient(text: &str) -> Result<Address, String> {
     if text.trim().is_empty() {
@@ -984,11 +1012,16 @@ mod tests {
         assert_eq!(app.screen, Screen::Unlock);
         assert_eq!(press(&mut app, KeyCode::Enter), None);
         typed(&mut app, "qlx");
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::Unlock));
+        assert!(app.unlocking);
+        let capacity = app.password.capacity();
+        let password = app.take_password();
+        assert_eq!(password.as_str(), "qlx");
+        app.return_password(password);
         assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Some(Action::Unlock("qlx".to_owned()))
+            (app.password.as_str(), app.password.capacity()),
+            ("", capacity)
         );
-        assert!(app.unlocking && app.password.is_empty());
         app.unlocked(Err("wrong password".to_owned()));
         assert_eq!(
             (app.screen, app.unlock_error.as_deref()),

@@ -25,6 +25,7 @@ alloy-sol-types.workspace = true
 alloy-signer = "2.5"
 alloy-signer-local = { version = "2.5", features = ["keystore"] }
 eth-keystore = "0.5"
+zeroize = "1.9"
 
 tokio.workspace = true
 tracing.workspace = true

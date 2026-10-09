@@ -212,12 +212,15 @@ impl Ui<'_> {
                 continue;
             };
             match self.app.key(key) {
-                Some(Action::Unlock(password)) => {
+                Some(Action::Unlock) => {
                     self.draw()?;
                     let path = keystore.to_owned();
-                    let unlocked =
-                        tokio::task::spawn_blocking(move || transfer::unlock(&path, &password))
-                            .await?;
+                    let password = self.app.take_password();
+                    let (unlocked, password) = tokio::task::spawn_blocking(move || {
+                        (transfer::unlock(&path, &password), password)
+                    })
+                    .await?;
+                    self.app.return_password(password);
                     match unlocked {
                         Ok(signer) => {
                             self.app.unlocked(Ok(signer.address()));
@@ -304,7 +307,7 @@ impl Ui<'_> {
                                 });
                             }
                         }
-                        Some(Action::Unlock(_)) | None => {}
+                        Some(Action::Unlock) | None => {}
                     }
                 }
                 Some(finished) = done.recv() => match finished {
