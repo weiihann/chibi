@@ -160,8 +160,8 @@ pub struct Form {
 pub struct Picker {
     /// Typed text that a symbol or name must contain, ignoring case.
     pub filter: String,
-    /// The highlighted entry of [`Picker::matches`].
-    pub highlighted: usize,
+    /// The highlighted asset; the first match stands in while it does not match.
+    pub highlighted: Asset,
 }
 
 impl Picker {
@@ -176,6 +176,14 @@ impl Picker {
                     || asset.name().to_lowercase().contains(&filter)
             })
             .collect()
+    }
+
+    /// Where the highlighted asset sits in `matches`, else the first.
+    pub fn position(&self, matches: &[Asset]) -> usize {
+        matches
+            .iter()
+            .position(|asset| *asset == self.highlighted)
+            .unwrap_or_default()
     }
 }
 
@@ -1195,14 +1203,9 @@ impl App {
                 Field::Token => {}
             },
             Key::Enter if self.form.field == Field::Token => {
-                let highlighted = self
-                    .assets()
-                    .iter()
-                    .position(|asset| *asset == self.form.asset)
-                    .unwrap_or_default();
                 self.form.picker = Some(Picker {
                     filter: String::new(),
-                    highlighted,
+                    highlighted: self.form.asset,
                 });
             }
             Key::Enter => self.submit(),
@@ -1217,20 +1220,27 @@ impl App {
             return;
         };
         let matches = picker.matches(&assets);
+        let at = picker.position(&matches);
         let count = matches.len().max(1);
         match key {
-            Key::Down => picker.highlighted = (picker.highlighted + 1) % count,
-            Key::Up => picker.highlighted = (picker.highlighted + count - 1) % count,
-            Key::Char(c) => {
-                picker.filter.push(c);
-                picker.highlighted = 0;
+            Key::Down | Key::Up => {
+                let step = if key == Key::Down { 1 } else { count - 1 };
+                if let Some(&asset) = matches.get((at + step) % count) {
+                    picker.highlighted = asset;
+                }
             }
-            Key::Backspace => {
-                picker.filter.pop();
-                picker.highlighted = 0;
+            Key::Char(_) | Key::Backspace => {
+                if let Key::Char(c) = key {
+                    picker.filter.push(c);
+                } else {
+                    picker.filter.pop();
+                }
+                if let Some(&first) = picker.matches(&assets).first() {
+                    picker.highlighted = first;
+                }
             }
             Key::Enter => {
-                if let Some(&asset) = matches.get(picker.highlighted) {
+                if let Some(&asset) = matches.get(at) {
                     self.form.picker = None;
                     self.form.asset = asset;
                     self.form.amount_error = None;
@@ -2081,10 +2091,11 @@ mod tests {
     }
 
     fn picker(app: &App) -> Option<(&str, usize)> {
+        let assets = app.assets();
         app.form
             .picker
             .as_ref()
-            .map(|picker| (picker.filter.as_str(), picker.highlighted))
+            .map(|picker| (picker.filter.as_str(), picker.position(&picker.matches(&assets))))
     }
 
     #[test]

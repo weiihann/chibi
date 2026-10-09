@@ -484,8 +484,9 @@ fn picker_lines(app: &App) -> Option<Vec<Line<'static>>> {
     if matches.is_empty() {
         lines.push(Line::raw("no token matches"));
     }
+    let highlighted = picker.position(&matches);
     for (at, asset) in matches.into_iter().enumerate() {
-        let marker = if at == picker.highlighted { ">" } else { " " };
+        let marker = if at == highlighted { ">" } else { " " };
         lines.push(Line::raw(format!(
             "{marker} {:<symbols$}  {:<names$}  {}",
             asset.symbol(),
@@ -887,7 +888,7 @@ mod tests {
 
         app.form.picker = Some(Picker {
             filter: String::new(),
-            highlighted: 2,
+            highlighted: app.assets()[2],
         });
         let open = drawn(&app, &[], 120, 30);
         let shown = sized(&app, &[], 120, 30);
@@ -920,7 +921,7 @@ mod tests {
 
         app.form.picker = Some(Picker {
             filter: "dai".to_owned(),
-            highlighted: 0,
+            highlighted: Asset::Eth,
         });
         let shown = sized(&app, &[], 120, 30);
         assert!(shown.contains("│no token matches"), "{shown}");
@@ -932,7 +933,7 @@ mod tests {
         let mut app = on_the_token_row();
         app.form.picker = Some(Picker {
             filter: String::new(),
-            highlighted: 0,
+            highlighted: Asset::Eth,
         });
         for (width, height) in [(20, 8), (3, 2), (1, 1), (120, 5)] {
             sized(&app, &[], width, height);
@@ -946,7 +947,7 @@ mod tests {
         let closed = drawn(&app, &[], 120, 10);
         app.form.picker = Some(Picker {
             filter: String::new(),
-            highlighted: 2,
+            highlighted: app.assets()[2],
         });
         let open = drawn(&app, &[], 120, 10);
         let shown = sized(&app, &[], 120, 10);
@@ -983,7 +984,7 @@ mod tests {
         let closed = drawn(&app, &[], 120, 13);
         app.form.picker = Some(Picker {
             filter: String::new(),
-            highlighted: 7,
+            highlighted: app.assets()[7],
         });
         let open = drawn(&app, &[], 120, 13);
         let shown = sized(&app, &[], 120, 13);
