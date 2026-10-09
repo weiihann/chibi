@@ -138,6 +138,9 @@ pub enum TransferError {
         /// The max fee.
         max_fee: U256,
     },
+    /// `max` ETH: each estimate moved the value it sends again.
+    #[error("the fee keeps changing what max sends; enter an exact amount instead")]
+    Unsettled,
     /// The node could not estimate, sign for, or submit the transfer.
     #[error(transparent)]
     Node(#[from] NodeError),
@@ -230,7 +233,14 @@ pub async fn estimate<P: Peers>(
     })
 }
 
-/// Answers `quote` with the draft to sign and its fee.
+/// Estimates of `max` ETH with a nonzero value before its value must have settled.
+const MAX_ESTIMATES: usize = 2;
+
+/// Answers `quote` with the draft to sign and the fee estimated for exactly that draft.
+///
+/// `max` ETH starts from the fee of a zero-value call, then re-estimates with the value that
+/// fee leaves, since a recipient may spend more gas for a nonzero value. If that changes the
+/// value it re-estimates once more, and refuses if the value still moves.
 pub async fn quote<P: Peers>(
     node: &Node<P>,
     from: Address,
@@ -248,9 +258,16 @@ pub async fn quote<P: Peers>(
         to,
         amount: U256::ZERO,
     };
-    let fee = estimate(node, from, &draft).await?;
-    draft.amount = left_after(balance, &fee)?;
-    Ok(Quoted { draft, fee })
+    let mut fee = estimate(node, from, &draft).await?;
+    for _ in 0..MAX_ESTIMATES {
+        draft.amount = left_after(balance, &fee)?;
+        let next = estimate(node, from, &draft).await?;
+        if next.max_cost() == fee.max_cost() {
+            return Ok(Quoted { draft, fee: next });
+        }
+        fee = next;
+    }
+    Err(TransferError::Unsettled)
 }
 
 /// The ETH `balance` leaves once `fee` is paid, if any.
