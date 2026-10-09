@@ -62,6 +62,7 @@ pub struct View {
     header: Line<'static>,
     body: Vec<Line<'static>>,
     footer: Vec<Line<'static>>,
+    notice: Option<String>,
     /// The tail of the log buffer, oldest first, while the log pane is open.
     logs: Option<Vec<String>>,
 }
@@ -71,8 +72,9 @@ impl View {
     pub fn new(app: &App, logs: Vec<String>) -> Self {
         Self {
             header: header_line(app),
-            body: with_notice(app, body_lines(app)),
+            body: body_lines(app),
             footer: footer_lines(app),
+            notice: app.notice.clone(),
             logs: app.logs.then_some(logs),
         }
     }
@@ -85,9 +87,14 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     } else {
         0
     };
-    let [header, body, footer, log_area] = Layout::vertical([
+    let rows = view
+        .notice
+        .as_deref()
+        .map_or(0, |notice| notice_rows(notice, frame.area().width));
+    let [header, body, notice, footer, log_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(rows),
         Constraint::Length(1),
         Constraint::Length(pane),
     ])
@@ -95,6 +102,13 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
 
     frame.render_widget(Paragraph::new(view.header), header);
     frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
+    if let Some(text) = view.notice {
+        frame.render_widget(
+            Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
+                .wrap(Wrap { trim: false }),
+            notice,
+        );
+    }
     frame.render_widget(Paragraph::new(view.footer), footer);
     if let Some(logs) = view.logs {
         let shown = usize::from(log_area.height.saturating_sub(2));
@@ -425,16 +439,28 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
     )]
 }
 
-/// Ends the body with the notice, if any, so it wraps like the rest of the body.
-fn with_notice(app: &App, mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    if let Some(notice) = app.notice.as_deref() {
-        lines.push(Line::default());
-        lines.push(Line::styled(
-            notice.to_owned(),
-            Style::default().fg(Color::Yellow),
-        ));
+/// The rows `text` takes wrapped greedily at word boundaries to `width`, words longer than
+/// `width` split across rows.
+fn notice_rows(text: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    for word in text.split(' ').filter(|word| !word.is_empty()) {
+        let mut len = word.chars().count();
+        if used > 0 && used + 1 + len <= width {
+            used += 1 + len;
+            continue;
+        }
+        if used > 0 {
+            rows += 1;
+        }
+        while len > width {
+            rows += 1;
+            len -= width;
+        }
+        used = len;
     }
-    lines
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 fn error_line(text: &str) -> Line<'static> {
@@ -812,5 +838,13 @@ mod tests {
         let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
         let shown = squeezed(&sized(&app, &logs, 80, 24));
         assert!(shown.contains(&squeezed(notice)), "{shown}");
+    }
+
+    #[test]
+    fn notice_rows_wrap_at_words_and_split_long_ones() {
+        assert_eq!(notice_rows("press q again", 20), 1);
+        assert_eq!(notice_rows("aaaa bbbb cccc", 9), 2);
+        assert_eq!(notice_rows("aaaa bbbb cccc", 4), 3);
+        assert_eq!(notice_rows("0123456789abcdef", 5), 4);
     }
 }
