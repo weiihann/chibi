@@ -663,7 +663,12 @@ impl App {
                 self.review = None;
                 self.screen = Screen::Paused;
             }
-            Screen::Ready | Screen::Paused => self.screen = self.form_screen(),
+            Screen::Ready | Screen::Paused => {
+                self.screen = self.form_screen();
+                if self.screen != Screen::Ready {
+                    self.form.picker = None;
+                }
+            }
             Screen::Menu
             | Screen::Backup
             | Screen::Confirm
@@ -859,11 +864,16 @@ impl App {
         if self.screen.is_setup() {
             return self.setup_key(key, ctrl_c);
         }
-        if ctrl_c || key == Some(Key::Char('q')) {
+        let picking = self.screen == Screen::Ready && self.form.picker.is_some();
+        if ctrl_c || (!picking && key == Some(Key::Char('q'))) {
             return self.quit();
         }
         self.quit_armed = false;
         let key = key?;
+        if picking {
+            self.picker_key(key);
+            return None;
+        }
         if key == Key::Char('l') {
             self.logs = !self.logs;
             return None;
@@ -1129,6 +1139,7 @@ impl App {
         let in_flight = self.sending.as_ref().is_some_and(Sending::in_flight);
         if in_flight && !self.quit_armed {
             self.quit_armed = true;
+            self.form.picker = None;
             self.notice = Some(
                 "a transfer is still pending; chibi's outbox rebroadcasts it on the next run. press q again to quit"
                     .to_owned(),
@@ -1183,8 +1194,51 @@ impl App {
                 }
                 Field::Token => {}
             },
+            Key::Enter if self.form.field == Field::Token => {
+                let highlighted = self
+                    .assets()
+                    .iter()
+                    .position(|asset| *asset == self.form.asset)
+                    .unwrap_or_default();
+                self.form.picker = Some(Picker {
+                    filter: String::new(),
+                    highlighted,
+                });
+            }
             Key::Enter => self.submit(),
             Key::Left | Key::Right | Key::Esc => {}
+        }
+    }
+
+    /// A key while the token list is open: every printable character edits the filter.
+    fn picker_key(&mut self, key: Key) {
+        let assets = self.assets();
+        let Some(picker) = self.form.picker.as_mut() else {
+            return;
+        };
+        let matches = picker.matches(&assets);
+        let count = matches.len().max(1);
+        match key {
+            Key::Down => picker.highlighted = (picker.highlighted + 1) % count,
+            Key::Up => picker.highlighted = (picker.highlighted + count - 1) % count,
+            Key::Char(c) => {
+                picker.filter.push(c);
+                picker.highlighted = 0;
+            }
+            Key::Backspace => {
+                picker.filter.pop();
+                picker.highlighted = 0;
+            }
+            Key::Enter => {
+                if let Some(&asset) = matches.get(picker.highlighted) {
+                    self.form.picker = None;
+                    self.form.asset = asset;
+                    self.form.amount_error = None;
+                    self.form.field = Field::Amount;
+                }
+            }
+            Key::Esc => self.form.picker = None,
+            Key::Left | Key::Right => {}
         }
     }
 
