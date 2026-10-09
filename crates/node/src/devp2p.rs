@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{B256, BlockNumber, Bytes, U256};
+use alloy_primitives::{B256, Bytes, U256};
 use chibi_core::state::Store;
 use chibi_core::wire::{
     AccountRangeRequest, AccountReply, Body, Receipt, StorageRangeRequest, StorageReply,
@@ -171,8 +171,8 @@ pub struct Session {
     /// The record chibi dialed for a snap/2 session it opened, `None` otherwise. Only such
     /// records are worth remembering for the next start.
     pub dialable: Option<NodeRecord>,
-    /// The head of the last block range sent to the peer.
-    pub range_sent: Option<BlockNumber>,
+    /// The publication sequence of the last block range sent to the peer.
+    pub range_sent: Option<u64>,
 }
 
 /// Established sessions by peer.
@@ -304,8 +304,9 @@ pub struct Devp2p {
     chain: Arc<ChainSpec>,
     sessions: Arc<watch::Sender<Sessions>>,
     snap_load: Arc<SnapLoad>,
-    /// The store announced last, whose held headers inbound requests are answered from.
-    served: watch::Sender<Option<Arc<Store>>>,
+    /// The store announced last, whose held headers inbound requests are answered from, with
+    /// its publication sequence.
+    served: watch::Sender<Option<(u64, Arc<Store>)>>,
     tasks: [JoinHandle<()>; 3],
 }
 
@@ -650,13 +651,20 @@ impl Peers for Devp2p {
         self.handle.update_status(status_head(&self.chain, head));
         let range = block_range(head);
         self.handle.update_block_range(range.0.clone());
-        self.served.send_replace(Some(Arc::clone(store)));
+        let mut seq = 0;
+        self.served.send_modify(|served| {
+            seq = served.as_ref().map_or(1, |(last, _)| last + 1);
+            *served = Some((seq, Arc::clone(store)));
+        });
         let peers: Vec<PeerKey> = self.sessions.borrow().keys().copied().collect();
         for peer in peers {
-            offer_range(&self.sessions, peer, &range, |peer, message| {
+            let sent = offer_range(&self.sessions, peer, seq, &range, |peer, message| {
                 self.handle
                     .send_eth_message(peer, PeerMessage::Other(message.clone()));
             });
+            if sent {
+                debug!(target: "chibi::devp2p", peer = %peer.0, head = range.0.latest, "sent block range");
+            }
         }
     }
 
@@ -703,28 +711,31 @@ fn block_range(head: &VerifiedHeader) -> (BlockRangeUpdate, RawCapabilityMessage
     (update, message)
 }
 
-/// Sends `range` to `peer` through `send` if it is an eth/69 session not yet sent this head or
-/// a later one. Check, send and record happen under the sessions lock, so a range read before
-/// a newer one was sent cannot follow it. reth only refreshes a live session's range every
-/// 384 s, and drops a typed `PeerMessage::BlockRangeUpdated` sent from outside, so `send`
-/// takes it as a raw eth message.
+/// Sends `range`, published as `seq`, to `peer` through `send` if it is an eth/69 session not
+/// yet sent this publication or a later one, and returns whether it sent. Check, send and
+/// record happen under the sessions lock, so a range read before a newer one was sent cannot
+/// follow it. reth only refreshes a live session's range every 384 s, and drops a typed
+/// `PeerMessage::BlockRangeUpdated` sent from outside, so `send` takes it as a raw eth message.
 fn offer_range(
     sessions: &watch::Sender<Sessions>,
     peer: PeerKey,
-    (update, message): &(BlockRangeUpdate, RawCapabilityMessage),
+    seq: u64,
+    (_, message): &(BlockRangeUpdate, RawCapabilityMessage),
     send: impl FnOnce(PeerId, &RawCapabilityMessage),
-) {
+) -> bool {
+    let mut sent = false;
     sessions.send_if_modified(|sessions| {
         if let Some(session) = sessions.get_mut(&peer)
             && session.eth >= ETH_69
-            && session.range_sent.is_none_or(|sent| update.latest > sent)
+            && session.range_sent.is_none_or(|last| seq > last)
         {
             send(peer.0, message);
-            session.range_sent = Some(update.latest);
-            debug!(target: "chibi::devp2p", peer = %peer.0, head = update.latest, "sent block range");
+            session.range_sent = Some(seq);
+            sent = true;
         }
         false
     });
+    sent
 }
 
 fn net_error(err: &RequestError, capability: &'static str) -> NetError {
@@ -768,7 +779,7 @@ async fn track_sessions(
     events: impl futures::Stream<Item = NetworkEvent>,
     handle: NetworkHandle,
     sessions: Arc<watch::Sender<Sessions>>,
-    served: watch::Receiver<Option<Arc<Store>>>,
+    served: watch::Receiver<Option<(u64, Arc<Store>)>>,
 ) {
     let mut events = std::pin::pin!(events);
     while let Some(event) = events.next().await {
@@ -788,16 +799,16 @@ async fn track_sessions(
                 sessions.send_modify(|sessions| {
                     sessions.insert(PeerKey(peer), session);
                 });
-                let store = served.borrow().clone();
-                if let Some(store) = store {
-                    offer_range(
-                        &sessions,
-                        PeerKey(peer),
-                        &block_range(store.anchor()),
-                        |peer, message| {
+                let latest = served.borrow().clone();
+                if let Some((seq, store)) = latest {
+                    let range = block_range(store.anchor());
+                    let sent =
+                        offer_range(&sessions, PeerKey(peer), seq, &range, |peer, message| {
                             handle.send_eth_message(peer, PeerMessage::Other(message.clone()));
-                        },
-                    );
+                        });
+                    if sent {
+                        debug!(target: "chibi::devp2p", %peer, head = range.0.latest, "sent block range");
+                    }
                 }
             }
             NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
@@ -834,10 +845,10 @@ async fn dialable(handle: &NetworkHandle, peer: PeerId) -> Option<NodeRecord> {
 
 async fn answer_inbound(
     mut requests: mpsc::Receiver<IncomingEthRequest>,
-    served: watch::Receiver<Option<Arc<Store>>>,
+    served: watch::Receiver<Option<(u64, Arc<Store>)>>,
 ) {
     while let Some(request) = requests.recv().await {
-        let store = served.borrow().clone();
+        let store = served.borrow().as_ref().map(|(_, store)| Arc::clone(store));
         answer(request, store.as_deref());
     }
 }
@@ -953,7 +964,7 @@ fn empty_snap(request: &SnapProtocolMessage) -> SnapResponse {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{B128, B512, b256};
+    use alloy_primitives::{B128, B512, BlockNumber, b256};
     use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World};
     use reth_eth_wire_types::{
         EthMessage, EthNetworkPrimitives, GetBlockAccessLists, GetBlockBodies, GetCells,
@@ -1143,17 +1154,32 @@ mod tests {
     #[test]
     fn a_session_is_sent_each_later_publication_once() {
         let sessions = snap_sessions(&[A]);
-        assert_eq!(offer(&sessions, A, 1, 105, 1), [(105, B256::repeat_byte(1))]);
+        assert_eq!(
+            offer(&sessions, A, 1, 105, 1),
+            [(105, B256::repeat_byte(1))]
+        );
         assert_eq!(offer(&sessions, A, 1, 105, 1), []);
-        assert_eq!(offer(&sessions, A, 2, 106, 2), [(106, B256::repeat_byte(2))]);
+        assert_eq!(
+            offer(&sessions, A, 2, 106, 2),
+            [(106, B256::repeat_byte(2))]
+        );
     }
 
     #[test]
     fn a_reorged_head_at_the_same_or_a_lower_height_is_sent() {
         let sessions = snap_sessions(&[A]);
-        assert_eq!(offer(&sessions, A, 1, 105, 1), [(105, B256::repeat_byte(1))]);
-        assert_eq!(offer(&sessions, A, 2, 105, 2), [(105, B256::repeat_byte(2))]);
-        assert_eq!(offer(&sessions, A, 3, 104, 3), [(104, B256::repeat_byte(3))]);
+        assert_eq!(
+            offer(&sessions, A, 1, 105, 1),
+            [(105, B256::repeat_byte(1))]
+        );
+        assert_eq!(
+            offer(&sessions, A, 2, 105, 2),
+            [(105, B256::repeat_byte(2))]
+        );
+        assert_eq!(
+            offer(&sessions, A, 3, 104, 3),
+            [(104, B256::repeat_byte(3))]
+        );
     }
 
     #[test]
