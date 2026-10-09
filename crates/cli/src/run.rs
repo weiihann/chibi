@@ -14,13 +14,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chibi_core::state::Key;
-use chibi_node::{Disk, Health, Network, Node, NodeConfig};
+use chibi_node::{Disk, Health, Network, Node, NodeConfig, Startup};
 use clap::Args;
 use eyre::{WrapErr, bail};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -53,6 +54,13 @@ const FOUND_STATE_PEER: &str = concat!(
     "  > ^ <\n",
     " (\")_(\")\n",
 );
+
+/// What `Node::start` reports before its first wakeup.
+pub const STARTING: Startup = Startup::Waiting {
+    peers: 0,
+    state_peers: 0,
+    elapsed: Duration::ZERO,
+};
 
 /// `chibi run` flags.
 #[derive(Debug, Default, Args)]
@@ -166,14 +174,10 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
         "starting"
     );
     let data_dir = node_config.data_dir.clone();
+    let progress = watch::Sender::new(STARTING);
+    tokio::spawn(greet_state_peer(progress.subscribe()));
     let (node, follower) = tokio::select! {
-        started = Node::start(node_config, || {
-            tokio::task::spawn_blocking(|| {
-                if let Err(err) = found_state_peer(&mut io::stdout().lock()) {
-                    warn!(%err, "cannot print to stdout");
-                }
-            });
-        }) => started?,
+        started = Node::start(node_config, progress) => started?,
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
             return Ok(());
@@ -212,6 +216,20 @@ async fn report(node: Node) -> Infallible {
         let health = node.health();
         log_status(&health, &previous);
         previous = health.unheld_pinned.into_iter().collect();
+    }
+}
+
+/// Prints the cat that greets the first state peer, off the startup path.
+async fn greet_state_peer(mut progress: watch::Receiver<Startup>) {
+    let found = progress
+        .wait_for(|startup| !matches!(startup, Startup::Waiting { .. }))
+        .await;
+    if found.is_ok() {
+        tokio::task::spawn_blocking(|| {
+            if let Err(err) = found_state_peer(&mut io::stdout().lock()) {
+                warn!(%err, "cannot print to stdout");
+            }
+        });
     }
 }
 

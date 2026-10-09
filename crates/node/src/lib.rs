@@ -22,7 +22,7 @@ pub use heads::{Heads, HeadsSender};
 pub use network::{Network, NetworkSpec, Token};
 pub use node::{
     BlockSel, ContractSnapshot, FeeHistory, Follower, Health, Held, Holding, Node, NodeConfig,
-    NodeError, Snapshot, Status, Stepped, SubmittedTx, TrackedContract, TxReceipt, Watchlist,
-    read_snapshot,
+    NodeError, Snapshot, Startup, Status, Stepped, SubmittedTx, TrackedContract, TxReceipt,
+    Watchlist, read_snapshot,
 };
 pub use peers::{Census, NetError, PeerKey, Peers, Reply};

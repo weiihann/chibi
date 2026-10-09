@@ -28,12 +28,12 @@ use futures::{StreamExt as _, future};
 use parking_lot::Mutex;
 use reth_chainspec::EthChainSpec as _;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
-use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig};
+use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, Sessions};
 use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
 use crate::follow::Search;
@@ -79,8 +79,11 @@ const HELIOS_CHECKPOINT: &str = "checkpoint";
 /// The length of a checkpoint helios can load; any other file makes it use its shipped default.
 const CHECKPOINT_BYTES: u64 = 32;
 
-/// How often `start` reports that it is still waiting for a state peer.
-const STATE_PEER_PROGRESS: Duration = Duration::from_secs(30);
+/// How often `start` logs that it is still waiting for a state peer.
+const STATE_PEER_LOG: Duration = Duration::from_secs(30);
+
+/// Longest gap between two [`Startup::Waiting`] reports.
+const STATE_PEER_PROGRESS: Duration = Duration::from_secs(1);
 
 /// Fewest head moves between two saves of learned keys whose membership changed.
 const KEYS_SAVE_HEADS: u64 = 5;
@@ -160,6 +163,25 @@ pub enum BlockSel {
     Number(BlockNumber),
     /// A block by hash, with the same limits as [`BlockSel::Number`].
     Hash(B256),
+}
+
+/// How far `Node::start` has come, reported on the channel it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Startup {
+    /// Waiting for the first state peer, reported on every session change and at least once
+    /// a second.
+    Waiting {
+        /// Connected devp2p sessions.
+        peers: usize,
+        /// Connected state peers: sessions that negotiated snap/2.
+        state_peers: usize,
+        /// Time since the wait began.
+        elapsed: Duration,
+    },
+    /// The first state peer connected; anchoring follows.
+    FoundStatePeer,
+    /// Anchored: `start` is about to return.
+    Serving,
 }
 
 /// Handle to a running node. Cheap to clone; every clone shares one state.
@@ -367,10 +389,11 @@ impl Node<Devp2p> {
     /// Opens the data dir (taking its lock), starts the light client and devp2p, and returns
     /// once the state is anchored at a fresh verified head. Nothing is proven yet: the
     /// follower warms pinned and learned keys, and requests fetch what they miss.
-    /// `found_state_peer` runs once, when the first state peer connects, before anchoring.
+    /// `progress` reports the wait for the first state peer, then [`Startup::Serving`] once
+    /// anchored.
     pub async fn start(
         config: NodeConfig,
-        found_state_peer: impl FnOnce(),
+        progress: watch::Sender<Startup>,
     ) -> Result<(Self, Follower<Devp2p>), NodeError> {
         let spec = config.network.spec();
         let disk = Disk::open(&config.data_dir)?;
@@ -403,39 +426,58 @@ impl Node<Devp2p> {
         let net =
             Devp2p::start(&spec, secret_key, &config.net, HeadHint::Attested(trusted)).await?;
         net.add_peers(&known_peers);
-        wait_for_state_peer(&net, known_peers.len() + config.net.trusted_peers.len()).await?;
-        found_state_peer();
+        wait_for_state_peer(
+            net.sessions(),
+            known_peers.len() + config.net.trusted_peers.len(),
+            &progress,
+        )
+        .await?;
 
         let (node, mut follower) = Node::with_parts(spec, net, heads, disk, &config.watch).await?;
         follower.beacon = Some(beacon);
+        progress.send_replace(Startup::Serving);
         Ok((node, follower))
     }
 }
 
 /// Waits until a state peer (snap/2) is connected, however long discovery takes, reporting
-/// progress.
-async fn wait_for_state_peer(net: &Devp2p, dialed: usize) -> Result<(), NodeError> {
-    let started = Instant::now();
-    let mut sessions = net.sessions();
+/// progress on `progress` and in the log.
+async fn wait_for_state_peer(
+    mut sessions: watch::Receiver<Sessions>,
+    dialed: usize,
+    progress: &watch::Sender<Startup>,
+) -> Result<(), NodeError> {
+    let started = tokio::time::Instant::now();
+    let mut logged: Option<tokio::time::Instant> = None;
     loop {
-        let census = net.census();
-        info!(
-            target: "chibi::node",
-            peers = census.peers,
-            state_peers = census.state_peers,
-            dialed,
-            elapsed_s = started.elapsed().as_secs(),
-            "waiting for a state peer (snap/2)",
-        );
-        let waited = tokio::time::timeout(
-            STATE_PEER_PROGRESS,
-            sessions.wait_for(|sessions| sessions.values().any(|session| session.snap)),
-        )
-        .await;
-        match waited {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(_)) => return Err(NodeError::Net(NetError::Stopped)),
-            Err(_) => {}
+        let (peers, state_peers) = {
+            let sessions = sessions.borrow_and_update();
+            let state_peers = sessions.values().filter(|session| session.snap).count();
+            (sessions.len(), state_peers)
+        };
+        if state_peers > 0 {
+            progress.send_replace(Startup::FoundStatePeer);
+            return Ok(());
+        }
+        let elapsed = started.elapsed();
+        if logged.is_none_or(|at| at.elapsed() >= STATE_PEER_LOG) {
+            info!(
+                target: "chibi::node",
+                peers,
+                state_peers,
+                dialed,
+                elapsed_s = elapsed.as_secs(),
+                "waiting for a state peer (snap/2)",
+            );
+            logged = Some(tokio::time::Instant::now());
+        }
+        progress.send_replace(Startup::Waiting {
+            peers,
+            state_peers,
+            elapsed,
+        });
+        if let Ok(Err(_)) = tokio::time::timeout(STATE_PEER_PROGRESS, sessions.changed()).await {
+            return Err(NodeError::Net(NetError::Stopped));
         }
     }
 }
@@ -1578,9 +1620,8 @@ pub enum NodeError {
 mod tests {
     use super::*;
     use alloy_primitives::B512;
-    use tokio::sync::watch;
 
-    use crate::devp2p::{Session, Sessions};
+    use crate::devp2p::Session;
     use crate::peers::PeerKey;
 
     fn session(snap: bool) -> Session {

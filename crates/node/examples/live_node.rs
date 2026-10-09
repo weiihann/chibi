@@ -10,7 +10,8 @@ use std::error::Error;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use chibi_node::{NetConfig, Network, Node, NodeConfig, Watchlist};
+use chibi_node::{NetConfig, Network, Node, NodeConfig, Startup, Watchlist};
+use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -41,7 +42,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         net: NetConfig::default(),
     };
 
-    let (node, mut follower) = Node::start(config, || info!("found a state peer")).await?;
+    let progress = watch::Sender::new(Startup::Waiting {
+        peers: 0,
+        state_peers: 0,
+        elapsed: Duration::ZERO,
+    });
+    let mut seen = progress.subscribe();
+    tokio::spawn(async move {
+        while seen.changed().await.is_ok() {
+            if *seen.borrow_and_update() == Startup::FoundStatePeer {
+                info!("found a state peer");
+            }
+        }
+    });
+    let (node, mut follower) = Node::start(config, progress).await?;
     info!(status = ?node.status(), "started");
     for step in 1..=2 {
         tokio::time::sleep(SLOT).await;
