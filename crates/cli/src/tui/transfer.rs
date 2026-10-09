@@ -314,17 +314,18 @@ pub async fn send<P: Peers>(
 }
 
 /// Where the node has the sent transfer: its verified receipt, else whether a verified block
-/// includes it.
+/// includes it, else dropped when the node no longer knows it. `None` when the node cannot
+/// say.
 pub fn track<P: Peers>(node: &Node<P>, hash: TxHash) -> Option<Tracked> {
     if let Ok(Some(receipt)) = node.receipt(hash) {
         return Some(Tracked::Receipt {
             success: receipt.receipt.success(),
         });
     }
-    let submitted = node.transaction(hash).ok()??;
-    Some(match submitted.included {
-        Some(_) => Tracked::Included,
-        None => Tracked::Pending,
+    Some(match node.transaction(hash).ok()? {
+        Some(submitted) if submitted.included.is_some() => Tracked::Included,
+        Some(_) => Tracked::Pending,
+        None => Tracked::Dropped,
     })
 }
 
