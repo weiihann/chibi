@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, ConfigArgs, RpcHost, process_env};
 use crate::rpc::{self, RpcConfig};
-use crate::tui::{self, LogBuffer, transfer};
+use crate::tui::{self, LogBuffer, Wallet, transfer};
 
 /// The background chibi's log, in its data directory.
 pub const LOG_FILE: &str = "chibi.log";
@@ -125,13 +125,16 @@ pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
     Ok(config)
 }
 
-/// The keystore `--tui` sends from.
-pub fn tui_keystore(config: &Config) -> eyre::Result<&Path> {
-    config.keystore.as_deref().ok_or_else(|| {
-        eyre::eyre!(
-            "--tui needs a keystore: pass --keystore PATH, or set keystore in the config (`chibi init --keystore PATH` writes it)"
-        )
-    })
+/// Where `--tui` gets its key: the keystore the flag or the config names, which must be
+/// readable, else a wallet set up in the UI and saved beside the config file at `path`.
+pub fn tui_wallet(config: &Config, path: &Path) -> eyre::Result<Wallet> {
+    match &config.keystore {
+        Some(keystore) => {
+            transfer::check_readable(keystore)?;
+            Ok(Wallet::Keystore(keystore.clone()))
+        }
+        None => Ok(Wallet::Setup(path.to_owned())),
+    }
 }
 
 /// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`,
@@ -157,12 +160,8 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
     if args.background {
         return start_background(args, &config, &data_dir, config_flag);
     }
-    let keystore = match &logs {
-        Some(_) => {
-            let keystore = tui_keystore(&config)?;
-            transfer::check_readable(keystore)?;
-            Some(keystore.to_owned())
-        }
+    let wallet = match &logs {
+        Some(_) => Some(tui_wallet(&config, path)?),
         None => None,
     };
     let rpc_config = config.rpc()?;
@@ -174,9 +173,9 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
     };
     let node_config = config.node_config(data_dir);
     let runtime = tokio::runtime::Runtime::new()?;
-    let result = match (keystore, logs) {
-        (Some(keystore), Some(logs)) => {
-            tui::run(&runtime, node_config, served, &keystore, &logs, args.logs)
+    let result = match (wallet, logs) {
+        (Some(wallet), Some(logs)) => {
+            tui::run(&runtime, node_config, served, wallet, &logs, args.logs)
         }
         _ => runtime.block_on(async {
             let progress = watch::Sender::new(STARTING);

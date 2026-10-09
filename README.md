@@ -1,6 +1,6 @@
 # chibi
 
-chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. Point MetaMask or Rabby at it, and the balances, call results, and gas estimates the wallet shows come from state chibi proved itself, not from an RPC provider. Over JSON-RPC chibi holds no keys. The wallet signs, and chibi simulates, broadcasts, and confirms. The one exception is the optional terminal UI, [`chibi run --tui`](#send-from-the-terminal-chibi-run---tui), which unlocks a keystore you name and sends from it.
+chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. Point MetaMask or Rabby at it, and the balances, call results, and gas estimates the wallet shows come from state chibi proved itself, not from an RPC provider. Over JSON-RPC chibi holds no keys. The wallet signs, and chibi simulates, broadcasts, and confirms. The one exception is the optional terminal UI, [`chibi run --tui`](#send-from-the-terminal-chibi-run---tui), which unlocks your keystore, or helps you create or import one, and sends from it.
 
 chibi is early software. It targets Sepolia first. Mainnet support exists in the code but is untested.
 
@@ -100,9 +100,17 @@ The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 da
 
 ## Send from the terminal (`chibi run --tui`)
 
-`chibi run --tui` runs chibi in a terminal UI that sends ETH or a token from the [token list](#token-list) from your own keystore, while JSON-RPC keeps serving your wallet as `chibi run` does. It is the only mode in which chibi holds a key: the keystore is decrypted into memory when you type its password, and the key is never logged or written anywhere.
+`chibi run --tui` runs chibi in a terminal UI that sends ETH or a token from the [token list](#token-list) from your own keystore, while JSON-RPC keeps serving your wallet as `chibi run` does. It is the only mode in which chibi holds a key: the keystore is decrypted into memory when you type its password, and the key is never logged, and never written except encrypted into a keystore by the setup below.
 
-Set up a keystore once, for example with Foundry's `cast`, which asks for the private key and a password:
+The first time you run `chibi run --tui` without a keystore (no `--keystore`, no `keystore` in the config), it walks you through setting one up. Up and Down choose, Enter selects, Esc goes back, and Esc on the menu quits:
+
+- **Create a new wallet.** chibi shows a new 12-word recovery phrase, numbered. Write it down: anyone with these words controls the wallet, and chibi will not show them again. Then type the two words it asks for, by position, to show you have them. The phrase is standard BIP-39 English and its first account (`m/44'/60'/0'/0/0`), so it also imports into MetaMask or any other wallet as the same address.
+- **Import a private key or recovery phrase.** Type or paste 64 hex digits (with or without `0x`) for a private key, or a 12 or 24 word recovery phrase, whose first account is used. The input is masked.
+- **Use an existing keystore file.** Type its path (absolute, or starting with `~/`), then its password.
+
+Creating and importing then ask for a password twice (at least 8 characters) and encrypt the key with it into `keystores/<address>.json` next to the config file in use: `~/.config/chibi/keystores/` by default (`$XDG_CONFIG_HOME/chibi/keystores/` when that is set), or beside the file `--config` or `CHIBI_CONFIG` names. The directory is readable only by you (0700) and the file too (0600). A keystore already there for the same address is never overwritten: chibi says so and asks for that keystore's password instead. chibi then records the keystore as `keystore` in that config file, keeping everything else in it, or writes a config with the defaults and `keystore` if there is none, so later runs go straight to the password. The new key stays unlocked, so the UI goes on to wait for a state peer without asking for the password again.
+
+You can also bring a keystore made elsewhere, for example with Foundry's `cast`, which asks for the private key and a password:
 
 ```sh
 cast wallet import chibi --interactive          # writes ~/.foundry/keystores/chibi
@@ -114,7 +122,7 @@ The keystore is an encrypted JSON keystore (Web3 Secret Storage, as `cast wallet
 
 | Flag | Meaning |
 |---|---|
-| `--keystore PATH` | The keystore to send from, instead of the config's `keystore`. `--tui` without either is an error |
+| `--keystore PATH` | The keystore to send from, instead of the config's `keystore`. Without either, the UI opens the setup above |
 | `--logs` | Start with the log pane open |
 
 `--tui` cannot run in the background (`-b`). A keystore that is missing or unreadable stops chibi before anything starts, naming the path. A wrong password asks again.
@@ -131,7 +139,7 @@ Enter checks every field and shows each problem beside its field, keeping what y
 
 Sending works only while a state peer is connected: without one, a sleepy cat says `waiting for a state peer`, Review and sending are disabled, and the form comes back as it was when one returns. chibi checks again just before signing and refuses with the same message if the last state peer has gone. Sending is Sepolia only for now: on mainnet the form shows your balances, and Review says `sending on mainnet is not enabled yet`.
 
-Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (the last lines of chibi's log, which goes there instead of the terminal), `q` or Ctrl-C quits and stops chibi as Ctrl-C does in `chibi run`. Quitting with a transfer still pending warns first; the transfer stays in chibi's outbox, which broadcasts it again on the next run. The password is at most 256 bytes, and its buffer is wiped once the keystore is decrypted and when you quit.
+Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (the last lines of chibi's log, which goes there instead of the terminal), `q` or Ctrl-C quits and stops chibi as Ctrl-C does in `chibi run`. Quitting with a transfer still pending warns first; the transfer stays in chibi's outbox, which broadcasts it again on the next run. Passwords are at most 256 bytes, and a pasted secret at most 256; their buffers are wiped once used and when you quit.
 
 ## Configuration
 
@@ -149,7 +157,7 @@ Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (th
 | `allowed_hosts` | `localhost`, `127.0.0.1`, `[::1]` | Accepted `Host` headers, which blocks DNS rebinding |
 | `p2p_port` | `0` (OS picks) | devp2p listen port |
 | `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
-| `keystore` | none | Absolute path of the encrypted JSON keystore `chibi run --tui` sends from |
+| `keystore` | none | Absolute path of the encrypted JSON keystore `chibi run --tui` sends from; the TUI's setup writes it |
 | `contracts` | none | Contract accounts and storage slots to pin, see below |
 
 The peer keys are under [Peers](#peers).

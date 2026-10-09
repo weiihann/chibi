@@ -1,6 +1,7 @@
 //! The TUI's screens as a state machine: keys, start-up progress, peer counts and node
 //! results in; what the event loop should do out. No terminal and no network here.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, TxHash, U256};
@@ -11,6 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::config::{AddressError, parse_address};
 use crate::format_units;
 use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
+use crate::tui::wallet::{self, SECRET_BYTES, Secret};
 
 /// Heads a sent transfer may stay pending before the screen says it is still pending.
 pub const STILL_PENDING_HEADS: u64 = 10;
@@ -27,9 +29,27 @@ pub const PASSWORD_BYTES: usize = 256;
 /// The shortest time the Excited screen stays up, so a fast anchor still shows it.
 pub const EXCITED_FOR: Duration = Duration::from_millis(1500);
 
+/// The fewest characters a new keystore's password may have.
+pub const PASSWORD_MIN_CHARS: usize = 8;
+
+/// Shown with the new recovery phrase.
+pub const BACKUP_WARNING: &str = "write these words down. anyone with them controls this wallet. chibi will not show them again.";
+
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
+    /// No keystore is named: create, import, or point at one.
+    Menu,
+    /// The new recovery phrase, shown once.
+    Backup,
+    /// Two words of the new phrase asked back.
+    Confirm,
+    /// A private key or recovery phrase to import.
+    Import,
+    /// The path of an existing keystore file.
+    Existing,
+    /// The new keystore's password, typed twice.
+    Password,
     /// The keystore password prompt, before the node starts.
     Unlock,
     /// Waiting for the first state peer.
@@ -44,6 +64,21 @@ pub enum Screen {
     Review,
     /// A signed transfer, tracked until its receipt is verified.
     Sending,
+}
+
+impl Screen {
+    /// Whether this is a step of setting up a wallet.
+    pub const fn is_setup(self) -> bool {
+        matches!(
+            self,
+            Self::Menu
+                | Self::Backup
+                | Self::Confirm
+                | Self::Import
+                | Self::Existing
+                | Self::Password
+        )
+    }
 }
 
 /// A form field.
@@ -62,6 +97,10 @@ pub enum Field {
 pub enum Action {
     /// Decrypt the keystore with [`App::take_password`].
     Unlock,
+    /// Encrypt [`App::take_secret`] with [`App::take_password`] and save it.
+    Save,
+    /// Unlock the keystore at this path from now on.
+    Open(PathBuf),
     /// Sign and submit this transfer.
     Send(Draft, Fee),
     /// Shut the node down and leave.
@@ -206,6 +245,102 @@ impl Sending {
     }
 }
 
+/// A way to get the wallet, on the setup menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// A new recovery phrase.
+    Create,
+    /// A private key or recovery phrase the user has.
+    Import,
+    /// A keystore file the user has.
+    Existing,
+}
+
+impl Choice {
+    /// The menu, top to bottom.
+    pub const ALL: [Self; 3] = [Self::Create, Self::Import, Self::Existing];
+
+    /// The menu line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Create => "create a new wallet",
+            Self::Import => "import a private key or recovery phrase",
+            Self::Existing => "use an existing keystore file",
+        }
+    }
+}
+
+/// Which of the new password's two fields takes the keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// The password, typed into [`App::password`].
+    First,
+    /// The same again, typed into [`Setup::again`].
+    Again,
+}
+
+/// The wallet being set up when no keystore is named.
+///
+/// Not `Debug`: it holds the phrase, the key and the password being typed. Every buffer of
+/// them is zeroizing, and those typed into are allocated once at a fixed capacity.
+pub struct Setup {
+    /// The highlighted menu line.
+    pub choice: Choice,
+    /// The home directory `~/` stands for in a keystore path.
+    pub home: Option<PathBuf>,
+    /// The new recovery phrase, from Backup until it is confirmed or discarded.
+    pub phrase: Option<Zeroizing<String>>,
+    /// The two 0-based word positions Confirm asks for.
+    pub asked: [usize; 2],
+    /// Which of them is being asked.
+    pub asking: usize,
+    /// A confirmation word or the secret to import, in a buffer of [`SECRET_BYTES`].
+    pub input: Zeroizing<String>,
+    /// The existing keystore's path as typed.
+    pub path: String,
+    /// The new password typed again, in a buffer of [`PASSWORD_BYTES`].
+    pub again: Zeroizing<String>,
+    /// The password field taking the keys.
+    pub entry: Entry,
+    /// Why the last step was refused.
+    pub error: Option<String>,
+    /// Whether the keystore is being encrypted and saved.
+    pub saving: bool,
+    secret: Option<Secret>,
+}
+
+impl Setup {
+    fn new() -> Self {
+        Self {
+            choice: Choice::Create,
+            home: None,
+            phrase: None,
+            asked: [0, 1],
+            asking: 0,
+            input: Zeroizing::new(String::with_capacity(SECRET_BYTES)),
+            path: String::new(),
+            again: Zeroizing::new(String::with_capacity(PASSWORD_BYTES)),
+            entry: Entry::First,
+            error: None,
+            saving: false,
+            secret: None,
+        }
+    }
+
+    /// Drops the phrase and the secret and wipes the buffers, keeping the menu line.
+    fn discard(&mut self) {
+        self.phrase = None;
+        self.secret = None;
+        self.input.zeroize();
+        self.again.zeroize();
+        self.path.clear();
+        self.asking = 0;
+        self.entry = Entry::First;
+        self.error = None;
+        self.saving = false;
+    }
+}
+
 /// The whole TUI state.
 ///
 /// Not `Debug`: it holds the password being typed.
@@ -254,6 +389,8 @@ pub struct App {
     pub sending: Option<Sending>,
     /// A one-line message under the screen.
     pub notice: Option<String>,
+    /// The wallet being set up.
+    pub setup: Setup,
     quit_armed: bool,
     balances_asked: Option<(u64, usize)>,
     refreshing: bool,
@@ -287,6 +424,7 @@ impl App {
             sending: None,
             notice: None,
             quit_armed: false,
+            setup: Setup::new(),
             balances_asked: None,
             refreshing: false,
             excited_since: None,
@@ -308,10 +446,52 @@ impl App {
             Ok(address) => {
                 self.sender = Some(address);
                 self.unlock_error = None;
+                self.notice = None;
                 self.screen = Screen::Waiting;
             }
             Err(reason) => self.unlock_error = Some(format!("{reason}, try again")),
         }
+    }
+
+    /// Opens the setup menu, for a run that names no keystore. `home` is what `~/` stands
+    /// for in a keystore path.
+    pub fn setup(&mut self, home: Option<PathBuf>) {
+        self.setup.home = home;
+        self.screen = Screen::Menu;
+    }
+
+    /// The wallet was encrypted to a new keystore at `path` and is unlocked as `address`.
+    pub fn saved(&mut self, address: Address, path: &Path) {
+        self.setup.discard();
+        self.unlocked(Ok(address));
+        self.notice = Some(format!(
+            "saved the keystore for {} to {}",
+            address.to_checksum(None),
+            path.display()
+        ));
+    }
+
+    /// A keystore for `address` was already at `path`: it is kept, and unlocked as any other.
+    pub fn kept(&mut self, address: Address, path: &Path) {
+        self.setup.discard();
+        self.screen = Screen::Unlock;
+        self.notice = Some(format!(
+            "a keystore for {} is already at {} and was not overwritten; enter its password",
+            address.to_checksum(None),
+            path.display()
+        ));
+    }
+
+    /// The wallet could not be saved; setup starts over from the menu.
+    pub fn save_failed(&mut self, reason: &str) {
+        self.setup.discard();
+        self.setup.error = Some(format!("cannot save the keystore: {reason}"));
+        self.screen = Screen::Menu;
+    }
+
+    /// The confirmed phrase or imported key, to save while [`Setup::saving`].
+    pub fn take_secret(&mut self) -> Option<Secret> {
+        self.setup.secret.take()
     }
 
     /// The node's start-up progress, observed at `now`.
@@ -381,7 +561,13 @@ impl App {
                 self.screen = Screen::Paused;
             }
             Screen::Ready | Screen::Paused => self.screen = self.form_screen(),
-            Screen::Unlock
+            Screen::Menu
+            | Screen::Backup
+            | Screen::Confirm
+            | Screen::Import
+            | Screen::Existing
+            | Screen::Password
+            | Screen::Unlock
             | Screen::Waiting
             | Screen::Excited
             | Screen::Review
@@ -567,6 +753,9 @@ impl App {
         if self.screen == Screen::Unlock {
             return self.unlock_key(key, ctrl_c);
         }
+        if self.screen.is_setup() {
+            return self.setup_key(key, ctrl_c);
+        }
         if ctrl_c || key == Some(Key::Char('q')) {
             return self.quit();
         }
@@ -586,7 +775,16 @@ impl App {
                 self.sending_key(key);
                 None
             }
-            Screen::Unlock | Screen::Waiting | Screen::Excited | Screen::Paused => None,
+            Screen::Menu
+            | Screen::Backup
+            | Screen::Confirm
+            | Screen::Import
+            | Screen::Existing
+            | Screen::Password
+            | Screen::Unlock
+            | Screen::Waiting
+            | Screen::Excited
+            | Screen::Paused => None,
         }
     }
 
@@ -608,6 +806,196 @@ impl App {
                 return Some(Action::Unlock);
             }
             Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {
+            }
+        }
+        None
+    }
+
+    fn setup_key(&mut self, key: Option<Key>, ctrl_c: bool) -> Option<Action> {
+        if ctrl_c || self.screen == Screen::Menu && key == Some(Key::Esc) {
+            self.setup.discard();
+            self.password.zeroize();
+            return Some(Action::Quit);
+        }
+        if self.setup.saving {
+            return None;
+        }
+        let key = key?;
+        if key == Key::Esc {
+            self.setup.discard();
+            self.password.zeroize();
+            self.screen = Screen::Menu;
+            return None;
+        }
+        match self.screen {
+            Screen::Menu => self.menu_key(key),
+            Screen::Backup if key == Key::Enter => {
+                self.setup.asked = wallet::positions();
+                self.setup.asking = 0;
+                self.screen = Screen::Confirm;
+            }
+            Screen::Confirm => self.confirm_key(key),
+            Screen::Import => self.import_key(key),
+            Screen::Existing => return self.existing_key(key),
+            Screen::Password => return self.password_key(key),
+            Screen::Backup
+            | Screen::Unlock
+            | Screen::Waiting
+            | Screen::Excited
+            | Screen::Ready
+            | Screen::Paused
+            | Screen::Review
+            | Screen::Sending => {}
+        }
+        None
+    }
+
+    fn menu_key(&mut self, key: Key) {
+        let choices = Choice::ALL;
+        let at = choices
+            .iter()
+            .position(|choice| *choice == self.setup.choice)
+            .unwrap_or_default();
+        match key {
+            Key::Down => self.setup.choice = choices[(at + 1) % choices.len()],
+            Key::Up => self.setup.choice = choices[(at + choices.len() - 1) % choices.len()],
+            Key::Enter => {
+                self.setup.error = None;
+                self.screen = match self.setup.choice {
+                    Choice::Create => {
+                        self.setup.phrase = Some(wallet::generate());
+                        Screen::Backup
+                    }
+                    Choice::Import => Screen::Import,
+                    Choice::Existing => Screen::Existing,
+                };
+            }
+            Key::Char(_) | Key::Backspace | Key::Esc | Key::Left | Key::Right => {}
+        }
+    }
+
+    fn confirm_key(&mut self, key: Key) {
+        if key != Key::Enter {
+            type_into(&mut self.setup.input, key, SECRET_BYTES);
+            return;
+        }
+        let at = self.setup.asked[self.setup.asking];
+        let right = self
+            .setup
+            .phrase
+            .as_ref()
+            .and_then(|phrase| phrase.split(' ').nth(at))
+            .is_some_and(|word| word.eq_ignore_ascii_case(self.setup.input.trim()));
+        self.setup.input.zeroize();
+        if !right {
+            self.setup.error = Some(format!(
+                "that is not word {}; check what you wrote down",
+                at + 1
+            ));
+            return;
+        }
+        self.setup.error = None;
+        if self.setup.asking == 0 {
+            self.setup.asking = 1;
+            return;
+        }
+        self.setup.secret = self.setup.phrase.take().map(Secret::Phrase);
+        self.password_screen();
+    }
+
+    fn import_key(&mut self, key: Key) {
+        if key != Key::Enter {
+            type_into(&mut self.setup.input, key, SECRET_BYTES);
+            return;
+        }
+        let parsed = wallet::parse(&self.setup.input);
+        self.setup.input.zeroize();
+        match parsed {
+            Ok(secret) => {
+                self.setup.secret = Some(secret);
+                self.password_screen();
+            }
+            Err(err) => self.setup.error = Some(err.to_string()),
+        }
+    }
+
+    fn existing_key(&mut self, key: Key) -> Option<Action> {
+        match key {
+            Key::Char(c) => self.setup.path.push(c),
+            Key::Backspace => {
+                self.setup.path.pop();
+            }
+            Key::Enter => match self.keystore_path() {
+                Ok(path) => {
+                    self.setup.discard();
+                    self.screen = Screen::Unlock;
+                    return Some(Action::Open(path));
+                }
+                Err(reason) => self.setup.error = Some(reason),
+            },
+            Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+        }
+        None
+    }
+
+    /// The typed keystore path, absolute or under `~/`, if a file is there.
+    fn keystore_path(&self) -> Result<PathBuf, String> {
+        let text = self.setup.path.trim();
+        if text.is_empty() {
+            return Err("enter the keystore's path".to_owned());
+        }
+        let path = match (text.strip_prefix("~/"), &self.setup.home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(text),
+        };
+        if !path.is_absolute() {
+            return Err("enter an absolute path, or one starting with ~/".to_owned());
+        }
+        if !path.is_file() {
+            return Err(format!("no file at {}", path.display()));
+        }
+        Ok(path)
+    }
+
+    fn password_screen(&mut self) {
+        self.setup.error = None;
+        self.setup.entry = Entry::First;
+        self.screen = Screen::Password;
+    }
+
+    fn password_key(&mut self, key: Key) -> Option<Action> {
+        if key != Key::Enter {
+            let field = match self.setup.entry {
+                Entry::First => &mut self.password,
+                Entry::Again => &mut self.setup.again,
+            };
+            type_into(field, key, PASSWORD_BYTES);
+            return None;
+        }
+        match self.setup.entry {
+            Entry::First if self.password.chars().count() < PASSWORD_MIN_CHARS => {
+                self.password.zeroize();
+                self.setup.error = Some(format!(
+                    "a password needs at least {PASSWORD_MIN_CHARS} characters"
+                ));
+            }
+            Entry::First => {
+                self.setup.error = None;
+                self.setup.entry = Entry::Again;
+            }
+            Entry::Again => {
+                let same = self.password.as_str() == self.setup.again.as_str();
+                self.setup.again.zeroize();
+                self.setup.entry = Entry::First;
+                if !same {
+                    self.password.zeroize();
+                    self.setup.error =
+                        Some("the passwords do not match; enter them again".to_owned());
+                    return None;
+                }
+                self.setup.error = None;
+                self.setup.saving = true;
+                return Some(Action::Save);
             }
         }
         None
@@ -896,6 +1284,15 @@ pub fn show(amount: U256, asset: Asset) -> String {
         format_units(amount, asset.decimals()),
         asset.symbol()
     )
+}
+
+/// Types `key` into `buffer`, refusing characters that would grow it past `capacity`.
+fn type_into(buffer: &mut String, key: Key, capacity: usize) {
+    match key {
+        Key::Char(c) if buffer.len() + c.len_utf8() <= capacity => buffer.push(c),
+        Key::Backspace => erase_last(buffer),
+        Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+    }
 }
 
 /// Removes the last character and overwrites its bytes, which would otherwise stay in the

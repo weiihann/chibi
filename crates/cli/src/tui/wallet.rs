@@ -1,3 +1,256 @@
+//! The wallet the TUI's setup makes: a new recovery phrase, an imported private key or
+//! phrase, and the encrypted keystore it saves beside the config.
+
+use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use alloy_primitives::{Address, hex};
+use alloy_signer_local::coins_bip39::{English, Mnemonic, MnemonicError, Wordlist};
+use alloy_signer_local::{LocalSignerError, MnemonicBuilder, PrivateKeySigner};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::config::{Config, ConfigError};
+
+/// The longest secret accepted at import, in bytes: its buffer's fixed capacity, room for
+/// 24 words of up to 8 letters.
+pub const SECRET_BYTES: usize = 256;
+
+/// Words in a generated recovery phrase.
+pub const PHRASE_WORDS: usize = 12;
+
+/// What the wallet's key is made from. Not `Debug`: it is the key.
+pub enum Secret {
+    /// A BIP-39 English recovery phrase, single-spaced and lowercase; its first account
+    /// m/44'/60'/0'/0/0 is the key.
+    Phrase(Zeroizing<String>),
+    /// A secp256k1 private key.
+    Key(Zeroizing<[u8; 32]>),
+}
+
+/// Why imported text is not a secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SecretError {
+    /// Neither a key nor a phrase.
+    #[error("expected a private key (64 hex digits) or a recovery phrase (12 or 24 words)")]
+    Unrecognized,
+    /// Words, but not 12 or 24 of them.
+    #[error("a recovery phrase has 12 or 24 words; this has {0}")]
+    WordCount(usize),
+    /// The word at this 1-based position is not in the word list.
+    #[error("word {0} is not in the English BIP-39 word list")]
+    Word(usize),
+    /// Every word is in the list, but the last does not carry the others' checksum.
+    #[error("the recovery phrase's checksum does not match; check the words and their order")]
+    Checksum,
+    /// 64 hex digits that are zero or not below the curve order.
+    #[error("this is not a valid private key")]
+    Key,
+}
+
+/// A new 12-word English recovery phrase from 16 bytes of the thread's CSPRNG.
+pub fn generate() -> Zeroizing<String> {
+    Zeroizing::new(Mnemonic::<English>::new(&mut rand::thread_rng()).to_phrase())
+}
+
+/// Two distinct positions of a [`PHRASE_WORDS`]-word phrase, 0-based, to ask back.
+pub fn positions() -> [usize; 2] {
+    let picked = rand::seq::index::sample(&mut rand::thread_rng(), PHRASE_WORDS, 2);
+    [picked.index(0), picked.index(1)]
+}
+
+/// One token of 64 hex digits, with or without `0x`, is a private key; 12 or 24 words are a
+/// recovery phrase, checked against the word list and its checksum.
+pub fn parse(text: &str) -> Result<Secret, SecretError> {
+    let count = text.split_whitespace().count();
+    let words = text
+        .split_whitespace()
+        .all(|word| word.bytes().all(|b| b.is_ascii_alphabetic()));
+    match count {
+        1 => parse_key(text.trim()),
+        2.. if words => parse_phrase(text, count),
+        _ => Err(SecretError::Unrecognized),
+    }
+}
+
+fn parse_key(token: &str) -> Result<Secret, SecretError> {
+    let digits = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+        .unwrap_or(token);
+    let mut key = Zeroizing::new([0u8; 32]);
+    if digits.len() != 64 || hex::decode_to_slice(digits, key.as_mut_slice()).is_err() {
+        return Err(SecretError::Unrecognized);
+    }
+    PrivateKeySigner::from_slice(key.as_slice()).map_err(|_| SecretError::Key)?;
+    Ok(Secret::Key(key))
+}
+
+fn parse_phrase(text: &str, count: usize) -> Result<Secret, SecretError> {
+    if !matches!(count, 12 | 24) {
+        return Err(SecretError::WordCount(count));
+    }
+    let mut phrase = Zeroizing::new(String::with_capacity(SECRET_BYTES));
+    for (at, word) in text.split_whitespace().enumerate() {
+        if at > 0 {
+            phrase.push(' ');
+        }
+        let start = phrase.len();
+        phrase.extend(word.chars().map(|c| c.to_ascii_lowercase()));
+        if !English::get_all().contains(&&phrase[start..]) {
+            return Err(SecretError::Word(at + 1));
+        }
+    }
+    match Mnemonic::<English>::new_from_phrase(&phrase) {
+        Ok(_) => Ok(Secret::Phrase(phrase)),
+        Err(err) => {
+            if let MnemonicError::InvalidPhrase(mut echoed) = err {
+                echoed.zeroize();
+            }
+            Err(SecretError::Checksum)
+        }
+    }
+}
+
+/// The signer `secret` holds: the key itself, or the phrase's first account.
+pub fn signer(secret: &Secret) -> Result<PrivateKeySigner, LocalSignerError> {
+    match secret {
+        Secret::Key(key) => PrivateKeySigner::from_slice(key.as_slice()).map_err(Into::into),
+        Secret::Phrase(phrase) => MnemonicBuilder::<English>::default()
+            .phrase(phrase.as_str())
+            .build(),
+    }
+}
+
+/// Where a saved wallet's keystore is.
+pub enum Saved {
+    /// Newly encrypted to this path, with its decrypted signer.
+    Written(PrivateKeySigner, PathBuf),
+    /// A keystore for this address was already at this path and is kept as it was.
+    Exists(Address, PathBuf),
+}
+
+/// Why the wallet could not be saved.
+#[derive(Debug, thiserror::Error)]
+pub enum SaveError {
+    /// The secret gives no signer.
+    #[error("cannot derive the key: {0}")]
+    Derive(LocalSignerError),
+    /// A directory or file could not be made.
+    #[error("cannot write {}: {source}", path.display())]
+    Write {
+        /// What was being written.
+        path: PathBuf,
+        /// Why it failed.
+        source: io::Error,
+    },
+    /// The keystore could not be encrypted or written.
+    #[error("cannot encrypt the keystore: {0}")]
+    Encrypt(LocalSignerError),
+    /// The config file exists but is not TOML chibi can edit.
+    #[error("cannot add keystore to {}: {reason}", path.display())]
+    Config {
+        /// The config file.
+        path: PathBuf,
+        /// What was wrong.
+        reason: String,
+    },
+    /// The config could not be created.
+    #[error(transparent)]
+    Save(#[from] ConfigError),
+}
+
+/// Encrypts `secret`'s key with `password` into `keystores/<checksummed address>.json` beside
+/// the config file at `config` (directory 0700, file 0600), unless a keystore for the address
+/// is already there, then records it as the config's `keystore`.
+pub fn save(secret: &Secret, password: &str, config: &Path) -> Result<Saved, SaveError> {
+    let derived = signer(secret).map_err(SaveError::Derive)?;
+    let address = derived.address();
+    let dir = config
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .join("keystores");
+    let write_error = |path: &Path| {
+        let path = path.to_owned();
+        move |source| SaveError::Write { path, source }
+    };
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .and_then(|()| fs::set_permissions(&dir, Permissions::from_mode(0o700)))
+        .map_err(write_error(&dir))?;
+    let name = format!("{}.json", address.to_checksum(None));
+    let path = dir.join(&name);
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path);
+    let saved = match created {
+        Ok(file) => {
+            drop(file);
+            let key = Zeroizing::new(derived.to_bytes().0);
+            drop(derived);
+            let (signer, _) = PrivateKeySigner::encrypt_keystore(
+                &dir,
+                &mut rand::thread_rng(),
+                key.as_slice(),
+                password,
+                Some(&name),
+            )
+            .map_err(|err| {
+                let _ = fs::remove_file(&path);
+                SaveError::Encrypt(err)
+            })?;
+            Saved::Written(signer, path.clone())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            Saved::Exists(address, path.clone())
+        }
+        Err(err) => return Err(write_error(&path)(err)),
+    };
+    record(config, &path)?;
+    Ok(saved)
+}
+
+/// Sets `keystore` in the config file at `config`, keeping everything else in it, or creates
+/// it with the defaults and `keystore`.
+fn record(config: &Path, keystore: &Path) -> Result<(), SaveError> {
+    let text = match fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let created = Config {
+                keystore: Some(keystore.to_owned()),
+                ..Config::default()
+            };
+            return Ok(created.save(config)?);
+        }
+        Err(err) => {
+            return Err(SaveError::Write {
+                path: config.to_owned(),
+                source: err,
+            });
+        }
+    };
+    let invalid = |reason: String| SaveError::Config {
+        path: config.to_owned(),
+        reason,
+    };
+    let value = keystore
+        .to_str()
+        .ok_or_else(|| invalid(format!("{} is not UTF-8", keystore.display())))?;
+    let mut document: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|err: toml_edit::TomlError| invalid(err.to_string()))?;
+    document["keystore"] = toml_edit::value(value);
+    fs::write(config, document.to_string()).map_err(|source| SaveError::Write {
+        path: config.to_owned(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

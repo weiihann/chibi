@@ -9,7 +9,7 @@ pub mod wallet;
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ use tracing_subscriber::fmt::MakeWriter;
 use self::app::{Action, App, Balances};
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
+use self::wallet::Saved;
+use crate::config::process_env;
 use crate::run::{self, STARTING, Served};
 
 /// Log lines kept for the log pane.
@@ -237,18 +239,30 @@ enum Done {
     Sent(Result<TxHash, String>),
 }
 
-/// Unlocks the keystore, then runs the node under the UI until the user quits, a signal
-/// arrives, or the node stops.
+/// Where the key the TUI sends from comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wallet {
+    /// The keystore `--keystore` or the config names.
+    Keystore(PathBuf),
+    /// None is named: set one up, saving it beside the config file at this path.
+    Setup(PathBuf),
+}
+
+/// Unlocks or sets up the wallet, then runs the node under the UI until the user quits, a
+/// signal arrives, or the node stops.
 pub fn run(
     runtime: &Runtime,
     mut node_config: NodeConfig,
     served: Served,
-    keystore: &Path,
+    wallet: Wallet,
     logs: &LogBuffer,
     logs_open: bool,
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
-    let app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
+    let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
+    if matches!(wallet, Wallet::Setup(_)) {
+        app.setup(process_env("HOME").map(PathBuf::from));
+    }
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
     let (input_tx, input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
@@ -265,7 +279,7 @@ pub fn run(
         logs,
     };
     let result = runtime.block_on(async {
-        let Some(signer) = ui.unlock(keystore).await? else {
+        let Some(signer) = ui.wallet(wallet).await? else {
             return Ok(());
         };
         let address = signer.address();
@@ -362,8 +376,13 @@ impl Ui<'_> {
             .map_err(|_| eyre::eyre!("the terminal UI stopped drawing"))
     }
 
-    /// Asks for the password until the keystore decrypts. `None` when the user quits first.
-    async fn unlock(&mut self, keystore: &Path) -> eyre::Result<Option<PrivateKeySigner>> {
+    /// Unlocks the named keystore, or sets up a wallet, until a signer is ready. `None` when
+    /// the user quits first.
+    async fn wallet(&mut self, wallet: Wallet) -> eyre::Result<Option<PrivateKeySigner>> {
+        let (mut keystore, config) = match wallet {
+            Wallet::Keystore(path) => (Some(path), None),
+            Wallet::Setup(config) => (None, Some(config)),
+        };
         let shutdown = run::shutdown_signal();
         tokio::pin!(shutdown);
         loop {
@@ -381,8 +400,10 @@ impl Ui<'_> {
             };
             match self.app.key(key) {
                 Some(Action::Unlock) => {
+                    let Some(path) = keystore.clone() else {
+                        eyre::bail!("the TUI asked to unlock with no keystore");
+                    };
                     self.draw()?;
-                    let path = keystore.to_owned();
                     let password = self.app.take_password();
                     let (unlocked, password) = tokio::task::spawn_blocking(move || {
                         (transfer::unlock(&path, &password), password)
@@ -399,6 +420,31 @@ impl Ui<'_> {
                                 .unlocked(Err(UnlockError::WrongPassword.to_string()));
                         }
                         Err(err) => return Err(err.into()),
+                    }
+                }
+                Some(Action::Open(path)) => keystore = Some(path),
+                Some(Action::Save) => {
+                    let (Some(secret), Some(config)) = (self.app.take_secret(), config.clone())
+                    else {
+                        eyre::bail!("the TUI asked to save with no wallet to save");
+                    };
+                    self.draw()?;
+                    let password = self.app.take_password();
+                    let (saved, password) = tokio::task::spawn_blocking(move || {
+                        (wallet::save(&secret, &password, &config), password)
+                    })
+                    .await?;
+                    self.app.return_password(password);
+                    match saved {
+                        Ok(Saved::Written(signer, path)) => {
+                            self.app.saved(signer.address(), &path);
+                            return Ok(Some(signer));
+                        }
+                        Ok(Saved::Exists(address, path)) => {
+                            self.app.kept(address, &path);
+                            keystore = Some(path);
+                        }
+                        Err(err) => self.app.save_failed(&err.to_string()),
                     }
                 }
                 Some(Action::Quit) => return Ok(None),
@@ -471,7 +517,7 @@ impl Ui<'_> {
                                     });
                                 }
                             }
-                            Some(Action::Unlock) | None => {}
+                            Some(Action::Unlock | Action::Save | Action::Open(_)) | None => {}
                         }
                     }
                     Some(finished) = tasks.join_next() => match finished {
@@ -672,10 +718,12 @@ mod tests {
             input,
             logs: &logs,
         };
-        let unlocked =
-            tokio::time::timeout(Duration::from_secs(5), ui.unlock(Path::new("/nonexistent")))
-                .await
-                .expect("the prompt ends without input");
+        let unlocked = tokio::time::timeout(
+            Duration::from_secs(5),
+            ui.wallet(Wallet::Keystore(PathBuf::from("/nonexistent"))),
+        )
+        .await
+        .expect("the prompt ends without input");
         assert!(unlocked.is_err());
         drop(ui);
         let err = finish(renderer, || {}).unwrap_err();

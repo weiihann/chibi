@@ -1,6 +1,7 @@
 //! Turning the [`App`] into a [`View`] and drawing it with ratatui. Reads the state; changes
 //! nothing.
 
+use std::fmt::Write;
 use std::time::Duration;
 
 use alloy_primitives::U256;
@@ -10,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::app::{App, Field, PAUSED, Screen, SendState, show};
+use super::app::{App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, Screen, SendState, show};
 use super::transfer::{Asset, Fee};
 use crate::format_units;
 
@@ -19,6 +20,9 @@ pub const LOG_PANE_LINES: u16 = 10;
 
 /// The token row's hint while some pinned key is not held yet.
 const TOKENS_UNPROVEN: &str = "more tokens appear once their balances are proven";
+
+/// A backup row's bytes: three columns of a 2-digit number and a word padded to 10.
+const BACKUP_ROW_BYTES: usize = 3 * 16;
 
 /// The dozing cat while waiting for a state peer: it breathes, then peeks.
 const DOZING: [[&str; 4]; 3] = [
@@ -51,7 +55,8 @@ const HAPPY: [&str; 4] = ["  /\\_/\\", " ( ^.^ )  ~", "  > ^ <", " (\")_(\")"];
 const SAD: [&str; 4] = ["  /\\_/\\", " ( ;.; )", "  > ^ <", " (\")_(\")"];
 
 /// What the screen shows, built from the [`App`] on the control loop and drawn on the render
-/// thread. Holds no secret: the password is already masked.
+/// thread. Passwords and typed secrets are already masked; the one secret it can hold is the
+/// new recovery phrase on Backup, gone with the next view sent.
 #[derive(Clone, Debug, Default)]
 pub struct View {
     header: Line<'static>,
@@ -129,6 +134,12 @@ fn pick<T: Copy, const N: usize>(frames: &[T; N], tick: u64) -> T {
 fn body_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     match app.screen {
+        Screen::Menu => menu(app, &mut lines),
+        Screen::Backup => backup(app, &mut lines),
+        Screen::Confirm => confirm(app, &mut lines),
+        Screen::Import => import(app, &mut lines),
+        Screen::Existing => existing(app, &mut lines),
+        Screen::Password => new_password(app, &mut lines),
         Screen::Unlock => unlock(app, &mut lines),
         Screen::Waiting => {
             lines.extend(cat(pick(&DOZING, app.frame)));
@@ -161,13 +172,107 @@ fn body_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn menu(app: &App, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw("no keystore yet: set up the wallet to send from"));
+    lines.push(Line::default());
+    for choice in Choice::ALL {
+        let marker = if app.setup.choice == choice { ">" } else { " " };
+        lines.push(Line::raw(format!("{marker} {}", choice.label())));
+    }
+    setup_error(app, lines);
+}
+
+/// The new phrase in three numbered columns, read down.
+fn backup(app: &App, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw("your new recovery phrase:"));
+    lines.push(Line::default());
+    let words: Vec<&str> = app
+        .setup
+        .phrase
+        .as_ref()
+        .map(|phrase| phrase.split(' ').collect())
+        .unwrap_or_default();
+    let rows = words.len().div_ceil(3);
+    for row in 0..rows {
+        let mut line = String::with_capacity(BACKUP_ROW_BYTES);
+        for at in (row..words.len()).step_by(rows) {
+            let _ = write!(line, "  {:>2}. {:<10}", at + 1, words[at]);
+        }
+        lines.push(Line::raw(line));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        BACKUP_WARNING,
+        Style::default().fg(Color::Yellow),
+    ));
+}
+
+fn confirm(app: &App, lines: &mut Vec<Line<'static>>) {
+    let [first, second] = app.setup.asked;
+    lines.push(Line::raw(format!(
+        "confirm your recovery phrase: enter words {} and {}",
+        first + 1,
+        second + 1
+    )));
+    lines.push(Line::default());
+    lines.push(Line::raw(format!(
+        "word {}  {}",
+        app.setup.asked[app.setup.asking] + 1,
+        mask(&app.setup.input)
+    )));
+    setup_error(app, lines);
+}
+
+fn import(app: &App, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw(
+        "type or paste a private key (64 hex digits) or a recovery phrase (12 or 24 words)",
+    ));
+    lines.push(Line::default());
+    lines.push(Line::raw(format!("secret  {}", mask(&app.setup.input))));
+    setup_error(app, lines);
+}
+
+fn existing(app: &App, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw(
+        "the path of an encrypted JSON keystore, absolute or starting with ~/",
+    ));
+    lines.push(Line::default());
+    lines.push(Line::raw(format!("path  {}", app.setup.path)));
+    setup_error(app, lines);
+}
+
+fn new_password(app: &App, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw(
+        "choose a password to encrypt the keystore with, at least 8 characters",
+    ));
+    lines.push(Line::default());
+    let field = |entry: Entry, label: &str, text: &str| {
+        let marker = if app.setup.entry == entry { ">" } else { " " };
+        Line::raw(format!("{marker} {label:<9} {}", mask(text)))
+    };
+    lines.push(field(Entry::First, "password", &app.password));
+    lines.push(field(Entry::Again, "again", &app.setup.again));
+    if app.setup.saving {
+        lines.push(Line::raw("encrypting and saving the keystore..."));
+    }
+    setup_error(app, lines);
+}
+
+fn setup_error(app: &App, lines: &mut Vec<Line<'static>>) {
+    if let Some(error) = &app.setup.error {
+        lines.push(error_line(error));
+    }
+}
+
+/// One `*` per character typed.
+fn mask(text: &str) -> String {
+    "*".repeat(text.chars().count())
+}
+
 fn unlock(app: &App, lines: &mut Vec<Line<'static>>) {
     lines.push(Line::raw("unlock your keystore to send from it"));
     lines.push(Line::default());
-    lines.push(Line::raw(format!(
-        "password  {}",
-        "*".repeat(app.password.chars().count())
-    )));
+    lines.push(Line::raw(format!("password  {}", mask(&app.password))));
     if app.unlocking {
         lines.push(Line::raw("unlocking..."));
     }
@@ -300,6 +405,12 @@ fn sending(app: &App, lines: &mut Vec<Line<'static>>) {
 
 fn footer_lines(app: &App) -> Vec<Line<'static>> {
     let keys = match app.screen {
+        Screen::Menu => "up/down choose · Enter select · Esc quit",
+        Screen::Backup => "Enter I wrote them down · Esc back to the menu, discarding them",
+        Screen::Confirm => "Enter check · Esc back to the menu, discarding the phrase",
+        Screen::Import | Screen::Existing | Screen::Password => {
+            "Enter continue · Esc back to the menu"
+        }
         Screen::Unlock => "Enter unlock · Esc quit",
         Screen::Waiting | Screen::Excited | Screen::Paused => "l logs · q quit",
         Screen::Ready => {
