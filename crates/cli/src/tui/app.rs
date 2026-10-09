@@ -244,6 +244,8 @@ pub struct App {
     /// A one-line message under the screen.
     pub notice: Option<String>,
     quit_armed: bool,
+    balances_asked: Option<(u64, usize)>,
+    refreshing: bool,
 }
 
 impl App {
@@ -271,6 +273,8 @@ impl App {
             sending: None,
             notice: None,
             quit_armed: false,
+            balances_asked: None,
+            refreshing: false,
         }
     }
 
@@ -361,6 +365,25 @@ impl App {
     /// The sender's balances at a new snapshot.
     pub fn balances(&mut self, balances: Balances) {
         self.balances = balances;
+    }
+
+    /// Whether to refresh the balances at `head` with `pinned_held` pinned keys held,
+    /// marking it asked: when the head changed since the last refresh.
+    pub fn balances_request(&mut self, head: u64, pinned_held: usize) -> bool {
+        if self.balances_asked.is_some_and(|(asked, _)| asked == head) {
+            return false;
+        }
+        self.balances_asked = Some((head, pinned_held));
+        self.refreshing = true;
+        true
+    }
+
+    /// A refresh finished, with the sender's balances if the snapshot holds them.
+    pub fn refreshed(&mut self, balances: Option<Balances>) {
+        self.refreshing = false;
+        if let Some(balances) = balances {
+            self.balances(balances);
+        }
     }
 
     /// The quote to ask when the form's quote or the head changed since the last one,
@@ -1292,6 +1315,33 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Ready, ""));
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn balances_refresh_on_a_new_head_on_new_held_pinned_keys_and_while_eth_is_unproven() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.unlocked(Ok(SENDER));
+        app.startup(Startup::Serving);
+        assert!(app.balances_request(100, 3));
+        assert!(!app.balances_request(100, 3));
+        app.refreshed(Some(Balances::default()));
+        assert!(app.balances_request(100, 3));
+        app.refreshed(Some(Balances {
+            eth: Some(eth(3_000)),
+            tokens: Vec::new(),
+        }));
+        assert!(!app.balances_request(100, 3));
+        assert!(app.balances_request(100, 5));
+        app.refreshed(Some(Balances {
+            eth: Some(eth(3_000)),
+            tokens: vec![(TKN, U256::from(1_500_000))],
+        }));
+        assert_eq!(app.assets(), [Asset::Eth, Asset::Token(TKN)]);
+        assert!(!app.balances_request(100, 5));
+        assert!(app.balances_request(101, 5));
+        app.refreshed(None);
+        assert_eq!(app.balance(Asset::Token(TKN)), Some(U256::from(1_500_000)));
+        assert!(!app.balances_request(101, 5));
     }
 
     #[test]

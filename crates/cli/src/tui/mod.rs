@@ -111,7 +111,7 @@ impl Drop for Terminal {
 
 /// What a background task finished.
 enum Done {
-    Balances(u64, Balances),
+    Balances(Option<Balances>),
     Estimated(Quote, u64, Result<Quoted, String>),
     Sent(Result<TxHash, String>),
 }
@@ -271,7 +271,6 @@ impl Ui<'_> {
         let (done_tx, mut done) = mpsc::unbounded_channel::<Done>();
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut balances_head = None;
         loop {
             self.draw()?;
             tokio::select! {
@@ -309,10 +308,7 @@ impl Ui<'_> {
                     }
                 }
                 Some(finished) = done.recv() => match finished {
-                    Done::Balances(head, balances) => {
-                        balances_head = Some(head);
-                        self.app.balances(balances);
-                    }
+                    Done::Balances(balances) => self.app.refreshed(balances),
                     Done::Estimated(quote, head, quoted) => {
                         self.app.estimated(quote, head, quoted);
                     }
@@ -323,8 +319,7 @@ impl Ui<'_> {
                     if let Some(node) = &node {
                         let health = node.health();
                         self.app.health(health.head.number, health.state_peers);
-                        if balances_head != Some(health.head.number) {
-                            balances_head = Some(health.head.number);
+                        if self.app.balances_request(health.head.number, health.pinned.held) {
                             refresh_balances(node, &signer, self.app.registry, &done_tx);
                         }
                         if let Some(hash) = self.app.tracking()
@@ -363,12 +358,12 @@ fn refresh_balances(
     let done = done.clone();
     tokio::task::spawn_blocking(move || {
         let snapshot = node.status().snapshot;
-        if let Some(holding) = snapshot.holdings.iter().find(|h| h.address == address) {
-            let _ = done.send(Done::Balances(
-                snapshot.block.number,
-                balances(holding, registry),
-            ));
-        }
+        let balances = snapshot
+            .holdings
+            .iter()
+            .find(|h| h.address == address)
+            .map(|holding| balances(holding, registry));
+        let _ = done.send(Done::Balances(balances));
     });
 }
 
