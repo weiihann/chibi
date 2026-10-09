@@ -523,6 +523,8 @@ impl Popup {
 
     /// Its lines in at most `room` rows where it can: when the rows do not fit, a window
     /// keeping the highlighted one, with a dim count above and below for those left out.
+    /// When even that is too tall, the rows come first, then the counts, the filter and
+    /// the hint.
     fn lines(&self, room: usize) -> Vec<Line<'static>> {
         let fit = room
             .saturating_sub(1 + usize::from(self.hint.is_some()))
@@ -556,6 +558,36 @@ impl Popup {
             lines.push(more("↓", count - end));
         }
         lines.extend(self.hint.clone());
+        if lines.len() <= room.max(1) {
+            return lines;
+        }
+        let shown = room.clamp(1, count);
+        let start = (at + 1).saturating_sub(shown).min(count - shown);
+        let end = start + shown;
+        let mut spare = room.max(1) - shown;
+        let mut take = |wanted: bool| {
+            let taken = wanted && spare > 0;
+            spare -= usize::from(taken);
+            taken
+        };
+        let up = take(start > 0);
+        let down = take(end < count);
+        let filter = take(true);
+        let hint = take(self.hint.is_some());
+        let mut lines = Vec::with_capacity(room);
+        if filter {
+            lines.push(self.filter.clone());
+        }
+        if up {
+            lines.push(more("↑", start));
+        }
+        lines.extend_from_slice(&self.rows[start..end]);
+        if down {
+            lines.push(more("↓", count - end));
+        }
+        if hint {
+            lines.extend(self.hint.clone());
+        }
         lines
     }
 }
@@ -1035,7 +1067,8 @@ mod tests {
         };
         assert_eq!(text(1), ["> WETH"]);
         assert_eq!(text(2), ["  USDC", "> WETH"]);
-        assert_eq!(text(4), ["filter", "  ETH", "  USDC", "> WETH"]);
+        assert_eq!(text(3), ["  ETH", "  USDC", "> WETH"]);
+        assert_eq!(text(4), ["filter", "↑ 2 more", "> WETH", "hint"]);
         assert_eq!(text(5), ["filter", "  ETH", "  USDC", "> WETH", "hint"]);
     }
 
