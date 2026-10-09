@@ -185,8 +185,19 @@ struct Renderer<T> {
 
 impl<T> Renderer<T> {
     /// Hands the thread to [`finish`] on the normal path.
-    fn take(mut self) -> thread::JoinHandle<T> {
-        self.thread.take().expect("the render thread is taken once")
+    fn take(mut self) -> Option<thread::JoinHandle<T>> {
+        self.thread.take()
+    }
+}
+
+impl<T> Drop for Renderer<T> {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take()
+            && thread::panicking()
+            && join_within(thread, RESTORE_WAIT).is_err()
+        {
+            (self.release_raw)();
+        }
     }
 }
 
@@ -283,7 +294,9 @@ pub fn run(
         ui.drive(node_task, Arc::new(signer)).await
     });
     drop(ui);
-    let rendered = finish(renderer.take(), release_raw);
+    let rendered = renderer
+        .take()
+        .map_or(Ok(()), |thread| finish(thread, release_raw));
     if reader.join().is_err() {
         tracing::warn!("the key reader panicked");
     }
