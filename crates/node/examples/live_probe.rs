@@ -64,7 +64,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &spec,
         rng_secret_key(),
         &NetConfig::default(),
-        HeadHint::Attested(trusted),
+        HeadHint::Attested {
+            hash: trusted,
+            clock: spec.clock,
+        },
     )
     .await?;
     let mut sessions = net.sessions();

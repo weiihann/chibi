@@ -177,7 +177,7 @@ pub struct BlockClock {
 impl BlockClock {
     /// The head block number at Unix time `now`, assuming no missed slots since this block.
     /// Missed slots make the estimate run slightly ahead of the real head.
-    pub const fn estimate(&self, now: u64) -> BlockNumber {
+    pub const fn floor(&self, now: u64) -> BlockNumber {
         self.number + now.saturating_sub(self.timestamp) / SLOT_SECONDS
     }
 }
@@ -384,8 +384,24 @@ mod tests {
             number: 100,
             timestamp: 1_000,
         };
-        assert_eq!(clock.estimate(0), 100);
-        assert_eq!(clock.estimate(1_000), 100);
-        assert_eq!(clock.estimate(1_000 + 12 * 50 + 11), 150);
+        assert_eq!(clock.floor(0), 100);
+        assert_eq!(clock.floor(1_000), 100);
+        assert_eq!(clock.floor(1_000 + 12 * 50 + 11), 145);
+    }
+
+    /// chibi anchored at Sepolia block 11_875_419, the light client's head, at
+    /// 2026-10-09T06:02:23Z. Counting every slot since Osaka as a block gives 12_000_107.
+    #[test]
+    fn the_clock_floor_never_passes_the_head() {
+        let (head, now) = (11_875_419, 1_791_525_743);
+        let osaka = Network::Sepolia.spec().clock;
+        assert!(osaka.floor(now) <= head, "{} > {head}", osaka.floor(now));
+        assert_eq!(osaka.floor(now), 11_740_954);
+
+        let anchored = BlockClock {
+            number: head,
+            timestamp: now,
+        };
+        assert_eq!(anchored.floor(now + 3_600), head + 270);
     }
 }

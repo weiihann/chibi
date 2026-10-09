@@ -57,7 +57,7 @@ use tracing::{debug, info, trace};
 
 pub use reth_network::config::{SecretKey, rng_secret_key};
 
-use crate::network::NetworkSpec;
+use crate::network::{BlockClock, NetworkSpec};
 use crate::peers::{Census, NetError, PeerKey, Peers, Reply, SNAP_PER_PEER};
 
 /// Soft cap on snap/2 response sizes, matching reth's own snap downloaders.
@@ -148,9 +148,15 @@ impl NetConfig {
 pub enum HeadHint<'a> {
     /// A header already verified.
     Verified(&'a VerifiedHeader),
-    /// Only the light client's hash is known; number and timestamp come from the wall clock.
-    /// The timestamp alone selects the right fork id.
-    Attested(TrustedHash),
+    /// Only the light client's hash is known. The number is `clock`'s floor for now, so it
+    /// does not pass the real head, and the timestamp is now, which alone selects the right
+    /// fork id.
+    Attested {
+        /// The light client's latest block hash.
+        hash: TrustedHash,
+        /// The newest block known to be on chain, counted forward from.
+        clock: BlockClock,
+    },
 }
 
 /// One established peer session.
@@ -318,13 +324,13 @@ impl Devp2p {
 
         let head = match head {
             HeadHint::Verified(header) => status_head(&spec.chain, header),
-            HeadHint::Attested(trusted) => {
+            HeadHint::Attested { hash, clock } => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
                 Head {
-                    number: spec.clock.estimate(now),
-                    hash: trusted.hash(),
+                    number: clock.floor(now),
+                    hash: hash.hash(),
                     difficulty: U256::ZERO,
                     total_difficulty: total_difficulty(&spec.chain),
                     timestamp: now,

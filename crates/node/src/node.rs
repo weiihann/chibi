@@ -39,7 +39,7 @@ use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
 use crate::follow::Search;
 use crate::heads::Heads;
-use crate::network::{Network, NetworkSpec, Token};
+use crate::network::{BlockClock, Network, NetworkSpec, Token};
 use crate::peers::{NetError, Paced, Peers, REQUEST_TIMEOUT};
 
 /// Fetch rounds one request may need before it gives up. Each round proves the keys the last
@@ -438,8 +438,12 @@ impl Node<Devp2p> {
         let trusted = wait_latest(&mut heads).await?;
         info!(target: "chibi::node", network = %spec.network, hash = %trusted.hash(), "light client synced");
 
-        let net =
-            Devp2p::start(&spec, secret_key, &config.net, HeadHint::Attested(trusted)).await?;
+        let clock = disk.read(|saved| start_clock(&spec, saved.snapshot()));
+        let head = HeadHint::Attested {
+            hash: trusted,
+            clock,
+        };
+        let net = Devp2p::start(&spec, secret_key, &config.net, head).await?;
         net.add_peers(&known_peers);
         wait_for_state_peer(
             net.sessions(),
@@ -566,6 +570,14 @@ async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeE
         .await
         .map_err(|_| NodeError::Stopped)?;
     latest.ok_or(NodeError::NotReady)
+}
+
+/// The block the start-up status counts forward from: the head the last run saved, if it is
+/// on `spec`'s network and newer than the network's clock block, else that clock block. The
+/// save came after the head's own timestamp, so counting from it cannot run ahead.
+fn start_clock(spec: &NetworkSpec, saved: Option<&Snapshot>) -> BlockClock {
+    let _ = saved;
+    spec.clock
 }
 
 impl<P: Peers> Node<P> {
@@ -1781,6 +1793,35 @@ mod tests {
             std::fs::read(dir.path().join(HELIOS_CHECKPOINT)).unwrap(),
             first.to_vec(),
             "a checkpoint helios saved is never replaced"
+        );
+    }
+
+    #[test]
+    fn the_start_up_status_counts_from_the_newest_known_head() {
+        let spec = Network::Sepolia.spec();
+        let saved = |network, number| Snapshot {
+            network,
+            block: BlockNumHash::new(number, B256::repeat_byte(1)),
+            saved_at: 1_791_525_743,
+            holdings: Vec::new(),
+            contracts: Vec::new(),
+        };
+        let last_run = BlockClock {
+            number: 11_875_419,
+            timestamp: 1_791_525_743,
+        };
+        assert_eq!(
+            start_clock(&spec, Some(&saved(Network::Sepolia, 11_875_419))),
+            last_run
+        );
+        assert_eq!(start_clock(&spec, None), spec.clock);
+        assert_eq!(
+            start_clock(&spec, Some(&saved(Network::Mainnet, 11_875_419))),
+            spec.clock
+        );
+        assert_eq!(
+            start_clock(&spec, Some(&saved(Network::Sepolia, 9_000_000))),
+            spec.clock
         );
     }
 }
