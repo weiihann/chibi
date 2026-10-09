@@ -1,5 +1,229 @@
 //! Unlocking the keystore, and building, signing and submitting a transfer from it.
 
+use std::io;
+use std::path::{Path, PathBuf};
+
+use alloy_consensus::{SignableTransaction as _, TxEip1559};
+use alloy_eips::eip2718::Encodable2718 as _;
+use alloy_primitives::{Address, Bytes, TxHash, TxKind, U256};
+use alloy_signer::SignerSync as _;
+use alloy_signer_local::{LocalSignerError, PrivateKeySigner};
+use alloy_sol_types::SolCall as _;
+use chibi_core::exec::{CallRequest, EstimateError};
+use chibi_core::wire;
+use chibi_node::{BlockSel, Node, NodeError, Peers, Token};
+
+alloy_sol_types::sol! {
+    function transfer(address to, uint256 amount) returns (bool);
+}
+
+/// What a transfer moves: ether or a registry token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asset {
+    /// Ether, sent as the transaction's value.
+    Eth,
+    /// An ERC-20 token, sent by calling its `transfer`.
+    Token(Token),
+}
+
+impl Asset {
+    /// The ticker shown to the user.
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Eth => "ETH",
+            Self::Token(token) => token.symbol,
+        }
+    }
+
+    /// Decimal places of one whole unit.
+    pub const fn decimals(self) -> u8 {
+        match self {
+            Self::Eth => crate::ETH_DECIMALS,
+            Self::Token(token) => token.decimals,
+        }
+    }
+}
+
+/// A checked transfer, before fees: `amount` base units of `asset` to `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Draft {
+    /// What is sent.
+    pub asset: Asset,
+    /// The recipient.
+    pub to: Address,
+    /// Base units sent.
+    pub amount: U256,
+}
+
+impl Draft {
+    /// The transaction's target, value and calldata.
+    fn call(&self) -> (Address, U256, Bytes) {
+        match self.asset {
+            Asset::Eth => (self.to, self.amount, Bytes::new()),
+            Asset::Token(token) => (
+                token.address,
+                U256::ZERO,
+                transferCall {
+                    to: self.to,
+                    amount: self.amount,
+                }
+                .abi_encode()
+                .into(),
+            ),
+        }
+    }
+}
+
+/// The gas limit and EIP-1559 fee caps of one transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fee {
+    /// Gas the transfer may use, as estimated.
+    pub gas_limit: u64,
+    /// Twice the next block's base fee plus the tip.
+    pub max_fee_per_gas: u128,
+    /// The tip the node suggests.
+    pub max_priority_fee_per_gas: u128,
+}
+
+impl Fee {
+    /// The most the transfer can cost in fees, in wei.
+    pub fn max_cost(&self) -> U256 {
+        U256::from(self.gas_limit) * U256::from(self.max_fee_per_gas)
+    }
+}
+
+/// Why a transfer was not estimated or sent.
+#[derive(Debug, thiserror::Error)]
+pub enum TransferError {
+    /// The transfer reverts at the head; nothing is signed.
+    #[error("the transfer reverts: {0}")]
+    Reverts(String),
+    /// The node could not estimate, sign for, or submit the transfer.
+    #[error(transparent)]
+    Node(#[from] NodeError),
+    /// Signing failed.
+    #[error("cannot sign: {0}")]
+    Sign(#[from] alloy_signer::Error),
+}
+
+/// Why the keystore did not unlock.
+#[derive(Debug, thiserror::Error)]
+pub enum UnlockError {
+    /// The keystore file cannot be read.
+    #[error("cannot read the keystore {}: {source}", path.display())]
+    Unreadable {
+        /// The keystore path.
+        path: PathBuf,
+        /// Why.
+        source: io::Error,
+    },
+    /// The password does not decrypt the keystore.
+    #[error("wrong password")]
+    WrongPassword,
+    /// The file is not a keystore chibi can decrypt.
+    #[error("cannot decrypt the keystore {}: {reason}", path.display())]
+    Invalid {
+        /// The keystore path.
+        path: PathBuf,
+        /// What the decryption reported.
+        reason: String,
+    },
+}
+
+/// Checks that the keystore at `path` can be read, before anything else starts.
+pub fn check_readable(path: &Path) -> Result<(), UnlockError> {
+    std::fs::File::open(path)
+        .map(drop)
+        .map_err(|source| UnlockError::Unreadable {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Decrypts the keystore at `path` with `password`. Slow by design (scrypt or PBKDF2).
+pub fn unlock(path: &Path, password: &str) -> Result<PrivateKeySigner, UnlockError> {
+    check_readable(path)?;
+    PrivateKeySigner::decrypt_keystore(path, password).map_err(|err| match err {
+        LocalSignerError::EthKeystoreError(eth_keystore::KeystoreError::MacMismatch) => {
+            UnlockError::WrongPassword
+        }
+        other => UnlockError::Invalid {
+            path: path.to_owned(),
+            reason: other.to_string(),
+        },
+    })
+}
+
+/// Estimates the transfer's gas at the head and caps its fees: twice the next block's base
+/// fee plus the suggested tip, so the cap survives several full blocks.
+pub async fn estimate<P: Peers>(
+    node: &Node<P>,
+    from: Address,
+    draft: &Draft,
+) -> Result<Fee, TransferError> {
+    let tip = node.max_priority_fee().await?;
+    let history = node.fee_history(1, BlockSel::Latest, &[]).await?;
+    let next_base_fee = history.base_fee_per_gas.last().copied().unwrap_or_default();
+    let (to, value, input) = draft.call();
+    let request = CallRequest {
+        from: Some(from),
+        to: TxKind::Call(to),
+        value,
+        input,
+        ..CallRequest::default()
+    };
+    let gas_limit = node
+        .estimate_gas(request, BlockSel::Latest)
+        .await
+        .map_err(|err| match err {
+            NodeError::Estimate(EstimateError::Reverted { output }) => {
+                TransferError::Reverts(revert_reason(&output))
+            }
+            other => TransferError::Node(other),
+        })?;
+    Ok(Fee {
+        gas_limit,
+        max_fee_per_gas: next_base_fee.saturating_mul(2).saturating_add(tip),
+        max_priority_fee_per_gas: tip,
+    })
+}
+
+/// Signs the transfer with `signer` at its next pending nonce and submits it.
+pub async fn send<P: Peers>(
+    node: &Node<P>,
+    signer: &PrivateKeySigner,
+    draft: &Draft,
+    fee: &Fee,
+) -> Result<TxHash, TransferError> {
+    let nonce = node
+        .transaction_count(signer.address(), BlockSel::Pending)
+        .await?;
+    let (to, value, input) = draft.call();
+    let tx = TxEip1559 {
+        chain_id: node.chain_id(),
+        nonce,
+        gas_limit: fee.gas_limit,
+        max_fee_per_gas: fee.max_fee_per_gas,
+        max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
+        to: TxKind::Call(to),
+        value,
+        access_list: Default::default(),
+        input,
+    };
+    let signature = signer.sign_hash_sync(&tx.signature_hash())?;
+    let signed = wire::Transaction::Eip1559(tx.into_signed(signature));
+    Ok(node.submit(&signed.encoded_2718()).await?)
+}
+
+/// The revert reason the output carries, as shown to the user.
+fn revert_reason(output: &[u8]) -> String {
+    if output.is_empty() {
+        return "no reason given".to_owned();
+    }
+    alloy_sol_types::decode_revert_reason(output)
+        .unwrap_or_else(|| format!("revert data {}", Bytes::copy_from_slice(output)))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::address;
