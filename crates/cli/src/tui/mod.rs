@@ -163,6 +163,28 @@ fn join_within<T>(
     Ok(thread.join())
 }
 
+/// Joins the render thread for at most [`RESTORE_WAIT`]. One still blocked writing is left
+/// behind with raw mode released by `release_raw`, which writes nothing to the terminal.
+fn finish<E: std::error::Error + Send + Sync + 'static>(
+    renderer: thread::JoinHandle<Result<(), E>>,
+    release_raw: fn(),
+) -> eyre::Result<()> {
+    match join_within(renderer, RESTORE_WAIT) {
+        Ok(Ok(rendered)) => rendered.wrap_err("cannot draw the terminal UI"),
+        Ok(Err(_)) => Err(eyre::eyre!("the terminal UI panicked")),
+        Err(_blocked) => {
+            release_raw();
+            tracing::warn!("the terminal still blocks its writes; it is left as last drawn");
+            Ok(())
+        }
+    }
+}
+
+/// Leaves raw mode, a termios call that cannot block on stdout.
+fn release_raw() {
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
 /// What a background task finished.
 enum Done {
     Balances(Option<Balances>),
@@ -232,14 +254,7 @@ pub fn run(
         ui.drive(node_task, Arc::new(signer)).await
     });
     drop(ui);
-    let rendered = match join_within(renderer, RESTORE_WAIT) {
-        Ok(Ok(rendered)) => rendered.wrap_err("cannot draw the terminal UI"),
-        Ok(Err(_)) => Err(eyre::eyre!("the terminal UI panicked")),
-        Err(_blocked) => {
-            tracing::warn!("the terminal still blocks its writes; it is left as last drawn");
-            Ok(())
-        }
-    };
+    let rendered = finish(renderer, release_raw);
     if reader.join().is_err() {
         tracing::warn!("the key reader panicked");
     }
