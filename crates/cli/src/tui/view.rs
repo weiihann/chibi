@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use alloy_primitives::U256;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -87,27 +87,35 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     } else {
         0
     };
-    let rows = view
-        .notice
-        .as_deref()
-        .map_or(0, |notice| notice_rows(notice, frame.area().width));
-    let [header, body, notice, footer, log_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(rows),
-        Constraint::Length(1),
-        Constraint::Length(pane),
-    ])
-    .areas(frame.area());
+    let area = frame.area();
+    let notice = view.notice.map(|text| {
+        Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
+            .wrap(Wrap { trim: false })
+    });
+    let free = area.height.saturating_sub(2);
+    let rows = notice.as_ref().map_or(0, |paragraph| {
+        u16::try_from(paragraph.line_count(area.width))
+            .unwrap_or(u16::MAX)
+            .min(free)
+    });
+    let rest = free - rows;
+    let pane = if rest >= 2 { pane.min(rest - 1) } else { 0 };
+    let mut next = area.y;
+    let mut take = |height: u16| {
+        let rect = Rect::new(area.x, next, area.width, height.min(area.bottom() - next));
+        next += rect.height;
+        rect
+    };
+    let header = take(1);
+    let body = take(rest - pane);
+    let notice_area = take(rows);
+    let footer = take(1);
+    let log_area = take(pane);
 
     frame.render_widget(Paragraph::new(view.header), header);
     frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
-    if let Some(text) = view.notice {
-        frame.render_widget(
-            Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
-                .wrap(Wrap { trim: false }),
-            notice,
-        );
+    if let Some(paragraph) = notice {
+        frame.render_widget(paragraph, notice_area);
     }
     frame.render_widget(Paragraph::new(view.footer), footer);
     if let Some(logs) = view.logs {
@@ -437,30 +445,6 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
         keys,
         Style::default().add_modifier(Modifier::DIM),
     )]
-}
-
-/// The rows `text` takes wrapped greedily at word boundaries to `width`, words longer than
-/// `width` split across rows.
-fn notice_rows(text: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut rows = 1usize;
-    let mut used = 0usize;
-    for word in text.split(' ').filter(|word| !word.is_empty()) {
-        let mut len = word.chars().count();
-        if used > 0 && used + 1 + len <= width {
-            used += 1 + len;
-            continue;
-        }
-        if used > 0 {
-            rows += 1;
-        }
-        while len > width {
-            rows += 1;
-            len -= width;
-        }
-        used = len;
-    }
-    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 fn error_line(text: &str) -> Line<'static> {

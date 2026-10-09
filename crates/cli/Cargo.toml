@@ -45,7 +45,7 @@ http = "1.3"
 url = { workspace = true, features = ["serde"] }
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm"] }
 nix = { version = "0.31.3", features = ["signal"] }
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 [dev-dependencies]
