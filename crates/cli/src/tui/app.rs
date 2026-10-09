@@ -151,6 +151,32 @@ pub struct Form {
     pub to_error: Option<String>,
     /// Why the fee is not known.
     pub fee_error: Option<String>,
+    /// The token list, while it is open over the form.
+    pub picker: Option<Picker>,
+}
+
+/// The token list opened from the token row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picker {
+    /// Typed text that a symbol or name must contain, ignoring case.
+    pub filter: String,
+    /// The highlighted entry of [`Picker::matches`].
+    pub highlighted: usize,
+}
+
+impl Picker {
+    /// The entries of `assets` the filter matches, in order.
+    pub fn matches(&self, assets: &[Asset]) -> Vec<Asset> {
+        let filter = self.filter.to_lowercase();
+        assets
+            .iter()
+            .copied()
+            .filter(|asset| {
+                asset.symbol().to_lowercase().contains(&filter)
+                    || asset.name().to_lowercase().contains(&filter)
+            })
+            .collect()
+    }
 }
 
 impl Default for Form {
@@ -163,6 +189,7 @@ impl Default for Form {
             amount_error: None,
             to_error: None,
             fee_error: None,
+            picker: None,
         }
     }
 }
@@ -1971,6 +1998,142 @@ mod tests {
             Some("this is the TKN contract itself; tokens sent to it are usually lost")
         );
         assert_eq!(app.screen, Screen::Review);
+    }
+
+    const USDC: Token = Token {
+        symbol: "USDC",
+        name: "USD Coin (Circle)",
+        address: address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+        decimals: 6,
+    };
+    const WETH: Token = Token {
+        symbol: "WETH",
+        name: "Wrapped Ether",
+        address: address!("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
+        decimals: 18,
+    };
+
+    /// The form holding 3 ETH, 25 USDC and 0.5 WETH, with the token list opened on WETH.
+    fn picking() -> App {
+        let mut app = ready(Network::Sepolia);
+        app.balances(Balances {
+            eth: Some(eth(3_000)),
+            tokens: vec![(USDC, U256::from(25_000_000)), (WETH, eth(500))],
+        });
+        app.form.asset = Asset::Token(WETH);
+        app.form.field = Field::Token;
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        app
+    }
+
+    fn picker(app: &App) -> Option<(&str, usize)> {
+        app.form
+            .picker
+            .as_ref()
+            .map(|picker| (picker.filter.as_str(), picker.highlighted))
+    }
+
+    #[test]
+    fn enter_on_the_token_row_opens_the_list_on_the_current_token_and_the_arrows_wrap() {
+        let mut app = picking();
+        assert_eq!(
+            (app.screen, app.form.field, picker(&app)),
+            (Screen::Ready, Field::Token, Some(("", 2)))
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(picker(&app), Some(("", 0)));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(picker(&app), Some(("", 1)));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(picker(&app), Some(("", 2)));
+        assert_eq!(app.form.asset, Asset::Token(WETH));
+    }
+
+    #[test]
+    fn typing_filters_by_symbol_or_name_and_enter_picks_and_moves_to_the_amount() {
+        let mut app = picking();
+        typed(&mut app, "us");
+        let assets = app.assets();
+        let matches = app.form.picker.as_ref().map(|p| p.matches(&assets));
+        assert_eq!(matches, Some(vec![Asset::Token(USDC)]));
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            (app.form.asset, app.form.field, picker(&app), app.screen),
+            (Asset::Token(USDC), Field::Amount, None, Screen::Ready)
+        );
+
+        app.form.field = Field::Token;
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "WRAPPED");
+        press(&mut app, KeyCode::Backspace);
+        typed(&mut app, "d");
+        assert_eq!(picker(&app), Some(("WRAPPEd", 0)));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.form.asset, Asset::Token(WETH));
+    }
+
+    #[test]
+    fn esc_closes_the_list_unchanged_and_q_and_l_type_into_its_filter() {
+        let mut app = picking();
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('l')), None);
+        assert_eq!((picker(&app), app.logs), (Some(("ql", 0)), false));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(
+            (app.form.asset, app.form.field, picker(&app), app.screen),
+            (Asset::Token(WETH), Field::Token, None, Screen::Ready)
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn enter_does_nothing_when_no_token_matches() {
+        let mut app = picking();
+        typed(&mut app, "dai");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(
+            (app.form.asset, picker(&app), app.screen),
+            (Asset::Token(WETH), Some(("dai", 0)), Screen::Ready)
+        );
+    }
+
+    #[test]
+    fn enter_on_the_amount_row_still_reviews() {
+        let mut app = ready(Network::Sepolia);
+        submit(&mut app, "1", BOB, Ok(FEE));
+        app.screen = Screen::Ready;
+        app.review = None;
+        app.form.field = Field::Amount;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((app.screen, picker(&app)), (Screen::Review, None));
+    }
+
+    #[test]
+    fn leaving_the_form_closes_the_list() {
+        let mut app = picking();
+        typed(&mut app, "us");
+        app.health(101, 0);
+        assert_eq!((app.screen, picker(&app)), (Screen::Paused, None));
+        app.health(102, 1);
+        assert_eq!(
+            (app.screen, picker(&app), app.form.asset),
+            (Screen::Ready, None, Asset::Token(WETH))
+        );
+
+        submit(&mut app, "0.1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.sent(Ok(TxHash::ZERO));
+        press(&mut app, KeyCode::Enter);
+        app.form.field = Field::Token;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(picker(&app), Some(("", 2)));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.key(ctrl_c), None);
+        assert!(app.notice.is_some());
+        assert_eq!((app.screen, picker(&app)), (Screen::Ready, None));
     }
 
     #[test]

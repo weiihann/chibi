@@ -37,6 +37,14 @@ impl Asset {
         }
     }
 
+    /// The full name shown beside the ticker.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Eth => "Ether",
+            Self::Token(token) => token.name,
+        }
+    }
+
     /// Decimal places of one whole unit.
     pub const fn decimals(self) -> u8 {
         match self {

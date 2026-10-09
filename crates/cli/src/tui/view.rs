@@ -529,7 +529,7 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use super::*;
-    use crate::tui::app::{Balances, EXCITED_FOR, Sending};
+    use crate::tui::app::{Balances, EXCITED_FOR, Picker, Sending};
     use crate::tui::transfer::Draft;
 
     const SENDER: Address = address!("0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025");
@@ -733,6 +733,102 @@ mod tests {
 
         app.pinned(6, 6, true);
         assert!(!screen(&app, &[]).contains(HINT));
+    }
+
+    /// The form on the token row holding 3 ETH, 25 USDC and 0.5 WETH, sending WETH.
+    fn on_the_token_row() -> App {
+        const USDC: Token = Token {
+            symbol: "USDC",
+            name: "USD Coin (Circle)",
+            address: address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+            decimals: 6,
+        };
+        const WETH: Token = Token {
+            symbol: "WETH",
+            name: "Wrapped Ether",
+            address: address!("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
+            decimals: 18,
+        };
+        let mut app = ready();
+        app.balances(Balances {
+            eth: Some(U256::from(3_000_000_000_000_000_000u64)),
+            tokens: vec![
+                (USDC, U256::from(25_000_000)),
+                (WETH, U256::from(500_000_000_000_000_000u64)),
+            ],
+        });
+        app.form.asset = Asset::Token(WETH);
+        app.form.field = Field::Token;
+        app
+    }
+
+    #[test]
+    fn the_token_list_opens_below_the_token_row_and_leaves_the_form_in_place() {
+        let mut app = on_the_token_row();
+        let closed = drawn(&app, &[], 120, 30);
+        let shown = sized(&app, &[], 120, 30);
+        assert!(
+            shown.contains("> token   < WETH >   0.50 WETH   Enter to choose   more tokens"),
+            "{shown}"
+        );
+        let row: String = (0..120).map(|x| closed[(x, 3)].symbol()).collect();
+        let hint_x = u16::try_from(row.find("Enter").unwrap()).unwrap();
+        assert!(closed[(hint_x, 3)].modifier.contains(Modifier::DIM));
+        assert!(!closed[(hint_x - 4, 3)].modifier.contains(Modifier::DIM));
+        assert!(!shown.contains("choose a token"), "{shown}");
+
+        app.form.picker = Some(Picker {
+            filter: String::new(),
+            highlighted: 2,
+        });
+        let open = drawn(&app, &[], 120, 30);
+        let shown = sized(&app, &[], 120, 30);
+        for expected in [
+            "┌choose a token",
+            "│  ETH   Ether              3.00 ETH",
+            "│  USDC  USD Coin (Circle)  25.00 USDC",
+            "│> WETH  Wrapped Ether      0.50 WETH",
+            "│more tokens appear once their balances are proven",
+            "└type to filter · Enter pick · Esc cancel",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        let corner = |symbol: &str| {
+            (0..30)
+                .flat_map(|y| (0..120).map(move |x| (x, y)))
+                .find(|&at| open[at].symbol() == symbol)
+                .unwrap()
+        };
+        let (left, top) = corner("┌");
+        let (right, bottom) = corner("┘");
+        assert_eq!(top, 4, "{shown}");
+        for y in 0..30 {
+            for x in 0..120 {
+                if !(left..=right).contains(&x) || !(top..=bottom).contains(&y) {
+                    assert_eq!(open[(x, y)], closed[(x, y)], "({x}, {y})\n{shown}");
+                }
+            }
+        }
+
+        app.form.picker = Some(Picker {
+            filter: "dai".to_owned(),
+            highlighted: 0,
+        });
+        let shown = sized(&app, &[], 120, 30);
+        assert!(shown.contains("│no token matches"), "{shown}");
+        assert!(shown.contains("│filter  dai"), "{shown}");
+    }
+
+    #[test]
+    fn the_token_list_fits_a_tiny_terminal() {
+        let mut app = on_the_token_row();
+        app.form.picker = Some(Picker {
+            filter: String::new(),
+            highlighted: 0,
+        });
+        for (width, height) in [(20, 8), (3, 2), (1, 1), (120, 5)] {
+            sized(&app, &[], width, height);
+        }
     }
 
     #[test]
