@@ -1401,6 +1401,16 @@ mod tests {
     }
 
     #[test]
+    fn tokens_are_unproven_until_every_pinned_key_is_held() {
+        let mut app = ready(Network::Sepolia);
+        assert!(app.tokens_unproven);
+        app.pinned(3, 5);
+        assert!(app.tokens_unproven);
+        app.pinned(5, 5);
+        assert!(!app.tokens_unproven);
+    }
+
+    #[test]
     fn a_replaced_or_dropped_transfer_stops_tracking_and_quits_without_a_warning() {
         let hash = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let mut app = ready(Network::Sepolia);

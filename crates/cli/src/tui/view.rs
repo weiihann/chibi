@@ -420,6 +420,33 @@ mod tests {
     }
 
     #[test]
+    fn the_token_row_says_more_tokens_appear_until_every_pinned_key_is_held() {
+        const HINT: &str = "more tokens appear once their balances are proven";
+        let mut app = ready();
+        app.pinned(4, 6);
+        assert!(screen(&app, &[]).contains(HINT));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..30)
+            .find(|&y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("  token   < ETH >   3.00 ETH   more tokens appear")
+            })
+            .expect("the token row carries the hint");
+        let hint_x = (0..100)
+            .find(|&x| buffer[(x, row)].symbol() == "m")
+            .unwrap();
+        assert!(buffer[(hint_x, row)].modifier.contains(Modifier::DIM));
+        assert!(!buffer[(2, row)].modifier.contains(Modifier::DIM));
+
+        app.pinned(6, 6);
+        assert!(!screen(&app, &[]).contains(HINT));
+    }
+
+    #[test]
     fn paused_shows_the_sleepy_cat_and_why() {
         let mut app = ready();
         app.health(101, 0);
