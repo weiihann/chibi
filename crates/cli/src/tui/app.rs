@@ -2260,4 +2260,38 @@ mod tests {
             Some("cannot save the keystore: disk full")
         );
     }
+
+    #[test]
+    fn up_and_down_move_between_the_two_password_fields() {
+        let mut app = setting_up(None);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        typed(
+            &mut app,
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Password);
+
+        typed(&mut app, "short");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.setup.entry, Entry::First);
+        assert_eq!(
+            app.setup.error.as_deref(),
+            Some("a password needs at least 8 characters")
+        );
+
+        typed(&mut app, "long enough");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.setup.entry, Entry::Again);
+        typed(&mut app, "long");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.setup.entry, Entry::First);
+        assert_eq!(app.setup.again.as_str(), "");
+        assert_eq!(app.password.as_str(), "long enough");
+
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "long enough");
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::Save));
+    }
 }
