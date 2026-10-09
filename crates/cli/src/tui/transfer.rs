@@ -704,7 +704,11 @@ mod tests {
             ),
         ] {
             let path = testdata.join(file);
-            assert_eq!(unlock(&path, password).unwrap().address(), expected, "{file}");
+            assert_eq!(
+                unlock(&path, password).unwrap().address(),
+                expected,
+                "{file}"
+            );
             assert!(
                 matches!(unlock(&path, "wrong"), Err(UnlockError::WrongPassword)),
                 "{file}"
