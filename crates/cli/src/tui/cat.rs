@@ -137,21 +137,40 @@ pub fn lines(grid: &Grid, scale: usize) -> Vec<Line<'static>> {
     half_blocks(grid, scale, 0..WIDTH * scale, 0..HEIGHT * scale / 2)
 }
 
-/// [`lines`] without the blank rows and columns around the pixels set.
-pub fn cropped(grid: &Grid, scale: usize) -> Vec<Line<'static>> {
-    let mut columns = (0..WIDTH).filter(|&x| grid.iter().any(|row| row[x] != EMPTY));
-    let mut rows = (0..HEIGHT).filter(|&y| grid[y].iter().any(|&key| key != EMPTY));
-    let (Some(left), Some(top)) = (columns.next(), rows.next()) else {
-        return Vec::new();
-    };
-    let right = columns.next_back().unwrap_or(left);
-    let bottom = rows.next_back().unwrap_or(top);
-    half_blocks(
-        grid,
-        scale,
-        left * scale..(right + 1) * scale,
-        top * scale / 2..((bottom + 1) * scale).div_ceil(2),
-    )
+/// The pixels set on a canvas: the columns and rows from the first set to the last.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    pub columns: Range<usize>,
+    pub rows: Range<usize>,
+}
+
+impl Bounds {
+    /// `grid`'s, `None` when no pixel is set.
+    pub fn of(grid: &Grid) -> Option<Self> {
+        let mut columns = (0..WIDTH).filter(|&x| grid.iter().any(|row| row[x] != EMPTY));
+        let mut rows = (0..HEIGHT).filter(|&y| grid[y].iter().any(|&key| key != EMPTY));
+        let (left, top) = (columns.next()?, rows.next()?);
+        let right = columns.next_back().unwrap_or(left);
+        let bottom = rows.next_back().unwrap_or(top);
+        Some(Self {
+            columns: left..right + 1,
+            rows: top..bottom + 1,
+        })
+    }
+
+    /// The cells they take at `scale`: the columns, and the half-block rows.
+    pub fn cells(&self, scale: usize) -> (Range<usize>, Range<usize>) {
+        (
+            self.columns.start * scale..self.columns.end * scale,
+            self.rows.start * scale / 2..(self.rows.end * scale).div_ceil(2),
+        )
+    }
+}
+
+/// [`lines`] cropped to `bounds`.
+pub fn cropped(grid: &Grid, bounds: &Bounds, scale: usize) -> Vec<Line<'static>> {
+    let (columns, rows) = bounds.cells(scale);
+    half_blocks(grid, scale, columns, rows)
 }
 
 /// The half-block cells of scaled pixel `columns` on cell `rows`, each holding scaled pixel

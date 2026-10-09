@@ -334,7 +334,7 @@ fn page(
 
 /// The side cat cropped to its pixels and where it goes in `body`: two columns right of the
 /// widest of `lines` and level with the first, when `body` is at least [`SIDE_CAT_COLUMNS`]
-/// wide. Twice its size where that fits whole, else its own size where it fits across.
+/// wide, at the scale [`side_cat_size`] picks.
 fn side_cat(
     lines: &[Line<'_>],
     grid: &cat::Grid,
@@ -345,17 +345,22 @@ fn side_cat(
     }
     let x = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0) + 2).ok()?;
     let room = body.height.saturating_sub(1);
+    let bounds = cat::Bounds::of(grid)?;
+    let (scale, width, height) = side_cat_size(&bounds, body.width.checked_sub(x)?, room)?;
+    Some((
+        Rect::new(body.x + x, body.y + 1, width, height.min(room)),
+        cat::cropped(grid, &bounds, scale),
+    ))
+}
+
+/// The scale and the cells across and down of a cat cropped to `bounds`: twice its size
+/// where that fits whole in `columns` by `rows`, else its own size where it fits across.
+fn side_cat_size(bounds: &cat::Bounds, columns: u16, rows: u16) -> Option<(usize, u16, u16)> {
     [2, 1].into_iter().find_map(|scale| {
-        let cat = cat::cropped(grid, scale);
-        let width = u16::try_from(cat.iter().map(Line::width).max()?).ok()?;
-        let height = u16::try_from(cat.len()).unwrap_or(u16::MAX);
-        let fits = x.checked_add(width)? <= body.width && (scale == 1 || height <= room);
-        fits.then(|| {
-            (
-                Rect::new(body.x + x, body.y + 1, width, height.min(room)),
-                cat,
-            )
-        })
+        let (across, down) = bounds.cells(scale);
+        let width = u16::try_from(across.len()).ok()?;
+        let height = u16::try_from(down.len()).unwrap_or(u16::MAX);
+        (width <= columns && (scale == 1 || height <= rows)).then_some((scale, width, height))
     })
 }
 
