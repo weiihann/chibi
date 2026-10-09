@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::U256;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
 use super::app::{
     App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, SIDE_CAT_COLUMNS, Screen, SendState, show,
@@ -20,6 +20,24 @@ use crate::format_units;
 
 /// Log lines the log pane shows at most.
 pub const LOG_PANE_LINES: u16 = 10;
+
+/// The narrowest terminal the card is drawn on; narrower ones get the borderless layout.
+const CARD_MIN_WIDTH: u16 = 44;
+
+/// The shortest terminal the card is drawn on; shorter ones get the borderless layout.
+const CARD_MIN_HEIGHT: u16 = 14;
+
+/// The card's widest.
+const CARD_MAX_WIDTH: u16 = 120;
+
+/// The card's tallest without the log pane.
+const CARD_MAX_HEIGHT: u16 = 36;
+
+/// The largest pixel cat scale.
+const MAX_CAT_SCALE: usize = 3;
+
+/// The widest ASCII cat frame, so a centered ASCII cat holds still as it animates.
+const ASCII_CAT_COLUMNS: u16 = 13;
 
 /// The token row's hint while some pinned key is not held yet.
 const TOKENS_UNPROVEN: &str = "more tokens appear once their balances are proven";
@@ -66,18 +84,38 @@ const SAD: [&str; 4] = ["  /\\_/\\", " ( ;.; )", "  > ^ <", " (\")_(\")"];
 /// What the screen shows, built from the [`App`] on the control loop and drawn on the render
 /// thread. Passwords and typed secrets are already masked; the one secret it can hold is the
 /// new recovery phrase on Backup, gone with the next view sent.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct View {
     header: Line<'static>,
-    body: Vec<Line<'static>>,
+    body: Body,
     footer: Vec<Line<'static>>,
     notice: Option<String>,
     /// The tail of the log buffer, oldest first, while the log pane is open.
     logs: Option<Vec<String>>,
-    /// The idle cat, drawn right of the form where it fits.
-    side: Vec<Line<'static>>,
-    /// The token list, drawn over the form.
-    picker: Option<Popup>,
+}
+
+/// What the body shows.
+#[derive(Clone, Debug)]
+enum Body {
+    /// A cat with a few lines under it, centered in the body: Waiting, Excited, Paused, and
+    /// Sending once the receipt is verified.
+    Scene { cat: Cat, lines: Vec<Line<'static>> },
+    /// Lines from the top left: setup, unlock, the form, review, and Sending until the
+    /// receipt is verified.
+    Page {
+        lines: Vec<Line<'static>>,
+        /// The idle cat's frame, drawn right of the form where it fits.
+        side: Option<u32>,
+        /// The token list, drawn over the form.
+        picker: Option<Popup>,
+    },
+}
+
+/// A scene's cat: frame `n` of a pixel cat pose, or an ASCII cat.
+#[derive(Clone, Copy, Debug)]
+enum Cat {
+    Pixels { pose: Pose, n: u32 },
+    Ascii([&'static str; 4]),
 }
 
 /// The token list drawn in a bordered box over the body, below one of its lines.
@@ -96,38 +134,70 @@ struct Popup {
 impl View {
     /// The screen for `app` at `now`, with `logs` in the log pane when it is open.
     pub fn new(app: &App, logs: Vec<String>, now: Instant) -> Self {
-        let (body, token_row) = body_lines(app, now);
-        let picker = token_row.and_then(|below| picker_popup(app, below));
-        let side = if app.cat() == Some(Pose::Idle) && picker.is_none() {
-            cat::cropped(&cat::frame(Pose::Idle, app.cat_frame(now)))
-        } else {
-            Vec::new()
-        };
         Self {
             header: header_line(app),
-            body,
+            body: body(app, now),
             footer: footer_lines(app),
             notice: app.notice.clone(),
             logs: app.logs.then_some(logs),
-            side,
-            picker,
         }
     }
 }
 
-/// Draws the whole screen.
+/// The card in `area` with a log pane `pane` rows tall, `None` when `area` is too small for
+/// one.
+fn card(area: Rect, pane: u16) -> Option<Rect> {
+    if area.width < CARD_MIN_WIDTH || area.height < CARD_MIN_HEIGHT {
+        return None;
+    }
+    let width = (area.width - 4).min(CARD_MAX_WIDTH);
+    let height = (area.height - 2).min(CARD_MAX_HEIGHT.saturating_add(pane));
+    Some(Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    ))
+}
+
+/// Draws the whole screen: in a card titled with the header when the terminal has room for
+/// one, else borderless under a header row.
 pub fn draw(frame: &mut Frame<'_>, view: View) {
     let pane = if view.logs.is_some() {
         LOG_PANE_LINES + 2
     } else {
         0
     };
-    let area = frame.area();
+    let screen = frame.area();
+    let area = if let Some(card) = card(screen, pane) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(view.header)
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(card);
+        frame.render_widget(Clear, card);
+        frame.render_widget(block, card);
+        inner
+    } else {
+        let header = screen.height.min(1);
+        frame.render_widget(
+            Paragraph::new(view.header),
+            Rect {
+                height: header,
+                ..screen
+            },
+        );
+        Rect {
+            y: screen.y + header,
+            height: screen.height - header,
+            ..screen
+        }
+    };
     let notice = view.notice.map(|text| {
         Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
             .wrap(Wrap { trim: false })
     });
-    let free = area.height.saturating_sub(2);
+    let free = area.height.saturating_sub(1);
     let rows = notice.as_ref().map_or(0, |paragraph| {
         u16::try_from(paragraph.line_count(area.width))
             .unwrap_or(u16::MAX)
@@ -141,34 +211,18 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
         next += rect.height;
         rect
     };
-    let header = take(1);
     let body = take(rest - pane);
     let notice_area = take(rows);
     let footer = take(1);
     let log_area = take(pane);
 
-    frame.render_widget(Paragraph::new(view.header), header);
-    let side = side_area(&view.body, &view.side, body);
-    let picker = view.picker.map(|popup| {
-        let above = Paragraph::new(
-            view.body
-                .iter()
-                .take(popup.below + 1)
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false })
-        .line_count(body.width);
-        let top = body
-            .y
-            .saturating_add(u16::try_from(above).unwrap_or(u16::MAX));
-        let room = body.bottom().saturating_sub(top).saturating_sub(2);
-        let lines = popup.lines(usize::from(room));
-        (popup_area(popup.widest(), lines.len(), top, body), lines)
-    });
-    frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
-    if let Some(side) = side {
-        frame.render_widget(Paragraph::new(view.side), side);
+    match view.body {
+        Body::Scene { cat, lines } => scene(frame, cat, lines, body),
+        Body::Page {
+            lines,
+            side,
+            picker,
+        } => page(frame, lines, side, picker, body),
     }
     if let Some(paragraph) = notice {
         frame.render_widget(paragraph, notice_area);
@@ -187,6 +241,84 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
             log_area,
         );
     }
+}
+
+/// Draws the cat, a blank line and `lines` under it, each centered, the whole centered in
+/// `body`.
+fn scene(frame: &mut Frame<'_>, cat: Cat, lines: Vec<Line<'static>>, body: Rect) {
+    let (art, width) = match cat {
+        Cat::Pixels { pose, n } => {
+            let scale = cat_scale(body);
+            let width = u16::try_from(cat::WIDTH * scale).unwrap_or(u16::MAX);
+            (cat::lines(&cat::frame(pose, n), scale), width)
+        }
+        Cat::Ascii(rows) => (rows.map(Line::raw).to_vec(), ASCII_CAT_COLUMNS),
+    };
+    let art_rows = u16::try_from(art.len()).unwrap_or(u16::MAX);
+    let text = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+    let text_rows = u16::try_from(text.line_count(body.width)).unwrap_or(u16::MAX);
+    let height = art_rows.saturating_add(1).saturating_add(text_rows);
+    let top = body.y + body.height.saturating_sub(height) / 2;
+    let left = body.x + body.width.saturating_sub(width) / 2;
+    frame.render_widget(
+        Paragraph::new(art),
+        Rect::new(left, top, width, art_rows).intersection(body),
+    );
+    frame.render_widget(
+        text,
+        Rect::new(
+            body.x,
+            top.saturating_add(art_rows).saturating_add(1),
+            body.width,
+            text_rows,
+        )
+        .intersection(body),
+    );
+}
+
+/// The largest pixel cat scale up to [`MAX_CAT_SCALE`] at which the cat takes at most half
+/// of `body` each way, at least 1.
+fn cat_scale(body: Rect) -> usize {
+    let (width, height) = (usize::from(body.width), usize::from(body.height));
+    (1..=MAX_CAT_SCALE)
+        .rev()
+        .find(|scale| cat::WIDTH * scale <= width / 2 && cat::HEIGHT / 2 * scale <= height / 2)
+        .unwrap_or(1)
+}
+
+/// Draws `lines` from the top left of `body`, the side cat right of them where it fits,
+/// and the token list over them.
+fn page(
+    frame: &mut Frame<'_>,
+    lines: Vec<Line<'static>>,
+    side: Option<u32>,
+    picker: Option<Popup>,
+    body: Rect,
+) {
+    let side = side.and_then(|n| side_cat(&lines, &cat::frame(Pose::Idle, n), body));
+    let picker = picker.map(|popup| {
+        let above = Paragraph::new(
+            lines
+                .iter()
+                .take(popup.below + 1)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .line_count(body.width);
+        let top = body
+            .y
+            .saturating_add(u16::try_from(above).unwrap_or(u16::MAX));
+        let room = body.bottom().saturating_sub(top).saturating_sub(2);
+        let lines = popup.lines(usize::from(room));
+        (popup_area(popup.widest(), lines.len(), top, body), lines)
+    });
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    if let Some((rect, cat)) = side {
+        frame.render_widget(Paragraph::new(cat), rect);
+    }
     if let Some((rect, lines)) = picker {
         frame.render_widget(Clear, rect);
         frame.render_widget(
@@ -200,16 +332,31 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     }
 }
 
-/// Where the side cat fits in `body`, two columns right of its widest line and level with
-/// its first, when `body` is at least [`SIDE_CAT_COLUMNS`] wide.
-fn side_area(lines: &[Line<'_>], side: &[Line<'_>], body: Rect) -> Option<Rect> {
-    let width = u16::try_from(side.iter().map(Line::width).max()?).ok()?;
+/// The side cat cropped to its pixels and where it goes in `body`: two columns right of the
+/// widest of `lines` and level with the first, when `body` is at least [`SIDE_CAT_COLUMNS`]
+/// wide. Twice its size where that fits whole, else its own size where it fits across.
+fn side_cat(
+    lines: &[Line<'_>],
+    grid: &cat::Grid,
+    body: Rect,
+) -> Option<(Rect, Vec<Line<'static>>)> {
+    if body.width < SIDE_CAT_COLUMNS {
+        return None;
+    }
     let x = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0) + 2).ok()?;
-    let fits = body.width >= SIDE_CAT_COLUMNS && x.checked_add(width)? <= body.width;
-    let height = u16::try_from(side.len())
-        .unwrap_or(u16::MAX)
-        .min(body.height.saturating_sub(1));
-    fits.then(|| Rect::new(body.x + x, body.y + 1, width, height))
+    let room = body.height.saturating_sub(1);
+    [2, 1].into_iter().find_map(|scale| {
+        let cat = cat::cropped(grid, scale);
+        let width = u16::try_from(cat.iter().map(Line::width).max()?).ok()?;
+        let height = u16::try_from(cat.len()).unwrap_or(u16::MAX);
+        let fits = x.checked_add(width)? <= body.width && (scale == 1 || height <= room);
+        fits.then(|| {
+            (
+                Rect::new(body.x + x, body.y + 1, width, height.min(room)),
+                cat,
+            )
+        })
+    })
 }
 
 /// Where a box `height` lines tall goes: from row `top`, two columns into `body`, as wide as
@@ -237,16 +384,11 @@ fn header_line(app: &App) -> Line<'static> {
 }
 
 /// The pixel cat up at `now` if there is one, else `ascii`.
-fn cat_lines(app: &App, now: Instant, ascii: [&str; 4]) -> Vec<Line<'static>> {
-    app.cat().map_or_else(
-        || {
-            ascii
-                .into_iter()
-                .map(|line| Line::raw(line.to_owned()))
-                .collect()
-        },
-        |pose| cat::lines(&cat::frame(pose, app.cat_frame(now))),
-    )
+fn cat(app: &App, now: Instant, ascii: [&'static str; 4]) -> Cat {
+    app.cat().map_or(Cat::Ascii(ascii), |pose| Cat::Pixels {
+        pose,
+        n: app.cat_frame(now),
+    })
 }
 
 /// Frame `n` of an animation, one step per tick.
@@ -254,47 +396,64 @@ fn pick<T: Copy, const N: usize>(frames: &[T; N], tick: u64) -> T {
     frames[usize::try_from(tick % N as u64).unwrap_or_default()]
 }
 
-/// The body's lines, and on the form the index of the token row.
-fn body_lines(app: &App, now: Instant) -> (Vec<Line<'static>>, Option<usize>) {
+/// A page of `lines` under a blank one, with no side cat or token list.
+fn plain(write: impl FnOnce(&mut Vec<Line<'static>>)) -> Body {
     let mut lines = vec![Line::default()];
-    let mut token_row = None;
+    write(&mut lines);
+    Body::Page {
+        lines,
+        side: None,
+        picker: None,
+    }
+}
+
+fn body(app: &App, now: Instant) -> Body {
     match app.screen {
-        Screen::Menu => menu(app, &mut lines),
-        Screen::Backup => backup(app, &mut lines),
-        Screen::Confirm => confirm(app, &mut lines),
-        Screen::Import => import(app, &mut lines),
-        Screen::Existing => existing(app, &mut lines),
-        Screen::Password => new_password(app, &mut lines),
-        Screen::Unlock => unlock(app, &mut lines),
-        Screen::Waiting => {
-            lines.extend(cat_lines(app, now, pick(&DOZING, app.frame)));
-            lines.push(Line::default());
-            lines.push(Line::raw(format!(
+        Screen::Menu => plain(|lines| menu(app, lines)),
+        Screen::Backup => plain(|lines| backup(app, lines)),
+        Screen::Confirm => plain(|lines| confirm(app, lines)),
+        Screen::Import => plain(|lines| import(app, lines)),
+        Screen::Existing => plain(|lines| existing(app, lines)),
+        Screen::Password => plain(|lines| new_password(app, lines)),
+        Screen::Unlock => plain(|lines| unlock(app, lines)),
+        Screen::Waiting => Body::Scene {
+            cat: cat(app, now, pick(&DOZING, app.frame)),
+            lines: vec![Line::raw(format!(
                 "looking for a state peer · peers {} · state peers {} · {}",
                 app.waiting.peers,
                 app.waiting.state_peers,
                 elapsed(app.waiting.elapsed)
-            )));
+            ))],
+        },
+        Screen::Excited => Body::Scene {
+            cat: cat(app, now, pick(&EXCITED, app.frame)),
+            lines: vec![
+                Line::raw("found a state peer!"),
+                Line::raw("anchoring at a verified head..."),
+            ],
+        },
+        Screen::Paused => Body::Scene {
+            cat: cat(app, now, pick(&SLEEPY, app.frame)),
+            lines: vec![
+                Line::raw(PAUSED),
+                Line::raw("nothing can be proven or sent until one connects; your form is kept"),
+            ],
+        },
+        Screen::Ready => {
+            let mut lines = vec![Line::default()];
+            let token_row = form(app, &mut lines);
+            let picker = picker_popup(app, token_row);
+            let side =
+                (app.cat() == Some(Pose::Idle) && picker.is_none()).then(|| app.cat_frame(now));
+            Body::Page {
+                lines,
+                side,
+                picker,
+            }
         }
-        Screen::Excited => {
-            lines.extend(cat_lines(app, now, pick(&EXCITED, app.frame)));
-            lines.push(Line::default());
-            lines.push(Line::raw("found a state peer!"));
-            lines.push(Line::raw("anchoring at a verified head..."));
-        }
-        Screen::Paused => {
-            lines.extend(cat_lines(app, now, pick(&SLEEPY, app.frame)));
-            lines.push(Line::default());
-            lines.push(Line::raw(PAUSED));
-            lines.push(Line::raw(
-                "nothing can be proven or sent until one connects; your form is kept",
-            ));
-        }
-        Screen::Ready => token_row = Some(form(app, &mut lines)),
-        Screen::Review => review(app, &mut lines),
-        Screen::Sending => sending(app, now, &mut lines),
+        Screen::Review => plain(|lines| review(app, lines)),
+        Screen::Sending => sending(app, now),
     }
-    (lines, token_row)
 }
 
 fn menu(app: &App, lines: &mut Vec<Line<'static>>) {
@@ -619,24 +778,25 @@ fn review(app: &App, lines: &mut Vec<Line<'static>>) {
     }
 }
 
-fn sending(app: &App, now: Instant, lines: &mut Vec<Line<'static>>) {
+/// The transfer under way: a scene with the cat once its receipt is verified, else a page.
+fn sending(app: &App, now: Instant) -> Body {
     let Some(sending) = &app.sending else {
-        return;
+        return plain(|_| {});
     };
-    match sending.state {
-        SendState::Succeeded => lines.extend(cat_lines(app, now, HAPPY)),
-        SendState::Failed => lines.extend(cat_lines(app, now, SAD)),
+    let ascii = match sending.state {
+        SendState::Succeeded => Some(HAPPY),
+        SendState::Failed => Some(SAD),
         SendState::Signing
         | SendState::Pending
         | SendState::Included
         | SendState::Rejected(_)
-        | SendState::Dropped => {}
-    }
-    lines.push(Line::raw(format!(
+        | SendState::Dropped => None,
+    };
+    let mut lines = vec![Line::raw(format!(
         "sending {} to {}",
         show(sending.draft.amount, sending.draft.asset),
         sending.draft.to.to_checksum(None)
-    )));
+    ))];
     if let Some(hash) = sending.hash {
         lines.push(Line::raw(format!("hash {hash}")));
     }
@@ -657,6 +817,13 @@ fn sending(app: &App, now: Instant, lines: &mut Vec<Line<'static>>) {
         }
     };
     lines.push(Line::raw(status));
+    match ascii {
+        Some(ascii) => Body::Scene {
+            cat: cat(app, now, ascii),
+            lines,
+        },
+        None => plain(|page| page.append(&mut lines)),
+    }
 }
 
 fn footer_lines(app: &App) -> Vec<Line<'static>> {
@@ -916,9 +1083,9 @@ mod tests {
         assert_eq!(cat[0].width(), 44);
         assert_cat_at(&buffer, &cat, 38, 10);
         let status = "looking for a state peer · peers 12 · state peers 0 · 1m20s";
-        let x = 4 + (112 - u16::try_from(status.chars().count()).unwrap()) / 2;
-        assert!(row_from(&buffer, x, 27).starts_with(status));
-        assert_eq!(buffer[(x - 1, 27)].symbol(), " ");
+        assert_eq!(status.chars().count(), 59);
+        assert!(row_from(&buffer, 31, 27).starts_with(status));
+        assert_eq!(buffer[(30, 27)].symbol(), " ");
     }
 
     #[test]
@@ -931,8 +1098,21 @@ mod tests {
         assert_eq!(buffer[(77, 22)].symbol(), "╯");
         assert_cat_at(&buffer, &cat::lines(&cat::frame(Pose::Dozing, 0), 1), 29, 6);
         let status = "looking for a state peer · peers 12 · state peers 0 · 1m20s";
-        let x = 4 + (72 - u16::try_from(status.chars().count()).unwrap()) / 2;
-        assert!(row_from(&buffer, x, 15).starts_with(status));
+        assert!(row_from(&buffer, 11, 15).starts_with(status));
+        assert_eq!(buffer[(10, 15)].symbol(), " ");
+    }
+
+    #[test]
+    fn the_ascii_cats_fit_the_columns_they_are_centered_in() {
+        let widest = DOZING
+            .iter()
+            .chain(&EXCITED)
+            .chain(&SLEEPY)
+            .chain([&HAPPY, &SAD])
+            .flatten()
+            .map(|line| line.chars().count())
+            .max();
+        assert_eq!(widest, Some(usize::from(ASCII_CAT_COLUMNS)));
     }
 
     #[test]
@@ -987,19 +1167,19 @@ mod tests {
     #[test]
     fn the_idle_cat_sits_right_of_the_form_only_on_wide_terminals() {
         let mut app = ready();
-        app.width = 100;
-        let plain = drawn(&app, &[], 100, 30);
+        app.width = 120;
+        let plain = drawn(&app, &[], 120, 30);
         app.pixel_cats = true;
-        let with_cat = drawn(&app, &[], 100, 30);
+        let with_cat = drawn(&app, &[], 120, 30);
         let form_right = (2..14)
-            .flat_map(|y| (4..96).map(move |x| (x, y)))
+            .flat_map(|y| (4..116).map(move |x| (x, y)))
             .filter(|&at| plain[at].symbol() != " ")
             .map(|(x, _)| x)
             .max()
             .unwrap();
         let mut cat_cells = 0;
         for y in 0..30 {
-            for x in 0..100 {
+            for x in 0..120 {
                 if plain[(x, y)].symbol() != " " {
                     assert_eq!(plain[(x, y)], with_cat[(x, y)], "({x}, {y})");
                 }
@@ -1021,7 +1201,7 @@ mod tests {
             columns.iter().max().unwrap() - columns.iter().min().unwrap() + 1
         };
         assert_eq!(cat_columns(&with_cat), 16);
-        app.width = 120;
+        app.pinned(6, 6, true);
         assert_eq!(cat_columns(&drawn(&app, &[], 120, 40)), 32);
 
         app.pixel_cats = false;
@@ -1102,8 +1282,8 @@ mod tests {
             row_from(&closed, 4, 4).starts_with("  from    0x17c5"),
             "{shown}"
         );
-        let row = row_from(&closed, 0, 5);
-        let hint_x = u16::try_from(row.find("Enter").unwrap()).unwrap();
+        let row = row_from(&closed, 4, 5);
+        let hint_x = 4 + u16::try_from(row.find("Enter").unwrap()).unwrap();
         assert!(closed[(hint_x, 5)].modifier.contains(Modifier::DIM));
         assert!(!closed[(hint_x - 4, 5)].modifier.contains(Modifier::DIM));
         assert!(!shown.contains("choose a token"), "{shown}");

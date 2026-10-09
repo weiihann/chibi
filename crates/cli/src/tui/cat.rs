@@ -130,14 +130,15 @@ fn stamp(grid: &mut Grid, sprite: &[&str], x: usize, y: usize) {
     }
 }
 
-/// The canvas as half-block rows: each cell's top pixel in the foreground of `▀`, its
-/// bottom one in the background, or `▄` when only the bottom pixel is set.
-pub fn lines(grid: &Grid) -> Vec<Line<'static>> {
-    half_blocks(grid, 0..WIDTH, 0..HEIGHT / 2)
+/// The canvas as half-block rows, each pixel drawn `scale` x `scale`: each cell's top pixel
+/// in the foreground of `▀`, its bottom one in the background, or `▄` when only the bottom
+/// pixel is set.
+pub fn lines(grid: &Grid, scale: usize) -> Vec<Line<'static>> {
+    half_blocks(grid, scale, 0..WIDTH * scale, 0..HEIGHT * scale / 2)
 }
 
 /// [`lines`] without the blank rows and columns around the pixels set.
-pub fn cropped(grid: &Grid) -> Vec<Line<'static>> {
+pub fn cropped(grid: &Grid, scale: usize) -> Vec<Line<'static>> {
     let mut columns = (0..WIDTH).filter(|&x| grid.iter().any(|row| row[x] != EMPTY));
     let mut rows = (0..HEIGHT).filter(|&y| grid[y].iter().any(|&key| key != EMPTY));
     let (Some(left), Some(top)) = (columns.next(), rows.next()) else {
@@ -145,18 +146,28 @@ pub fn cropped(grid: &Grid) -> Vec<Line<'static>> {
     };
     let right = columns.next_back().unwrap_or(left);
     let bottom = rows.next_back().unwrap_or(top);
-    half_blocks(grid, left..right + 1, top / 2..bottom / 2 + 1)
+    half_blocks(
+        grid,
+        scale,
+        left * scale..(right + 1) * scale,
+        top * scale / 2..((bottom + 1) * scale).div_ceil(2),
+    )
 }
 
-/// The half-block cells of `columns` on cell `rows`, each holding pixel rows `2 * row` and
-/// `2 * row + 1`.
-fn half_blocks(grid: &Grid, columns: Range<usize>, rows: Range<usize>) -> Vec<Line<'static>> {
+/// The half-block cells of scaled pixel `columns` on cell `rows`, each holding scaled pixel
+/// rows `2 * row` and `2 * row + 1`.
+fn half_blocks(
+    grid: &Grid,
+    scale: usize,
+    columns: Range<usize>,
+    rows: Range<usize>,
+) -> Vec<Line<'static>> {
     rows.map(|row| {
-        let (top, bottom) = (&grid[2 * row], &grid[2 * row + 1]);
+        let (top, bottom) = (&grid[2 * row / scale], &grid[(2 * row + 1) / scale]);
         Line::from(
             columns
                 .clone()
-                .map(|x| cell(top[x], bottom[x]))
+                .map(|x| cell(top[x / scale], bottom[x / scale]))
                 .collect::<Vec<_>>(),
         )
     })
