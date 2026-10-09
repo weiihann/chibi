@@ -368,12 +368,14 @@ impl App {
     }
 
     /// Whether to refresh the balances at `head` with `pinned_held` pinned keys held,
-    /// marking it asked: when the head changed since the last refresh.
+    /// marking it asked: when either changed since the last refresh, or while ETH is
+    /// unproven. Never while a refresh is outstanding.
     pub fn balances_request(&mut self, head: u64, pinned_held: usize) -> bool {
-        if self.balances_asked.is_some_and(|(asked, _)| asked == head) {
+        let at = (head, pinned_held);
+        if self.refreshing || self.balances_asked == Some(at) && self.balances.eth.is_some() {
             return false;
         }
-        self.balances_asked = Some((head, pinned_held));
+        self.balances_asked = Some(at);
         self.refreshing = true;
         true
     }
