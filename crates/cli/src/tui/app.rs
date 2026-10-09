@@ -2143,6 +2143,33 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_dropping_the_highlighted_token_highlights_the_first_match() {
+        let mut app = picking();
+        app.balances(Balances {
+            eth: Some(eth(3_000)),
+            tokens: vec![(USDC, U256::from(25_000_000))],
+        });
+        assert_eq!(picker(&app), Some(("", 0)));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((app.form.asset, picker(&app)), (Asset::Eth, None));
+    }
+
+    #[test]
+    fn picking_another_token_clears_the_previous_fee_error() {
+        let mut app = picking();
+        press(&mut app, KeyCode::Esc);
+        app.form.asset = Asset::Eth;
+        app.form.fee_error = Some("execution reverted".to_owned());
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "us");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.form.asset, app.form.fee_error),
+            (Asset::Token(USDC), None)
+        );
+    }
+
+    #[test]
     fn enter_does_nothing_when_no_token_matches() {
         let mut app = picking();
         typed(&mut app, "dai");

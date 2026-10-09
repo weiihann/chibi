@@ -940,6 +940,63 @@ mod tests {
     }
 
     #[test]
+    fn the_token_list_stays_above_the_notice_and_footer() {
+        let mut app = on_the_token_row();
+        app.notice = Some("a notice".to_owned());
+        let closed = drawn(&app, &[], 120, 10);
+        app.form.picker = Some(Picker {
+            filter: String::new(),
+            highlighted: 2,
+        });
+        let open = drawn(&app, &[], 120, 10);
+        let shown = sized(&app, &[], 120, 10);
+        assert!(shown.contains("┌choose a token"), "{shown}");
+        for y in [8, 9] {
+            for x in 0..120 {
+                assert_eq!(open[(x, y)], closed[(x, y)], "({x}, {y})\n{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_token_list_scrolls_to_keep_the_highlighted_row_visible() {
+        const fn token(symbol: &'static str, byte: u8) -> Token {
+            let mut address = [0; 20];
+            address[19] = byte;
+            Token {
+                symbol,
+                name: "Test token",
+                address: Address::new(address),
+                decimals: 6,
+            }
+        }
+        let mut app = ready();
+        app.balances(Balances {
+            eth: Some(U256::from(3_000_000_000_000_000_000u64)),
+            tokens: ["TA", "TB", "TC", "TD", "TE", "TF", "TG"]
+                .into_iter()
+                .zip(1..)
+                .map(|(symbol, byte)| (token(symbol, byte), U256::from(1_000_000)))
+                .collect(),
+        });
+        app.form.field = Field::Token;
+        let closed = drawn(&app, &[], 120, 13);
+        app.form.picker = Some(Picker {
+            filter: String::new(),
+            highlighted: 7,
+        });
+        let open = drawn(&app, &[], 120, 13);
+        let shown = sized(&app, &[], 120, 13);
+        for expected in ["│↑ 5 more", "│  TE ", "│  TF ", "│> TG "] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        assert!(!shown.contains("│  TD "), "{shown}");
+        for x in 0..120 {
+            assert_eq!(open[(x, 12)], closed[(x, 12)], "({x}, 12)\n{shown}");
+        }
+    }
+
+    #[test]
     fn paused_shows_the_sleepy_cat_and_why() {
         let mut app = ready();
         app.health(101, 0);
