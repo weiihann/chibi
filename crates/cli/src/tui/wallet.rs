@@ -363,6 +363,31 @@ mod tests {
     }
 
     #[test]
+    fn a_config_is_replaced_whole_keeping_its_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let keystores = dir.path().join("keystores");
+        let text = "# mine\nnetwork = \"mainnet\"\n";
+        fs::write(&config, text).unwrap();
+        fs::set_permissions(&config, Permissions::from_mode(0o640)).unwrap();
+        let _ = save_with(&parse(ANVIL_KEY).unwrap(), PASSWORD, &config, &|path| {
+            if path.starts_with(&keystores) {
+                Ok(())
+            } else {
+                injected(path)
+            }
+        });
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        assert_eq!(entries(dir.path()), vec![config.clone(), keystores.clone()]);
+
+        fs::remove_dir_all(&keystores).unwrap();
+        save(&parse(ANVIL_KEY).unwrap(), PASSWORD, &config).unwrap();
+        assert!(fs::read_to_string(&config).unwrap().starts_with(text));
+        assert_eq!(mode(&config), 0o640);
+        assert_eq!(entries(dir.path()), vec![config, keystores]);
+    }
+
+    #[test]
     fn the_anvil_phrase_and_its_first_key_give_the_same_address() {
         assert!(matches!(parse(ANVIL_PHRASE), Ok(Secret::Phrase(_))));
         assert_eq!(address_of(ANVIL_PHRASE), ANVIL);
