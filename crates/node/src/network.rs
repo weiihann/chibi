@@ -175,10 +175,12 @@ pub struct BlockClock {
 }
 
 impl BlockClock {
-    /// The head block number at Unix time `now`, assuming no missed slots since this block.
-    /// Missed slots make the estimate run slightly ahead of the real head.
+    /// A head block number at Unix time `now` that stays at or below the real head as long as
+    /// at most one slot in ten since this block went empty. Sepolia left about one in twenty
+    /// empty in the year after Osaka.
     pub const fn floor(&self, now: u64) -> BlockNumber {
-        self.number + now.saturating_sub(self.timestamp) / SLOT_SECONDS
+        let slots = now.saturating_sub(self.timestamp) / SLOT_SECONDS;
+        self.number + slots - slots / 10
     }
 }
 

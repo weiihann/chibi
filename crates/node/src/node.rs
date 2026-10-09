@@ -576,8 +576,12 @@ async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeE
 /// on `spec`'s network and newer than the network's clock block, else that clock block. The
 /// save came after the head's own timestamp, so counting from it cannot run ahead.
 fn start_clock(spec: &NetworkSpec, saved: Option<&Snapshot>) -> BlockClock {
-    let _ = saved;
-    spec.clock
+    saved
+        .filter(|saved| saved.network == spec.network && saved.block.number > spec.clock.number)
+        .map_or(spec.clock, |saved| BlockClock {
+            number: saved.block.number,
+            timestamp: saved.saved_at,
+        })
 }
 
 impl<P: Peers> Node<P> {
