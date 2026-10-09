@@ -374,13 +374,23 @@ mod tests {
         assert_eq!(cells(0), [full, full, blank, blank]);
         assert_eq!(cells(1), [blank, blank, full, full]);
         assert_eq!(lines[2].to_string(), " ".repeat(2 * WIDTH));
+        let bounds = Bounds::of(&grid).unwrap();
         assert_eq!(
-            cropped(&grid, 2)
+            bounds,
+            Bounds {
+                columns: 0..2,
+                rows: 0..2
+            }
+        );
+        assert_eq!(bounds.cells(2), (0..4, 0..2));
+        assert_eq!(
+            cropped(&grid, &bounds, 2)
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             ["▀▀  ", "  ▀▀"]
         );
+        assert_eq!(Bounds::of(&[[b'.'; WIDTH]; HEIGHT]), None);
     }
 
     #[test]

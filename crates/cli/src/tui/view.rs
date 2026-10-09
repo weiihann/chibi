@@ -1342,6 +1342,166 @@ mod tests {
         }
     }
 
+    /// [`ready`] holding 4.019083742425574983 ETH, on the token row.
+    fn rich() -> App {
+        let mut app = ready();
+        app.balances(Balances {
+            eth: Some(U256::from(4_019_083_742_425_574_983u64)),
+            tokens: vec![(TKN, U256::from(1_500_000))],
+        });
+        app.form.field = Field::Token;
+        app
+    }
+
+    /// The rows inside the card on a `width` x `height` terminal, trailing blanks dropped.
+    fn inside_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        inside(app, &[], width, height)
+            .lines()
+            .map(|row| row.trim_end().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_form_row_too_wide_for_the_card_continues_under_its_values() {
+        let app = rich();
+        let rows = inside_rows(&app, 80, 24);
+        assert_eq!(
+            rows[1..7],
+            [
+                "  from    0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025",
+                "          4.019083742425574983 ETH",
+                "> token   < ETH >   4.019083742425574983 ETH   Enter to choose",
+                "          more tokens appear once their balances are proven",
+                "  amount",
+                "  to",
+            ],
+            "{rows:#?}"
+        );
+        let buffer = drawn(&app, &[], 80, 24);
+        assert_eq!(buffer[(14, 6)].symbol(), "m");
+        assert!(buffer[(14, 6)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn a_wide_card_keeps_each_form_row_on_one_line() {
+        let mut app = rich();
+        let rows = inside_rows(&app, 200, 60);
+        assert_eq!(
+            rows[1..4],
+            [
+                "  from    0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025   4.019083742425574983 ETH",
+                "> token   < ETH >   4.019083742425574983 ETH   Enter to choose   more tokens appear once their balances are proven",
+                "  amount",
+            ],
+            "{rows:#?}"
+        );
+        app.pinned(6, 6, true);
+        let rows = inside_rows(&app, 120, 40);
+        assert_eq!(
+            rows[1..4],
+            [
+                "  from    0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025   4.019083742425574983 ETH",
+                "> token   < ETH >   4.019083742425574983 ETH   Enter to choose",
+                "  amount",
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn the_footer_packs_its_keys_into_as_few_rows_as_hold_them() {
+        let app = ready();
+        let last = |rows: Vec<String>, count: usize| rows[rows.len() - count..].to_vec();
+        assert_eq!(
+            last(inside_rows(&app, 80, 24), 3),
+            [
+                "",
+                "up/down field · Enter or left/right token · type amount (or max) and to",
+                "Enter review · l logs · q quit",
+            ]
+        );
+        assert_eq!(
+            last(inside_rows(&app, 104, 24), 3),
+            [
+                "",
+                "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · l logs",
+                "q quit",
+            ]
+        );
+        assert_eq!(
+            last(inside_rows(&app, 120, 40), 2),
+            [
+                "",
+                "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · l logs · q quit",
+            ]
+        );
+        let borderless = sized(&app, &[], 43, 30)
+            .lines()
+            .map(|row| row.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            last(borderless, 4),
+            [
+                "",
+                "up/down field · Enter or left/right token",
+                "type amount (or max) and to · Enter review",
+                "l logs · q quit",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_token_list_opens_below_the_token_rows_last_line_on_an_80_by_24_terminal() {
+        let mut app = on_the_token_row();
+        let closed = drawn(&app, &[], 80, 24);
+        let rows = inside_rows(&app, 80, 24);
+        assert_eq!(
+            rows[1..4],
+            [
+                "  from    0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025   3.00 ETH",
+                "> token   < WETH >   0.50 WETH   Enter to choose",
+                "          more tokens appear once their balances are proven",
+            ],
+            "{rows:#?}"
+        );
+        app.form.picker = Some(Picker {
+            filter: String::new(),
+            highlighted: app.assets()[2],
+        });
+        let open = drawn(&app, &[], 80, 24);
+        let shown = sized(&app, &[], 80, 24);
+        let corner = |symbol: &str| {
+            (0..24)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .find(|&at| open[at].symbol() == symbol)
+                .unwrap()
+        };
+        let (left, top) = corner("┌");
+        let (right, bottom) = corner("┘");
+        assert_eq!((left, top), (6, 6), "{shown}");
+        for y in 0..24 {
+            for x in 0..80 {
+                if !(left..=right).contains(&x) || !(top..=bottom).contains(&y) {
+                    assert_eq!(open[(x, y)], closed[(x, y)], "({x}, {y})\n{shown}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_side_cat_doubles_only_where_its_bounds_fit_whole() {
+        let bounds = cat::Bounds {
+            columns: 3..19,
+            rows: 2..16,
+        };
+        assert_eq!(side_cat_size(&bounds, 40, 20), Some((2, 32, 14)));
+        assert_eq!(side_cat_size(&bounds, 32, 14), Some((2, 32, 14)));
+        assert_eq!(side_cat_size(&bounds, 40, 13), Some((1, 16, 7)));
+        assert_eq!(side_cat_size(&bounds, 31, 20), Some((1, 16, 7)));
+        assert_eq!(side_cat_size(&bounds, 16, 3), Some((1, 16, 7)));
+        assert_eq!(side_cat_size(&bounds, 15, 20), None);
+    }
+
     #[test]
     fn the_token_list_stays_above_the_notice_and_footer() {
         let mut app = on_the_token_row();
@@ -1640,6 +1800,6 @@ mod tests {
         let rows: Vec<&str> = shown.lines().collect();
         assert_eq!(rows[0], tall[0], "{shown}");
         assert_eq!(squeezed(&rows[1..3].concat()), squeezed(notice), "{shown}");
-        assert_eq!(rows[3], tall[29], "{shown}");
+        assert_eq!(rows[3], tall[26], "{shown}");
     }
 }
