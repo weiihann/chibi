@@ -123,7 +123,7 @@ Once unlocked, your address is watched for that run, so its ETH and every listed
 
 - `from`: your checksummed address and its ETH balance.
 - `token`: ETH or a listed token you hold; left and right cycle through them.
-- `amount`: a decimal amount, or `max` for the whole token balance, or the ETH balance less the max fee. For `max` ETH the fee is estimated for the exact amount sent, since a recipient contract can spend more gas for a nonzero value; if the fee keeps moving that amount, chibi asks for an exact amount instead.
+- `amount`: a decimal amount, or `max` for the whole token balance, or the ETH balance less the max fee. For `max` ETH the fee is estimated for the exact amount sent, since a recipient contract can spend more gas for a nonzero value, and never with a zero value, which a recipient may refuse; if the fee keeps moving that amount, chibi asks for an exact amount instead.
 - `to`: the recipient, `0x` and 40 hex digits. Mixed case must carry a valid checksum; all lowercase skips the check. The zero address is refused, and sending a token to its own contract warns.
 - `fee`: the estimated gas and the max fee, refreshed at each head. A transfer that would revert shows the reason and cannot be sent.
 

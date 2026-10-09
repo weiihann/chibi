@@ -201,16 +201,13 @@ pub fn unlock(path: &Path, password: &str) -> Result<PrivateKeySigner, UnlockErr
     })
 }
 
-/// Estimates the transfer's gas at the head and caps its fees: twice the next block's base
-/// fee plus the suggested tip, so the cap survives several full blocks.
+/// Estimates the transfer's gas at the head and caps its fees with [`fee_caps`].
 pub async fn estimate<P: Peers>(
     node: &Node<P>,
     from: Address,
     draft: &Draft,
 ) -> Result<Fee, TransferError> {
-    let tip = node.max_priority_fee().await?;
-    let history = node.fee_history(1, BlockSel::Latest, &[]).await?;
-    let next_base_fee = history.base_fee_per_gas.last().copied().unwrap_or_default();
+    let caps = fee_caps(node).await?;
     let (to, value, input) = draft.call();
     let request = CallRequest {
         from: Some(from),
@@ -226,21 +223,34 @@ pub async fn estimate<P: Peers>(
         }
         Err(err) => return Err(err.into()),
     };
+    Ok(Fee { gas_limit, ..caps })
+}
+
+/// The fee caps at the head, with no gas: twice the next block's base fee plus the
+/// suggested tip, so the cap survives several full blocks.
+async fn fee_caps<P: Peers>(node: &Node<P>) -> Result<Fee, TransferError> {
+    let tip = node.max_priority_fee().await?;
+    let history = node.fee_history(1, BlockSel::Latest, &[]).await?;
+    let next_base_fee = history.base_fee_per_gas.last().copied().unwrap_or_default();
     Ok(Fee {
-        gas_limit,
+        gas_limit: 0,
         max_fee_per_gas: next_base_fee.saturating_mul(2).saturating_add(tip),
         max_priority_fee_per_gas: tip,
     })
 }
 
-/// Estimates of `max` ETH with a nonzero value before its value must have settled.
+/// Gas of a plain ETH transfer, the least any ETH transfer uses.
+const PLAIN_TRANSFER_GAS: u64 = 21_000;
+
+/// Estimates of `max` ETH before its value must have settled.
 const MAX_ESTIMATES: usize = 2;
 
 /// Answers `quote` with the draft to sign and the fee estimated for exactly that draft.
 ///
-/// `max` ETH starts from the fee of a zero-value call, then re-estimates with the value that
-/// fee leaves, since a recipient may spend more gas for a nonzero value. If that changes the
-/// value it re-estimates once more, and refuses if the value still moves.
+/// `max` ETH starts from the fee of a plain transfer, so the recipient is never asked to
+/// accept a value it might refuse, such as zero, then estimates with the value that fee
+/// leaves. If that changes the fee it re-estimates once more, and refuses if the fee still
+/// moves.
 pub async fn quote<P: Peers>(
     node: &Node<P>,
     from: Address,
@@ -253,14 +263,16 @@ pub async fn quote<P: Peers>(
         }
         Quote::MaxEth { to, balance } => (to, balance),
     };
-    let mut draft = Draft {
-        asset: Asset::Eth,
-        to,
-        amount: U256::ZERO,
+    let mut fee = Fee {
+        gas_limit: PLAIN_TRANSFER_GAS,
+        ..fee_caps(node).await?
     };
-    let mut fee = estimate(node, from, &draft).await?;
     for _ in 0..MAX_ESTIMATES {
-        draft.amount = left_after(balance, &fee)?;
+        let draft = Draft {
+            asset: Asset::Eth,
+            to,
+            amount: left_after(balance, &fee)?,
+        };
         let next = estimate(node, from, &draft).await?;
         if next.max_cost() == fee.max_cost() {
             return Ok(Quoted { draft, fee: next });
@@ -495,7 +507,7 @@ mod tests {
         };
         assert_eq!(
             quote(&node, sender, &short).await.unwrap_err().to_string(),
-            "your balance of 0.000000000000001 ETH does not cover the max fee 0.000058245 ETH"
+            "your balance of 0.000000000000001 ETH does not cover the max fee 0.00005775 ETH"
         );
     }
 
@@ -529,7 +541,7 @@ mod tests {
             quoted.fee,
             estimate(&node, sender, &quoted.draft).await.unwrap()
         );
-        assert_eq!(quoted.fee.gas_limit, 21_016);
+        assert_eq!(quoted.fee.gas_limit, 21_181);
         assert_eq!(quoted.draft.amount + quoted.fee.max_cost(), eth(3));
     }
 
