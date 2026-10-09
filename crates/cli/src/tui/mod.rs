@@ -100,7 +100,7 @@ impl Drop for LogWriter {
 }
 
 /// The terminal in raw mode on the alternate screen, restored when dropped. ratatui's panic
-/// hook restores it on a panic too.
+/// hook restores it on a panic too, and [`run`] restores it if initialization fails partway.
 struct Terminal(DefaultTerminal);
 
 impl Drop for Terminal {
@@ -128,7 +128,11 @@ pub fn run(
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
     let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
-    let mut terminal = Terminal(ratatui::try_init().wrap_err("cannot open the terminal UI")?);
+    let terminal = ratatui::try_init().map_err(|err| {
+        ratatui::restore();
+        err
+    });
+    let mut terminal = Terminal(terminal.wrap_err("cannot open the terminal UI")?);
     let (input_tx, mut input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
     let mut ui = Ui {
