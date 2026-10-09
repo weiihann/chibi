@@ -27,8 +27,9 @@ use reth_eth_wire_types::snap::{
     GetStorageRangesMessage, SnapProtocolMessage, StorageRangesMessage,
 };
 use reth_eth_wire_types::{
-    BlockAccessLists, BlockBodies, BlockHeaders, Capability, Cells, GetBlockHeaders,
-    HeadersDirection, NodeData, Receipts, Receipts69, Receipts70,
+    BlockAccessLists, BlockBodies, BlockHeaders, BlockRangeUpdate, Capability, Cells, EthMessageID,
+    GetBlockHeaders, HeadersDirection, NodeData, RawCapabilityMessage, Receipts, Receipts69,
+    Receipts70,
 };
 use reth_network::eth_requests::IncomingEthRequest;
 use reth_network::events::{NetworkEvent, PeerEvent, SessionInfo};
@@ -661,6 +662,15 @@ fn total_difficulty(chain: &ChainSpec) -> U256 {
     chain.final_paris_total_difficulty().unwrap_or_default()
 }
 
+/// The eth/69 `BlockRangeUpdate` for `head` and its encoding as a raw eth message.
+fn block_range(head: &VerifiedHeader) -> (BlockRangeUpdate, RawCapabilityMessage) {
+    let _ = head;
+    (
+        BlockRangeUpdate::default(),
+        RawCapabilityMessage::eth(EthMessageID::BlockRangeUpdate, Default::default()),
+    )
+}
+
 fn net_error(err: &RequestError, capability: &'static str) -> NetError {
     match err {
         RequestError::ChannelClosed => NetError::Stopped,
@@ -872,10 +882,11 @@ fn empty_snap(request: &SnapProtocolMessage) -> SnapResponse {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{B128, B512};
+    use alloy_primitives::{B128, B512, b256};
     use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World};
     use reth_eth_wire_types::{
-        GetBlockAccessLists, GetBlockBodies, GetCells, GetNodeData, GetReceipts, GetReceipts70,
+        EthMessage, EthNetworkPrimitives, EthVersion, GetBlockAccessLists, GetBlockBodies,
+        GetCells, GetNodeData, GetReceipts, GetReceipts70, ProtocolMessage,
     };
 
     use super::*;
@@ -1140,6 +1151,32 @@ mod tests {
         assert_eq!(headers(held, number(6), 16, 0, Falling), at(&[]));
         assert_eq!(headers(held, HASH, 16, 0, Falling), at(&[]));
         assert_eq!(headers(None, hashes[5], 16, 0, Falling), at(&[]));
+    }
+
+    #[test]
+    fn the_block_range_message_decodes_to_the_head_as_earliest_and_latest() {
+        let hash = b256!("0x7972d020ff8e1aeaaaa90febfa53ed72217398cbacb826f39e533c4d79c2fd8a");
+        let header = Header {
+            number: 11_875_421,
+            timestamp: 1_791_525_744,
+            ..Header::default()
+        };
+        let head = chibi_core::verify::header(TrustedHash::attested(hash), header).unwrap();
+        let expected = BlockRangeUpdate {
+            earliest: 11_875_421,
+            latest: 11_875_421,
+            latest_hash: hash,
+        };
+
+        let (update, message) = block_range(&head);
+        assert_eq!(update, expected);
+        let encoded = message.encoded();
+        let decoded = ProtocolMessage::<EthNetworkPrimitives>::decode_message(
+            EthVersion::Eth69,
+            &mut &encoded[..],
+        )
+        .expect("a well-formed eth/69 message");
+        assert_eq!(decoded.message, EthMessage::BlockRangeUpdate(expected));
     }
 
     #[test]
