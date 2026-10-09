@@ -571,7 +571,8 @@ impl App {
                 self.unlocking = true;
                 return Some(Action::Unlock);
             }
-            Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+            Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {
+            }
         }
         None
     }
@@ -1141,7 +1142,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Paused);
         press(&mut app, KeyCode::Enter);
         assert_eq!(press(&mut app, KeyCode::Char('y')), None);
-        assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Paused, "1"));
+        assert_eq!(
+            (app.screen, app.form.amount.as_str()),
+            (Screen::Paused, "1")
+        );
         app.health(102, 1);
         assert_eq!(app.screen, Screen::Ready);
     }

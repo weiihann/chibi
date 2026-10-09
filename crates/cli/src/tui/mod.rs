@@ -112,7 +112,7 @@ impl Drop for Terminal {
 /// What a background task finished.
 enum Done {
     Balances(Option<Balances>),
-    Estimated(Quote, u64, Result<Quoted, String>),
+    Estimated(Box<(Quote, u64, Result<Quoted, String>)>),
     Sent(Result<TxHash, String>),
 }
 
@@ -128,11 +128,10 @@ pub fn run(
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
     let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
-    let terminal = ratatui::try_init().map_err(|err| {
-        ratatui::restore();
-        err
-    });
-    let mut terminal = Terminal(terminal.wrap_err("cannot open the terminal UI")?);
+    let terminal = ratatui::try_init()
+        .inspect_err(|_| ratatui::restore())
+        .wrap_err("cannot open the terminal UI")?;
+    let mut terminal = Terminal(terminal);
     let (input_tx, mut input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
     let mut ui = Ui {
@@ -323,7 +322,8 @@ impl Ui<'_> {
                     }
                     Some(finished) = done.recv() => match finished {
                         Done::Balances(balances) => self.app.refreshed(balances),
-                        Done::Estimated(quote, head, quoted) => {
+                        Done::Estimated(estimated) => {
+                            let (quote, head, quoted) = *estimated;
                             self.app.estimated(quote, head, quoted);
                         }
                         Done::Sent(sent) => self.app.sent(sent),
@@ -353,7 +353,7 @@ impl Ui<'_> {
                         let quoted = transfer::quote(&node, from, &quote)
                             .await
                             .map_err(|err| err.to_string());
-                        let _ = done_tx.send(Done::Estimated(quote, head, quoted));
+                        let _ = done_tx.send(Done::Estimated(Box::new((quote, head, quoted))));
                     });
                 }
             }

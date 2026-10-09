@@ -482,7 +482,10 @@ mod tests {
         };
 
         let quoted = quote(&node, sender, &max).await.unwrap();
-        assert_eq!(quoted.fee, estimate(&node, sender, &quoted.draft).await.unwrap());
+        assert_eq!(
+            quoted.fee,
+            estimate(&node, sender, &quoted.draft).await.unwrap()
+        );
         assert_eq!(quoted.fee.gas_limit, 43_497);
         assert_eq!(quoted.draft.amount + quoted.fee.max_cost(), eth(3));
 
