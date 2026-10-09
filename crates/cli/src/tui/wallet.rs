@@ -1,9 +1,9 @@
 //! The wallet the TUI's setup makes: a new recovery phrase, an imported private key or
 //! phrase, and the encrypted keystore it saves beside the config.
 
-use std::fs::{self, DirBuilder, File, Permissions};
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, hex};
@@ -195,7 +195,7 @@ fn save_with(
     let name = format!("{}.json", address.to_checksum(None));
     let path = dir.join(&name);
     if path.symlink_metadata().is_ok() {
-        record(config, &path)?;
+        record(config, &path, fault)?;
         return Ok(Saved::Exists(address, path));
     }
     let temp = dir.join(format!(".{name}.{:016x}", rand::random::<u64>()));
@@ -217,7 +217,7 @@ fn save_with(
     File::open(&dir)
         .and_then(|dir| dir.sync_all())
         .map_err(write_error(&dir))?;
-    record(config, &path)?;
+    record(config, &path, fault)?;
     Ok(saved)
 }
 
@@ -248,7 +248,15 @@ fn publish(
 
 /// Sets `keystore` in the config file at `config`, keeping everything else in it, or creates
 /// it with the defaults and `keystore`.
-fn record(config: &Path, keystore: &Path) -> Result<(), SaveError> {
+fn record(
+    config: &Path,
+    keystore: &Path,
+    fault: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<(), SaveError> {
+    let write_error = |source| SaveError::Write {
+        path: config.to_owned(),
+        source,
+    };
     let text = match fs::read_to_string(config) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -256,14 +264,10 @@ fn record(config: &Path, keystore: &Path) -> Result<(), SaveError> {
                 keystore: Some(keystore.to_owned()),
                 ..Config::default()
             };
-            return Ok(created.save(config)?);
+            let text = toml::to_string(&created).map_err(ConfigError::from)?;
+            return replace(config, &text, fault).map_err(write_error);
         }
-        Err(err) => {
-            return Err(SaveError::Write {
-                path: config.to_owned(),
-                source: err,
-            });
-        }
+        Err(err) => return Err(write_error(err)),
     };
     let invalid = |reason: String| SaveError::Config {
         path: config.to_owned(),
@@ -276,10 +280,36 @@ fn record(config: &Path, keystore: &Path) -> Result<(), SaveError> {
         .parse()
         .map_err(|err: toml_edit::TomlError| invalid(err.to_string()))?;
     document["keystore"] = toml_edit::value(value);
-    fs::write(config, document.to_string()).map_err(|source| SaveError::Write {
-        path: config.to_owned(),
-        source,
-    })
+    replace(config, &document.to_string(), fault).map_err(write_error)
+}
+
+/// Writes `text` to a sibling temporary file with `path`'s permissions (or the defaults for a
+/// new file), fsyncs it, renames it over `path` and fsyncs the directory, so `path` holds
+/// either its old or its new contents.
+fn replace(path: &Path, text: &str, fault: &dyn Fn(&Path) -> io::Result<()>) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = dir.join(format!(".{name}.{:016x}", rand::random::<u64>()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if permissions.is_some() { 0o600 } else { 0o666 })
+        .open(&temp)?;
+    let written = permissions
+        .map_or(Ok(()), |permissions| file.set_permissions(permissions))
+        .and_then(|()| file.write_all(text.as_bytes()))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fault(&temp))
+        .and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written.and_then(|()| File::open(dir)?.sync_all())
 }
 
 #[cfg(test)]
