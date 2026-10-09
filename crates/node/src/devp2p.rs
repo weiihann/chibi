@@ -1089,6 +1089,57 @@ mod tests {
     const A: PeerKey = PeerKey(B512::repeat_byte(1));
     const B: PeerKey = PeerKey(B512::repeat_byte(2));
 
+    fn range_at(head: BlockNumber) -> (BlockRangeUpdate, RawCapabilityMessage) {
+        let update = BlockRangeUpdate {
+            earliest: head,
+            latest: head,
+            latest_hash: B256::ZERO,
+        };
+        let payload = alloy_rlp::encode(&update).into();
+        let message = RawCapabilityMessage::eth(EthMessageID::BlockRangeUpdate, payload);
+        (update, message)
+    }
+
+    fn offer(sessions: &watch::Sender<Sessions>, peer: PeerKey, head: BlockNumber) -> Vec<u64> {
+        let mut sent = Vec::new();
+        offer_range(sessions, peer, &range_at(head), |to, message| {
+            assert_eq!(to, peer.0);
+            let update = BlockRangeUpdate::decode(&mut &message.payload[..]).unwrap();
+            sent.push(update.latest);
+        });
+        sent
+    }
+
+    #[test]
+    fn a_session_is_never_sent_an_older_or_equal_range_than_it_has() {
+        let sessions = snap_sessions(&[A]);
+        assert_eq!(offer(&sessions, A, 105), [105]);
+        assert_eq!(offer(&sessions, A, 104), Vec::<u64>::new());
+        assert_eq!(offer(&sessions, A, 105), Vec::<u64>::new());
+        assert_eq!(offer(&sessions, A, 106), [106]);
+    }
+
+    #[test]
+    fn a_connect_time_range_read_before_a_newer_announce_is_not_sent_after_it() {
+        let sessions = snap_sessions(&[A]);
+        let announced = offer(&sessions, A, 105);
+        let connected = offer(&sessions, A, 104);
+        assert_eq!([announced, connected].concat(), [105]);
+    }
+
+    #[test]
+    fn eth68_and_unknown_sessions_are_never_sent_a_range() {
+        let sessions = watch::Sender::new(Sessions::from([(
+            A,
+            Session {
+                eth: 68,
+                ..session(true)
+            },
+        )]));
+        assert_eq!(offer(&sessions, A, 105), Vec::<u64>::new());
+        assert_eq!(offer(&sessions, B, 105), Vec::<u64>::new());
+    }
+
     #[tokio::test]
     async fn snap_requests_go_to_the_least_loaded_snap_session_and_need_one() {
         let eth = PeerKey(B512::repeat_byte(3));
