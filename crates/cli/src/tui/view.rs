@@ -1009,11 +1009,34 @@ mod tests {
         let open = drawn(&app, &[], 120, 10);
         let shown = sized(&app, &[], 120, 10);
         assert!(shown.contains("┌choose a token"), "{shown}");
+        assert!(shown.contains("│> WETH"), "{shown}");
         for y in [8, 9] {
             for x in 0..120 {
                 assert_eq!(open[(x, y)], closed[(x, y)], "({x}, {y})\n{shown}");
             }
         }
+    }
+
+    #[test]
+    fn a_short_token_list_keeps_the_highlighted_row_first() {
+        let popup = Popup {
+            below: 0,
+            filter: Line::raw("filter"),
+            rows: ["  ETH", "  USDC", "> WETH"].map(Line::raw).to_vec(),
+            highlighted: 2,
+            hint: Some(Line::raw("hint")),
+        };
+        let text = |room| {
+            popup
+                .lines(room)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(1), ["> WETH"]);
+        assert_eq!(text(2), ["  USDC", "> WETH"]);
+        assert_eq!(text(4), ["filter", "  ETH", "  USDC", "> WETH"]);
+        assert_eq!(text(5), ["filter", "  ETH", "  USDC", "> WETH", "hint"]);
     }
 
     #[test]
