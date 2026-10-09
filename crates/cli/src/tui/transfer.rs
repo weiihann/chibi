@@ -172,15 +172,15 @@ pub async fn estimate<P: Peers>(
         input,
         ..CallRequest::default()
     };
-    let gas_limit = node
-        .estimate_gas(request, BlockSel::Latest)
-        .await
-        .map_err(|err| match err {
-            NodeError::Estimate(EstimateError::Reverted { output }) => {
-                TransferError::Reverts(revert_reason(&output))
-            }
-            other => TransferError::Node(other),
-        })?;
+    let gas_limit =
+        node.estimate_gas(request, BlockSel::Latest)
+            .await
+            .map_err(|err| match err {
+                NodeError::Estimate(EstimateError::Reverted { output }) => {
+                    TransferError::Reverts(revert_reason(&output))
+                }
+                other => TransferError::Node(other),
+            })?;
     Ok(Fee {
         gas_limit,
         max_fee_per_gas: next_base_fee.saturating_mul(2).saturating_add(tip),

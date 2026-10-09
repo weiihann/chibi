@@ -308,7 +308,10 @@ impl App {
     /// The node's head and state peer count, read each tick once serving.
     pub fn health(&mut self, head: u64, state_peers: usize) {
         if head > self.head {
-            if let Some(sending) = self.sending.as_mut().filter(|s| s.state == SendState::Pending)
+            if let Some(sending) = self
+                .sending
+                .as_mut()
+                .filter(|s| s.state == SendState::Pending)
             {
                 sending.pending_heads += head - self.head;
             }
@@ -460,8 +463,8 @@ impl App {
 
     /// Handles one key press.
     pub fn key(&mut self, key: KeyEvent) -> Option<Action> {
-        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c'));
+        let ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c'));
         if self.screen == Screen::Unlock {
             return self.unlock_key(key, ctrl_c);
         }
@@ -738,7 +741,11 @@ enum Amount {
 
 /// `amount` of `asset` for display, with its symbol.
 pub fn show(amount: U256, asset: Asset) -> String {
-    format!("{} {}", format_units(amount, asset.decimals()), asset.symbol())
+    format!(
+        "{} {}",
+        format_units(amount, asset.decimals()),
+        asset.symbol()
+    )
 }
 
 /// The recipient field as an address, with the reason it cannot be sent to.
@@ -901,7 +908,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Paused);
         assert_eq!(app.estimate_request(), None);
         app.health(102, 2);
-        assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Ready, "1.5"));
+        assert_eq!(
+            (app.screen, app.form.amount.as_str()),
+            (Screen::Ready, "1.5")
+        );
 
         submit(&mut app, "", BOB, Ok(FEE));
         assert_eq!(app.screen, Screen::Review);
@@ -1112,7 +1122,9 @@ mod tests {
         assert_eq!(
             errors(&app),
             [
-                Some("your balance of 0.000000000000001 ETH does not cover the max fee 0.00005775 ETH"),
+                Some(
+                    "your balance of 0.000000000000001 ETH does not cover the max fee 0.00005775 ETH"
+                ),
                 None,
                 None
             ]
@@ -1173,10 +1185,7 @@ mod tests {
         );
         assert_eq!(app.tracking(), None);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(
-            (app.screen, app.form.amount.as_str()),
-            (Screen::Ready, "")
-        );
+        assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Ready, ""));
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
     }
 
