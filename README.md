@@ -1,6 +1,6 @@
 # chibi
 
-chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. Point MetaMask or Rabby at it, and the balances, call results, and gas estimates the wallet shows come from state chibi proved itself, not from an RPC provider. chibi holds no keys. The wallet signs, and chibi simulates, broadcasts, and confirms.
+chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. Point MetaMask or Rabby at it, and the balances, call results, and gas estimates the wallet shows come from state chibi proved itself, not from an RPC provider. Over JSON-RPC chibi holds no keys. The wallet signs, and chibi simulates, broadcasts, and confirms. The one exception is the optional terminal UI, [`chibi run --tui`](#send-from-the-terminal-chibi-run---tui), which unlocks a keystore you name and sends from it.
 
 chibi is early software. It targets Sepolia first. Mainnet support exists in the code but is untested.
 
@@ -58,7 +58,7 @@ A key is held when it is proven at the current head. The status line counts each
 chibi init --network sepolia --address 0xYourAddress --rpc-host 127.0.0.1 --rpc-port 8545
 ```
 
-`--beacon-url URL` and `--data-dir PATH` write `beacon_url` and `data_dir` into the config, and the peer flags write their keys (see [Configuration](#configuration) and [Peers](#peers)). When `chibi init` overwrites an existing config, it keeps that config's `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so.
+`--beacon-url URL`, `--data-dir PATH`, and `--keystore PATH` write `beacon_url`, `data_dir`, and `keystore` into the config, and the peer flags write their keys (see [Configuration](#configuration) and [Peers](#peers)). When `chibi init` overwrites an existing config, it keeps that config's `[[contracts]]` and, unless `--data-dir` is given, its `data_dir`, and says so.
 
 Writing a config resets the chosen network's saved state, since the old snapshot, pending transactions, and learned keys belong to the old config: once the config is written, `chibi init` deletes them from that network's `chibi.db` and prints what it deleted. If the config cannot be written, nothing is deleted. It keeps the remembered state peers, so the next start finds one fast, along with the light-client checkpoint and the devp2p key. It refuses, writing nothing, while a chibi runs on that data directory; stop it first. While init writes, it holds that data directory, so a chibi started meanwhile refuses to start. Without a database there is nothing to reset and it says nothing.
 
@@ -77,6 +77,7 @@ chibi status --config ~/chibi-test.toml
 ```sh
 chibi run        # in the foreground; Ctrl-C stops it
 chibi run -b     # in the background; logs go to the data directory
+chibi run --tui  # with a terminal UI that sends from your keystore, see below
 chibi status     # whether it runs, and the balances saved at the last verified head
 chibi stop       # stops a background chibi
 ```
@@ -97,6 +98,41 @@ The ENS name comes from the chain's ENS UniversalResolver, run by chibi itself o
 
 The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 days to 2026-10-07. Mainnet has all 15: USDT, USDC, WETH, WBTC, UNI, LINK, QNT, DAI, PYUSD, ONDO, AAVE, PEPE, SHIB, 1INCH, and CRV. Sepolia has the 9 with a Sepolia deployment: USDT, USDC, WETH, WBTC, UNI, LINK, DAI, PYUSD, and AAVE. Sepolia's USDC, PYUSD, and LINK are their issuers' own deployments. Sepolia's USDT, DAI, WBTC, and AAVE are test tokens from Aave's Sepolia faucet, not tokens issued by Tether, Maker, BitGo, or Aave; anyone can mint them, so their balances carry no value.
 
+## Send from the terminal (`chibi run --tui`)
+
+`chibi run --tui` runs chibi in a terminal UI that sends ETH or a token from the [token list](#token-list) from your own keystore, while JSON-RPC keeps serving your wallet as `chibi run` does. It is the only mode in which chibi holds a key: the keystore is decrypted into memory when you type its password, and the key is never logged or written anywhere.
+
+Set up a keystore once, for example with Foundry's `cast`, which asks for the private key and a password:
+
+```sh
+cast wallet import chibi --interactive          # writes ~/.foundry/keystores/chibi
+chibi init --keystore ~/.foundry/keystores/chibi   # or pass --keystore to chibi run
+chibi run --tui
+```
+
+The keystore is an encrypted JSON keystore (Web3 Secret Storage, as `cast wallet import` writes it). `--tui` takes every `chibi run` flag (`--config`, `--network`, `--data-dir`, `--rpc-host`, `--rpc-port`, the peer flags), plus:
+
+| Flag | Meaning |
+|---|---|
+| `--keystore PATH` | The keystore to send from, instead of the config's `keystore`. `--tui` without either is an error |
+| `--logs` | Start with the log pane open |
+
+`--tui` cannot run in the background (`-b`). A keystore that is missing or unreadable stops chibi before anything starts, naming the path. A wrong password asks again.
+
+Once unlocked, your address is watched for that run, so its ETH and every listed token are proven while chibi waits for a state peer. A dozing cat shows the wait, `looking for a state peer · peers N · state peers M · 1m20s`, and perks up at `found a state peer!`. Then the transfer form opens:
+
+- `from`: your checksummed address and its ETH balance.
+- `token`: ETH or a listed token you hold; left and right cycle through them.
+- `amount`: a decimal amount, or `max` for the whole token balance, or the ETH balance less the max fee.
+- `to`: the recipient, `0x` and 40 hex digits. Mixed case must carry a valid checksum; all lowercase skips the check. The zero address is refused, and sending a token to its own contract warns.
+- `fee`: the estimated gas and the max fee, refreshed at each head. A transfer that would revert shows the reason and cannot be sent.
+
+Enter checks every field and shows each problem beside its field, keeping what you typed. Review then shows the network and chain id, the full recipient, the exact amount and token, and the max fee; `y` signs and sends, `n` or Esc goes back. The transfer is an EIP-1559 transaction with the pending nonce, the suggested tip, and a max fee of twice the next block's base fee plus the tip, broadcast through chibi like a wallet's. The UI follows it from pending to included to a verified receipt and shows success for status 1 and failure for status 0. After 10 blocks still pending it says so; chibi never raises the fee on its own.
+
+Sending works only while a state peer is connected: without one, a sleepy cat says `waiting for a state peer`, Review and sending are disabled, and the form comes back as it was when one returns. Sending is Sepolia only for now: on mainnet the form shows your balances, and Review says `sending on mainnet is not enabled yet`.
+
+Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (the last lines of chibi's log, which goes there instead of the terminal), `q` or Ctrl-C quits and stops chibi as Ctrl-C does in `chibi run`. Quitting with a transfer still pending warns first; the transfer stays in chibi's outbox, which broadcasts it again on the next run.
+
 ## Configuration
 
 `config.toml` fields:
@@ -113,6 +149,7 @@ The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 da
 | `allowed_hosts` | `localhost`, `127.0.0.1`, `[::1]` | Accepted `Host` headers, which blocks DNS rebinding |
 | `p2p_port` | `0` (OS picks) | devp2p listen port |
 | `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
+| `keystore` | none | Absolute path of the encrypted JSON keystore `chibi run --tui` sends from |
 | `contracts` | none | Contract accounts and storage slots to pin, see below |
 
 The peer keys are under [Peers](#peers).
@@ -185,4 +222,4 @@ cargo run -p chibi-node --example live_node -- 0xAddress   # live Sepolia: a ful
 scripts/oracle-check.sh 0xAddress   # compare a running chibi with a public RPC at chibi's head
 ```
 
-The workspace has three crates. `chibi-core` holds proof verification, the known-key store, BAL application, and local execution, with no I/O. `chibi-node` holds the light client, devp2p, the head follower, and the request-side node API. `chibi` is the binary and its JSON-RPC server.
+The workspace has three crates. `chibi-core` holds proof verification, the known-key store, BAL application, and local execution, with no I/O. `chibi-node` holds the light client, devp2p, the head follower, and the request-side node API. `chibi` is the binary, its JSON-RPC server, and its terminal UI.

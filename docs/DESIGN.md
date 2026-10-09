@@ -1,6 +1,6 @@
 # chibi design
 
-chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. It answers from state it proved itself instead of from an RPC provider. It holds no keys: the wallet (MetaMask, Rabby) signs, and chibi verifies, simulates, and broadcasts.
+chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. It answers from state it proved itself instead of from an RPC provider. Over JSON-RPC it holds no keys: the wallet (MetaMask, Rabby) signs, and chibi verifies, simulates, and broadcasts. The one place chibi signs is `chibi run --tui`, which decrypts a keystore the user names into memory and sends transfers from it (see [Terminal UI](#terminal-ui)).
 
 ## Problem
 
@@ -46,7 +46,7 @@ The user adds `http://127.0.0.1:8545` as a custom network in the wallet. Balance
 `chibi run` in the binary:
 
 ```rust
-let (node, follower) = Node::start(node_config, found_state_peer).await?; // returns at a freshly verified head
+let (node, follower) = Node::start(node_config, progress).await?; // returns at a freshly verified head
 tokio::select! {
     result = follower.run() => result.wrap_err("head follower stopped"),
     result = rpc::serve(node, rpc_config) => result.wrap_err("JSON-RPC server stopped"),
@@ -73,7 +73,7 @@ chibi/
   install.sh
   crates/core   chibi-core, no tokio: verify.rs state.rs working.rs exec.rs tx.rs
   crates/node   chibi-node: node.rs follow.rs fetch.rs disk.rs peers.rs heads.rs devp2p.rs beacon.rs network.rs fixture.rs
-  crates/cli    chibi (bin): main.rs (init, run, status), config.rs, rpc.rs
+  crates/cli    chibi (bin): main.rs (init, run, status), config.rs, rpc.rs, tui/ (mod.rs app.rs transfer.rs view.rs)
 ```
 
 Dependencies point one way: `cli -> node -> core`. reth-network and helios compile only into `node`. JSON-RPC types appear only in `cli/rpc.rs`.
@@ -95,6 +95,8 @@ Values enter a `Store` only through `Store::insert(Proven)` at the anchor, `Stat
 ### Start
 
 Once the trusted head's header is fetched and verified, `Node::start` builds an empty store at that anchor with the working set (the pinned keys plus the learned keys the last run saved), restores the outbox, persists, and returns, and JSON-RPC opens. Nothing is proven before RPC opens. The follower's first step runs the seeding calls and warms everything unheld. Requests during warm-up fetch their misses on demand.
+
+`Node::start` takes a `watch::Sender<Startup>` and reports on it: `Waiting { peers, state_peers, elapsed }` on every session change and at least once a second while it waits for a state peer, `FoundStatePeer` when the first one connects, and `Serving` once anchored, just before it returns. A watch keeps only the latest value, so a slow reader can see `Serving` without `FoundStatePeer`; readers treat any non-`Waiting` value as the end of the wait.
 
 ### Advancing to a new head
 
@@ -136,6 +138,14 @@ The state database is `chibi.db` in the per-network data directory, a SQLite fil
 
 `rpc.rs` decodes EIP-2718 bytes and rejects blob transactions. `Node::submit` checks the chain id, recovers the sender, persists the outbox, records the transaction with the anchor chibi held at submission, and broadcasts it to up to 8 connected peers. While anything is pending, the follower walks back from the anchor through every block it has not searched yet, down to the oldest pending transaction's submission anchor (at most 8192 blocks, past the header window when needed), fetches and verifies those bodies against `transactions_root`, and matches hashes. On a match it verifies the block's receipts against `receipts_root` and stores the receipt, including for blocks a reanchor skipped. Pending transactions whose nonce was used are pruned only after every block since their submission anchor was searched, so a failed body fetch, a restart, or a long sleep cannot drop a mined transaction. This works with and without BALs. `eth_getTransactionCount(pending)` adds pending outbox transactions to the anchor nonce. Fees use the verified base fee and tips sampled from verified bodies, fetched on demand and cached per block.
 
+### Terminal UI
+
+`chibi run --tui` runs the same node and JSON-RPC server in-process, through the same `serve` path as a plain run, under a ratatui terminal UI (`cli/tui/`). Logs go to an in-memory ring of the last 1000 lines instead of stdout, shown in a toggleable pane. The UI is a pure state machine (`tui/app.rs`: Unlock, Waiting, Excited, Ready, Paused, Review, Sending) fed by keys, `Startup` progress, and a 1-second tick that reads `Node::health` and tracks a sent transfer; `tui/view.rs` draws it and `tui/mod.rs` owns the terminal and the event loop.
+
+Before the node starts, the UI asks for the password of the keystore named by `--keystore` or the config's `keystore` and decrypts it with `PrivateKeySigner::decrypt_keystore`. The key stays in memory and is never logged or written; the password lives in the UI state only while typed. The address is added to the watched addresses, so its ETH and every registry token are pinned and proven while chibi waits for a state peer. Balances come from the display snapshot (`Node::status`), computed on a blocking thread at each new head.
+
+`tui/transfer.rs` builds an EIP-1559 transfer through the node's own request API: the nonce from `transaction_count(sender, Pending)`, the tip from `max_priority_fee`, a max fee of twice the next block's base fee plus the tip, and the gas limit from `estimate_gas`, whose revert stops the transfer before anything is signed. ETH goes as the value; a registry token as `transfer(recipient, amount)` to the token contract. The signed bytes go through `Node::submit`, so the outbox, rebroadcast, and receipt verification are the ones wallet transactions get. The form refuses Review while no state peer is connected, and Review refuses to sign on any network but Sepolia.
+
 ### Block tags and unsupported methods
 
 `latest` and `pending` resolve to the anchor. `safe` and `finalized` resolve to the finalized header for block queries. A state query by number or hash is served at the anchor and the 8 blocks before it. Wallets need this: MetaMask's network client rewrites `latest` to the number its block tracker last polled, every 20 s, which on Sepolia's 12 s blocks is often one or two blocks behind chibi's head. State queries at older blocks, history, and `eth_getLogs` return a JSON-RPC error that names the held head.
@@ -146,7 +156,7 @@ The state database is `chibi.db` in the per-network data directory, a SQLite fil
 
 The light-client checkpoint follows one precedence: a user override, else the checkpoint helios saved in the data directory (a file of exactly 32 bytes), else the newest checkpoint from the community checkpoint services, logged as a warning. chibi never passes helios's shipped default, which is older than helios's 14-day limit. helios saves only checkpoints newer than the one it started from, so after a first-run sync chibi saves that checkpoint itself in helios's file format.
 
-At start chibi dials the known and remembered state peers as static peers and waits, logging `waiting for a state peer (snap/2)` every 30 seconds, until one state peer is connected. It does not give up, because discovery of these rare peers has taken from under a minute to several minutes. When the wait ends, `Node::start` runs the caller's `found_state_peer` callback once, before fetching the anchor header; the CLI prints a small ASCII cat with `found a state peer` to stdout. The library itself prints nothing.
+At start chibi dials the known and remembered state peers as static peers and waits, logging `waiting for a state peer (snap/2)` every 30 seconds and reporting `Startup::Waiting` at least once a second, until one state peer is connected. It does not give up, because discovery of these rare peers has taken from under a minute to several minutes. When the wait ends, `Node::start` reports `Startup::FoundStatePeer` before fetching the anchor header; a plain `chibi run` then prints a small ASCII cat with `found a state peer` to stdout from a blocking task, off the startup path. The library itself prints nothing.
 
 `NetConfig` carries the user's peer settings to the one reth `NetworkConfigBuilder` in `node::devp2p`: trusted peers (reth's `PeersConfig` trusted nodes, always dialed and kept), `trusted_only` (reth connects to and accepts trusted nodes only, and chibi then dials no built-in or remembered snap/2 peer and starts discovery from no network boot node), boot nodes replacing the network's, outbound and inbound session limits (reth's 100 and 30 by default), a discovery port apart from the RLPx port, and discovery off. The config refuses `trusted_only` without trusted peers, and discovery off when there is nothing else to dial: no trusted peer, and no built-in snap/2 peer (mainnet has none) or `trusted_only`.
 
@@ -189,6 +199,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 - We accept rewriting the snapshot row at each head (a few KB of JSON), in exchange for keeping the display-only snapshot out of the schema. The outbox and peers tables are rewritten only when they change.
 - We accept one mutex around the canonical value, in exchange for no actor. It guards only synchronous pure calls.
 - We accept receipts only for transactions submitted through chibi.
+- We accept that a TUI transfer stuck pending is only reported (`still pending` after 10 heads) and never fee-bumped, in exchange for never signing a second transaction the user did not review. The outbox keeps rebroadcasting it, including after a restart.
 - We accept that `eth_call` and `eth_estimateGas` with `pending` use the anchor's block environment.
 - We accept keeping 8 full copies of the store besides the current one, so a wallet that names a block up to about 96 s old reads state instead of `-32004`. Each copy holds up to 1024 entries of about 140 bytes plus their slot maps, and 257 headers of 800 bytes, so about 0.4 MB, and the 8 cost about 3 MB (estimated from the type sizes, not measured on a live node). `advance` copies the store once per block rather than mutating it in place.
 

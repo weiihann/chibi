@@ -37,3 +37,4 @@ Each feature file has an H1 title and one paragraph describing the user-visible 
 - [Send and confirm](./send-and-confirm.md) covers sending a signed transaction through chibi and getting a verified receipt. Needs a funded Sepolia key.
 - [Onboarding](./onboarding.md) covers `install.sh`, interactive and flag-driven `chibi init`, and the first `chibi run`.
 - [RPC exposure](./rpc-exposure.md) covers the Host filter, the CORS allowlist, unsupported methods, and block responses.
+- [Terminal UI](./tui.md) covers `chibi run --tui`: keystore unlock, the state-peer wait and its cat, the transfer form and its validation, sending and tracking to a verified receipt, the state-peer pause, and the Sepolia-only rule. Driven in tmux on a scratch port with a scratch keystore; sending needs a funded Sepolia key.
