@@ -649,6 +649,45 @@ mod tests {
     }
 
     #[test]
+    fn the_keystore_comes_from_the_flag_or_the_config_and_the_tui_needs_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "keystore = \"/keys/a.json\"\n").unwrap();
+        let config = load(&path, true, &run_args(&["--tui"])).unwrap();
+        assert_eq!(config.keystore, Some(PathBuf::from("/keys/a.json")));
+        assert_eq!(tui_keystore(&config).unwrap(), Path::new("/keys/a.json"));
+
+        let args = run_args(&["--tui", "--logs", "--keystore", "b.json"]);
+        assert!(args.tui && args.logs);
+        let config = load(&path, true, &args).unwrap();
+        let flagged = config.keystore.unwrap();
+        assert!(flagged.is_absolute() && flagged.ends_with("b.json"));
+
+        fs::write(&path, "").unwrap();
+        let config = load(&path, true, &run_args(&["--tui"])).unwrap();
+        assert_eq!(
+            tui_keystore(&config).unwrap_err().to_string(),
+            "--tui needs a keystore: pass --keystore PATH, or set keystore in the config (`chibi init --keystore PATH` writes it)"
+        );
+
+        fs::write(&path, "keystore = \"a.json\"\n").unwrap();
+        let error = format!("{:#}", load(&path, true, &RunArgs::default()).unwrap_err());
+        assert!(
+            error.contains("keystore a.json is not an absolute path"),
+            "{error}"
+        );
+
+        use clap::Parser;
+        for argv in [
+            &["chibi", "run", "--tui", "-b"][..],
+            &["chibi", "run", "--tui", "--background"],
+            &["chibi", "run", "--logs"],
+        ] {
+            assert!(crate::Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
     fn run_without_a_config_at_the_default_path_uses_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

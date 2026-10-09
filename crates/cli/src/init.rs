@@ -889,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_and_beacon_url_flags_are_written_only_when_given() {
+    fn data_dir_beacon_url_and_keystore_flags_are_written_only_when_given() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let answered = |keys: ConfigArgs| {
@@ -912,11 +912,13 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("data_dir"), "{text}");
         assert!(!text.contains("beacon_url"), "{text}");
+        assert!(!text.contains("keystore"), "{text}");
         std::fs::remove_file(&path).unwrap();
 
         let custom = answered(ConfigArgs {
             beacon_url: Some("http://127.0.0.1:5052".parse().unwrap()),
             data_dir: Some(dir.path().join("data")),
+            keystore: Some(dir.path().join("key.json")),
             ..ConfigArgs::default()
         });
         assert_eq!(custom.data_dir, Some(dir.path().join("data")));
@@ -928,6 +930,10 @@ mod tests {
         );
         assert!(
             text.contains(&format!("data_dir = {:?}", dir.path().join("data"))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("keystore = {:?}", dir.path().join("key.json"))),
             "{text}"
         );
         assert_eq!(Config::load(&path).unwrap(), Some(custom));
