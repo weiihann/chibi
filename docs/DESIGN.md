@@ -218,7 +218,7 @@ Rejected: A's 64-BAL roll-forward window, which adds a second insertion path and
 
 - Some wallets send state queries tagged `finalized`. Should those serve the anchor instead of an error?
 - Should the RPC fail closed when the anchor falls behind the light client because no state peer is reachable?
-- Will Nethermind peers serve BALs over snap/2 after the fork, and will geth and reth peers enable snap/2? Today only Nethermind does on Sepolia, and the five known state peers are a single point of slowness.
+- Will Nethermind peers serve BALs over snap/2 after the fork, and will geth and reth peers enable snap/2? Today only Nethermind does on Sepolia, and the four built-in state peers are a single point of slowness.
 - The first run trusts the community checkpoint services for weak subjectivity unless the user sets `checkpoint`. Should a release ship a recent checkpoint instead?
 - Does MetaMask's background page send an `Origin` header to a custom RPC? If it does not, the CORS allowlist never applies to it.
 

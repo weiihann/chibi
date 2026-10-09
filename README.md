@@ -168,7 +168,7 @@ Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, p
 
 ### Peers
 
-chibi reads state from state peers: devp2p peers that speak snap/2 and so can serve proofs. By default it finds peers through discovery, starting from the network's boot nodes, and also dials the network's built-in state peers (Sepolia has five; mainnet has none) and the state peers it reached on earlier runs. These keys change that. Each has a flag: `chibi init` writes it into the config, and `chibi run` uses it for that run only.
+chibi reads state from state peers: devp2p peers that speak snap/2 and so can serve proofs. By default it finds peers through discovery, starting from the network's boot nodes, and also dials the network's built-in state peers (Sepolia has four; mainnet has none) and the state peers it reached on earlier runs. These keys change that. Each has a flag: `chibi init` writes it into the config, and `chibi run` uses it for that run only.
 
 | Field | Flag | Default | Meaning |
 |---|---|---|---|
