@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::app::{
     App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, SIDE_CAT_COLUMNS, Screen, SendState, show,
@@ -23,6 +23,12 @@ pub const LOG_PANE_LINES: u16 = 10;
 
 /// The token row's hint while some pinned key is not held yet.
 const TOKENS_UNPROVEN: &str = "more tokens appear once their balances are proven";
+
+/// The token list's title.
+const PICKER_TITLE: &str = "choose a token";
+
+/// The token list's keys, on its bottom border.
+const PICKER_KEYS: &str = "type to filter · Enter pick · Esc cancel";
 
 /// A backup row's bytes: three columns of a 2-digit number and a word padded to 10.
 const BACKUP_ROW_BYTES: usize = 3 * 16;
@@ -70,23 +76,41 @@ pub struct View {
     logs: Option<Vec<String>>,
     /// The idle cat, drawn right of the form where it fits.
     side: Vec<Line<'static>>,
+    /// The token list, drawn over the form.
+    picker: Option<Popup>,
+}
+
+/// Lines drawn in a bordered box over the body, below one of its lines.
+#[derive(Clone, Debug)]
+struct Popup {
+    /// The body line it opens below.
+    below: usize,
+    lines: Vec<Line<'static>>,
 }
 
 impl View {
     /// The screen for `app` at `now`, with `logs` in the log pane when it is open.
     pub fn new(app: &App, logs: Vec<String>, now: Instant) -> Self {
-        let side = if app.cat() == Some(Pose::Idle) {
+        let (body, token_row) = body_lines(app, now);
+        let picker = token_row.and_then(|below| {
+            Some(Popup {
+                below,
+                lines: picker_lines(app)?,
+            })
+        });
+        let side = if app.cat() == Some(Pose::Idle) && picker.is_none() {
             cat::cropped(&cat::frame(Pose::Idle, app.cat_frame(now)))
         } else {
             Vec::new()
         };
         Self {
             header: header_line(app),
-            body: body_lines(app, now),
+            body,
             footer: footer_lines(app),
             notice: app.notice.clone(),
             logs: app.logs.then_some(logs),
             side,
+            picker,
         }
     }
 }
@@ -125,6 +149,18 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
 
     frame.render_widget(Paragraph::new(view.header), header);
     let side = side_area(&view.body, &view.side, body);
+    let picker = view.picker.map(|popup| {
+        let above = Paragraph::new(
+            view.body
+                .iter()
+                .take(popup.below + 1)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .line_count(body.width);
+        (popup_area(&popup.lines, above, body, area), popup.lines)
+    });
     frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
     if let Some(side) = side {
         frame.render_widget(Paragraph::new(view.side), side);
@@ -146,6 +182,17 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
             log_area,
         );
     }
+    if let Some((rect, lines)) = picker {
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::bordered()
+                    .title(PICKER_TITLE)
+                    .title_bottom(PICKER_KEYS),
+            ),
+            rect,
+        );
+    }
 }
 
 /// Where the side cat fits in `body`, two columns right of its widest line and level with
@@ -158,6 +205,25 @@ fn side_area(lines: &[Line<'_>], side: &[Line<'_>], body: Rect) -> Option<Rect> 
         .unwrap_or(u16::MAX)
         .min(body.height.saturating_sub(1));
     fits.then(|| Rect::new(body.x + x, body.y + 1, width, height))
+}
+
+/// Where a box around `lines` goes: `above` rows into `body`, two columns in, as wide as
+/// its lines, title and keys need up to two columns less than `area`, clipped to `area`.
+fn popup_area(lines: &[Line<'_>], above: usize, body: Rect, area: Rect) -> Rect {
+    let widest = lines
+        .iter()
+        .map(Line::width)
+        .chain([PICKER_TITLE.chars().count(), PICKER_KEYS.chars().count()])
+        .max()
+        .unwrap_or(0);
+    let width = u16::try_from(widest + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.width.saturating_sub(2));
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let top = body
+        .y
+        .saturating_add(u16::try_from(above).unwrap_or(u16::MAX));
+    Rect::new(body.x.saturating_add(2), top, width, height).intersection(area)
 }
 
 fn header_line(app: &App) -> Line<'static> {
@@ -189,8 +255,10 @@ fn pick<T: Copy, const N: usize>(frames: &[T; N], tick: u64) -> T {
     frames[usize::try_from(tick % N as u64).unwrap_or_default()]
 }
 
-fn body_lines(app: &App, now: Instant) -> Vec<Line<'static>> {
+/// The body's lines, and on the form the index of the token row.
+fn body_lines(app: &App, now: Instant) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines = vec![Line::default()];
+    let mut token_row = None;
     match app.screen {
         Screen::Menu => menu(app, &mut lines),
         Screen::Backup => backup(app, &mut lines),
@@ -223,11 +291,11 @@ fn body_lines(app: &App, now: Instant) -> Vec<Line<'static>> {
                 "nothing can be proven or sent until one connects; your form is kept",
             ));
         }
-        Screen::Ready => form(app, &mut lines),
+        Screen::Ready => token_row = Some(form(app, &mut lines)),
         Screen::Review => review(app, &mut lines),
         Screen::Sending => sending(app, now, &mut lines),
     }
-    lines
+    (lines, token_row)
 }
 
 fn menu(app: &App, lines: &mut Vec<Line<'static>>) {
@@ -339,7 +407,8 @@ fn unlock(app: &App, lines: &mut Vec<Line<'static>>) {
     }
 }
 
-fn form(app: &App, lines: &mut Vec<Line<'static>>) {
+/// Pushes the form, returning the index of its token row.
+fn form(app: &App, lines: &mut Vec<Line<'static>>) -> usize {
     let from = app
         .sender
         .map(|sender| sender.to_checksum(None))
@@ -362,12 +431,14 @@ fn form(app: &App, lines: &mut Vec<Line<'static>>) {
             balance(app.balance(asset), asset)
         ),
     );
-    if app.tokens_unproven {
-        token.push_span(Span::styled(
-            format!("   {TOKENS_UNPROVEN}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    if app.form.field == Field::Token {
+        token.push_span(Span::styled("   Enter to choose", dim));
     }
+    if app.tokens_unproven {
+        token.push_span(Span::styled(format!("   {TOKENS_UNPROVEN}"), dim));
+    }
+    let token_row = lines.len();
     lines.push(token);
     lines.push(field(Field::Amount, "amount", app.form.amount.clone()));
     if let Some(error) = &app.form.amount_error {
@@ -392,6 +463,43 @@ fn form(app: &App, lines: &mut Vec<Line<'static>>) {
     if let Some(error) = &app.form.fee_error {
         lines.push(error_line(error));
     }
+    token_row
+}
+
+/// The open token list: the filter, then each matching asset with its balance, the
+/// highlighted one marked.
+fn picker_lines(app: &App) -> Option<Vec<Line<'static>>> {
+    let picker = app.form.picker.as_ref()?;
+    let assets = app.assets();
+    let width = |text: fn(Asset) -> &'static str| {
+        assets
+            .iter()
+            .map(|asset| text(*asset).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (symbols, names) = (width(Asset::symbol), width(Asset::name));
+    let mut lines = vec![Line::raw(format!("filter  {}", picker.filter))];
+    let matches = picker.matches(&assets);
+    if matches.is_empty() {
+        lines.push(Line::raw("no token matches"));
+    }
+    for (at, asset) in matches.into_iter().enumerate() {
+        let marker = if at == picker.highlighted { ">" } else { " " };
+        lines.push(Line::raw(format!(
+            "{marker} {:<symbols$}  {:<names$}  {}",
+            asset.symbol(),
+            asset.name(),
+            balance(app.balance(asset), asset)
+        )));
+    }
+    if app.tokens_unproven {
+        lines.push(Line::styled(
+            TOKENS_UNPROVEN,
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Some(lines)
 }
 
 fn review(app: &App, lines: &mut Vec<Line<'static>>) {
@@ -471,7 +579,7 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Unlock => "Enter unlock · Esc quit",
         Screen::Waiting | Screen::Excited | Screen::Paused => "l logs · q quit",
         Screen::Ready => {
-            "up/down field · left/right token · type amount (or max) and to · Enter review · l logs · q quit"
+            "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · l logs · q quit"
         }
         Screen::Review => "y send · n back · l logs · q quit",
         Screen::Sending => "Enter back to the form · l logs · q quit",
