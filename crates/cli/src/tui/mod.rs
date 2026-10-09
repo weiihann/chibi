@@ -11,21 +11,24 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::TxHash;
 use alloy_signer_local::PrivateKeySigner;
-use chibi_node::{Holding, Node, NodeConfig, Token};
+use chibi_node::{Holding, Node, NodeConfig, Peers, Startup, Token};
 use crossterm::event::{self, Event, KeyEventKind};
 use eyre::WrapErr;
-use ratatui::DefaultTerminal;
-use tokio::runtime::Runtime;
+use ratatui::Terminal;
+use ratatui::backend::Backend;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
 use self::app::{Action, App, Balances};
 use self::transfer::{Quote, Quoted, UnlockError};
+use self::view::View;
 use crate::run::{self, STARTING, Served};
 
 /// Log lines kept for the log pane.
@@ -36,6 +39,13 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// How long the key reader waits for input before checking whether the TUI has gone.
 const KEY_POLL: Duration = Duration::from_millis(100);
+
+/// How long the TUI waits at exit for the render thread to restore the terminal. A render
+/// thread still blocked writing is left behind, so it cannot keep the process alive.
+const RESTORE_WAIT: Duration = Duration::from_millis(500);
+
+/// How often [`join_within`] checks whether its thread has ended.
+const JOIN_POLL: Duration = Duration::from_millis(10);
 
 /// The last [`LOG_LINES`] log lines. Under `--tui` the tracing subscriber writes here
 /// instead of stdout, which the UI owns.
@@ -99,14 +109,58 @@ impl Drop for LogWriter {
     }
 }
 
-/// The terminal in raw mode on the alternate screen, restored when dropped. ratatui's panic
-/// hook restores it on a panic too, and [`run`] restores it if initialization fails partway.
-struct Terminal(DefaultTerminal);
+/// A terminal that `restore` puts back when dropped. ratatui's panic hook restores it on a
+/// panic too.
+struct Restoring<B: Backend> {
+    terminal: Terminal<B>,
+    restore: fn(),
+}
 
-impl Drop for Terminal {
+impl<B: Backend> Drop for Restoring<B> {
     fn drop(&mut self) {
-        ratatui::restore();
+        (self.restore)();
     }
+}
+
+/// Opens the terminal with `init`, restoring it with `restore` if `init` fails partway.
+fn open<B: Backend, E>(
+    init: impl FnOnce() -> Result<Terminal<B>, E>,
+    restore: fn(),
+) -> Result<Restoring<B>, E> {
+    init()
+        .map(|terminal| Restoring { terminal, restore })
+        .inspect_err(|_| restore())
+}
+
+/// Draws the latest view until every sender is dropped, then restores the terminal. Runs on
+/// its own thread, so a terminal whose writes block stalls only this thread.
+fn render<B: Backend>(
+    mut terminal: Restoring<B>,
+    mut views: watch::Receiver<View>,
+    runtime: &Handle,
+) -> Result<(), B::Error> {
+    loop {
+        let latest = views.borrow_and_update().clone();
+        terminal.terminal.draw(|frame| view::draw(frame, latest))?;
+        if runtime.block_on(views.changed()).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// Joins `thread` if it ends within `wait`, else hands it back still running.
+fn join_within<T>(
+    thread: thread::JoinHandle<T>,
+    wait: Duration,
+) -> Result<thread::Result<T>, thread::JoinHandle<T>> {
+    let deadline = Instant::now() + wait;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(thread);
+        }
+        thread::sleep(JOIN_POLL);
+    }
+    Ok(thread.join())
 }
 
 /// What a background task finished.
@@ -127,17 +181,18 @@ pub fn run(
     logs_open: bool,
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
-    let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
-    let terminal = ratatui::try_init()
-        .inspect_err(|_| ratatui::restore())
-        .wrap_err("cannot open the terminal UI")?;
-    let mut terminal = Terminal(terminal);
-    let (input_tx, mut input) = mpsc::unbounded_channel();
+    let app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
+    let terminal =
+        open(ratatui::try_init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
+    let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+    let handle = runtime.handle().clone();
+    let renderer = thread::spawn(move || render(terminal, latest, &handle));
+    let (input_tx, input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
     let mut ui = Ui {
-        terminal: &mut terminal,
-        app: &mut app,
-        input: &mut input,
+        views,
+        app,
+        input,
         logs,
     };
     let result = runtime.block_on(async {
@@ -148,14 +203,47 @@ pub fn run(
         if !node_config.watch.addresses.contains(&address) {
             node_config.watch.addresses.push(address);
         }
-        ui.drive(node_config, served, Arc::new(signer)).await
+        let progress = watch::Sender::new(STARTING);
+        let startup = progress.subscribe();
+        let (quit, quit_rx) = oneshot::channel::<()>();
+        let (node_tx, node) = oneshot::channel::<Node>();
+        let shutdown = async move {
+            tokio::select! {
+                signal = run::shutdown_signal() => signal,
+                _ = quit_rx => Ok("the TUI's quit key"),
+            }
+        };
+        let task = tokio::spawn(run::serve(
+            node_config,
+            served,
+            false,
+            progress,
+            shutdown,
+            move |node: &Node| {
+                let _ = node_tx.send(node.clone());
+            },
+        ));
+        let node_task = NodeTask {
+            task,
+            startup,
+            node,
+            quit,
+        };
+        ui.drive(node_task, Arc::new(signer)).await
     });
-    drop(input);
-    drop(terminal);
+    drop(ui);
+    let rendered = match join_within(renderer, RESTORE_WAIT) {
+        Ok(Ok(rendered)) => rendered.wrap_err("cannot draw the terminal UI"),
+        Ok(Err(_)) => Err(eyre::eyre!("the terminal UI panicked")),
+        Err(_blocked) => {
+            tracing::warn!("the terminal still blocks its writes; it is left as last drawn");
+            Ok(())
+        }
+    };
     if reader.join().is_err() {
         tracing::warn!("the key reader panicked");
     }
-    result
+    rendered.and(result)
 }
 
 /// Forwards terminal input until the UI drops its receiver.
@@ -177,25 +265,37 @@ fn read_input(input: &mpsc::UnboundedSender<Event>) {
     }
 }
 
-/// The UI's terminal, state, input and log.
+/// The node's task as the UI sees it.
+struct NodeTask<P: Peers> {
+    /// `serve`, ending once the node has shut down.
+    task: JoinHandle<eyre::Result<()>>,
+    /// Its start-up progress.
+    startup: watch::Receiver<Startup>,
+    /// The node, once anchored.
+    node: oneshot::Receiver<Node<P>>,
+    /// Shuts the node down as a signal does.
+    quit: oneshot::Sender<()>,
+}
+
+/// The UI's state, its input and log, and the channel to the render thread.
 struct Ui<'a> {
-    terminal: &'a mut Terminal,
-    app: &'a mut App,
-    input: &'a mut mpsc::UnboundedReceiver<Event>,
+    views: watch::Sender<View>,
+    app: App,
+    input: mpsc::UnboundedReceiver<Event>,
     logs: &'a LogBuffer,
 }
 
 impl Ui<'_> {
-    fn draw(&mut self) -> eyre::Result<()> {
+    /// Hands the render thread the screen for the current state.
+    fn draw(&self) -> eyre::Result<()> {
         let logs = if self.app.logs {
             self.logs.tail(usize::from(view::LOG_PANE_LINES))
         } else {
             Vec::new()
         };
-        self.terminal
-            .0
-            .draw(|frame| view::draw(frame, self.app, &logs))?;
-        Ok(())
+        self.views
+            .send(View::new(&self.app, logs))
+            .map_err(|_| eyre::eyre!("the terminal UI stopped drawing"))
     }
 
     /// Asks for the password until the keystore decrypts. `None` when the user quits first.
@@ -242,40 +342,26 @@ impl Ui<'_> {
         }
     }
 
-    /// Runs the node on its own task and the UI here until the node stops. The UI reaches the
-    /// node only through channels and the [`Node`] handle, so a terminal that blocks a draw
-    /// stalls the screen but not the node, its JSON-RPC, or its shutdown on a signal.
-    async fn drive(
+    /// Runs the UI until the node task ends. The render thread draws, so a terminal that
+    /// blocks its writes stalls the screen but not this loop: quit keys and signals still
+    /// shut the node down, and every [`Node`] handle the UI holds is dropped before it
+    /// returns.
+    async fn drive<P: Peers>(
         &mut self,
-        node_config: NodeConfig,
-        served: Served,
+        node_task: NodeTask<P>,
         signer: Arc<PrivateKeySigner>,
     ) -> eyre::Result<()> {
-        let progress = watch::Sender::new(STARTING);
-        let mut startup = progress.subscribe();
+        let NodeTask {
+            task: mut serving,
+            mut startup,
+            node: mut node_rx,
+            quit,
+        } = node_task;
+        let mut quit = Some(quit);
         let mut startup_open = true;
-        let (quit_tx, quit_rx) = oneshot::channel::<()>();
-        let mut quit_tx = Some(quit_tx);
-        let (node_tx, mut node_rx) = oneshot::channel::<Node>();
-        let mut node: Option<Node> = None;
+        let mut node: Option<Node<P>> = None;
         let mut node_pending = true;
-        let shutdown = async move {
-            tokio::select! {
-                signal = run::shutdown_signal() => signal,
-                _ = quit_rx => Ok("the TUI's quit key"),
-            }
-        };
-        let mut serving = tokio::spawn(run::serve(
-            node_config,
-            served,
-            false,
-            progress,
-            shutdown,
-            move |node: &Node| {
-                let _ = node_tx.send(node.clone());
-            },
-        ));
-        let (done_tx, mut done) = mpsc::unbounded_channel::<Done>();
+        let mut tasks = JoinSet::new();
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let ui: eyre::Result<eyre::Result<()>> = async {
@@ -294,39 +380,44 @@ impl Ui<'_> {
                     },
                     started = &mut node_rx, if node_pending => {
                         node_pending = false;
-                        node = started.ok();
+                        if quit.is_some() {
+                            node = started.ok();
+                        }
                     }
                     Some(event) = self.input.recv() => {
                         let Event::Key(key) = event else { continue };
                         match self.app.key(key) {
                             Some(Action::Quit) => {
-                                if let Some(quit) = quit_tx.take() {
+                                if let Some(quit) = quit.take() {
                                     let _ = quit.send(());
                                     self.app.notice = Some("shutting down...".to_owned());
+                                    node = None;
+                                    tasks.abort_all();
                                 }
                             }
                             Some(Action::Send(draft, fee)) => {
                                 if let Some(node) = node.clone() {
                                     let signer = Arc::clone(&signer);
-                                    let done_tx = done_tx.clone();
-                                    tokio::spawn(async move {
+                                    tasks.spawn(async move {
                                         let sent = transfer::send(&node, &signer, &draft, &fee)
                                             .await
                                             .map_err(|err| err.to_string());
-                                        let _ = done_tx.send(Done::Sent(sent));
+                                        Done::Sent(sent)
                                     });
                                 }
                             }
                             Some(Action::Unlock) | None => {}
                         }
                     }
-                    Some(finished) = done.recv() => match finished {
-                        Done::Balances(balances) => self.app.refreshed(balances),
-                        Done::Estimated(estimated) => {
+                    Some(finished) = tasks.join_next() => match finished {
+                        Ok(Done::Balances(balances)) => self.app.refreshed(balances),
+                        Ok(Done::Estimated(estimated)) => {
                             let (quote, head, quoted) = *estimated;
                             self.app.estimated(quote, head, quoted);
                         }
-                        Done::Sent(sent) => self.app.sent(sent),
+                        Ok(Done::Sent(sent)) => self.app.sent(sent),
+                        Err(err) if err.is_cancelled() => {}
+                        Err(err) => return Err(err).wrap_err("a TUI task failed"),
                     },
                     _ = ticks.tick() => {
                         self.app.tick();
@@ -335,7 +426,7 @@ impl Ui<'_> {
                             self.app.health(health.head.number, health.state_peers);
                             self.app.pinned(health.pinned.held, health.pinned.total);
                             if self.app.balances_request(health.head.number, health.pinned.held) {
-                                refresh_balances(node, &signer, self.app.registry, &done_tx);
+                                refresh_balances(node, &signer, self.app.registry, &mut tasks);
                             }
                             if let Some(hash) = self.app.tracking()
                                 && let Some(tracked) = transfer::track(node, hash)
@@ -349,21 +440,22 @@ impl Ui<'_> {
                     let node = node.clone();
                     let from = signer.address();
                     let head = self.app.head;
-                    let done_tx = done_tx.clone();
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let quoted = transfer::quote(&node, from, &quote)
                             .await
                             .map_err(|err| err.to_string());
-                        let _ = done_tx.send(Done::Estimated(Box::new((quote, head, quoted))));
+                        Done::Estimated(Box::new((quote, head, quoted)))
                     });
                 }
             }
         }
         .await;
+        drop(node);
+        tasks.shutdown().await;
         match ui {
             Ok(served) => served,
             Err(err) => {
-                if let Some(quit) = quit_tx.take() {
+                if let Some(quit) = quit.take() {
                     let _ = quit.send(());
                 }
                 if let Ok(Err(served)) = serving.await {
@@ -375,24 +467,23 @@ impl Ui<'_> {
     }
 }
 
-/// Computes the display snapshot off the event loop and sends the sender's balances.
-fn refresh_balances(
-    node: &Node,
+/// Computes the display snapshot off the event loop and answers the sender's balances.
+fn refresh_balances<P: Peers>(
+    node: &Node<P>,
     signer: &PrivateKeySigner,
     registry: &'static [Token],
-    done: &mpsc::UnboundedSender<Done>,
+    tasks: &mut JoinSet<Done>,
 ) {
     let node = node.clone();
     let address = signer.address();
-    let done = done.clone();
-    tokio::task::spawn_blocking(move || {
+    tasks.spawn_blocking(move || {
         let snapshot = node.status().snapshot;
         let balances = snapshot
             .holdings
             .iter()
             .find(|h| h.address == address)
             .map(|holding| balances(holding, registry));
-        let _ = done.send(Done::Balances(balances));
+        Done::Balances(balances)
     });
 }
 
@@ -417,11 +508,188 @@ fn balances(holding: &Holding, registry: &[Token]) -> Balances {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc as std_mpsc;
 
     use alloy_primitives::{U256, address};
+    use chibi_core::testing::{WorldAccount, eth};
+    use chibi_node::fixture::Fixture;
+    use chibi_node::{Disk, Network, Watchlist};
+    use crossterm::event::KeyCode;
+    use ratatui::backend::{ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
 
     use super::*;
+
+    /// A test terminal whose flush tells `entered`, then blocks until `release` is sent to or
+    /// dropped.
+    struct Stalled {
+        screen: TestBackend,
+        entered: std_mpsc::Sender<()>,
+        release: std_mpsc::Receiver<()>,
+    }
+
+    impl Backend for Stalled {
+        type Error = Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Infallible>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.screen.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Infallible> {
+            self.screen.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Infallible> {
+            self.screen.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Infallible> {
+            self.screen.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Infallible> {
+            self.screen.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), Infallible> {
+            self.screen.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Infallible> {
+            self.screen.clear_region(clear_type)
+        }
+
+        fn size(&self) -> Result<Size, Infallible> {
+            self.screen.size()
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Infallible> {
+            self.screen.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Infallible> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_fails_to_open_is_restored() {
+        static RESTORED: AtomicUsize = AtomicUsize::new(0);
+        fn restored() {
+            RESTORED.fetch_add(1, Ordering::SeqCst);
+        }
+        let failed = open::<TestBackend, _>(|| Err(io::Error::other("no tty")), restored);
+        assert_eq!(
+            failed.err().map(|err| err.to_string()).as_deref(),
+            Some("no tty")
+        );
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+
+        let opened = open(|| Terminal::new(TestBackend::new(10, 2)), restored).unwrap();
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+        drop(opened);
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quitting_releases_the_node_while_the_terminal_blocks() {
+        static RESTORED: AtomicUsize = AtomicUsize::new(0);
+        fn restored() {
+            RESTORED.fetch_add(1, Ordering::SeqCst);
+        }
+        let signer = PrivateKeySigner::from_slice(&[0x42; 32]).unwrap();
+        let sender = signer.address();
+        let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, follower) = Node::with_parts(
+            Fixture::spec(&[]),
+            fixture.peers(),
+            fixture.heads(),
+            Disk::open(dir.path()).unwrap(),
+            &Watchlist {
+                addresses: vec![sender],
+                contracts: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (entered_tx, entered) = std_mpsc::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let stalled = Stalled {
+            screen: TestBackend::new(100, 30),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let terminal = open(|| Terminal::new(stalled), restored).unwrap();
+        let mut app = App::new(Network::Sepolia, 11_155_111, &[], false);
+        app.unlocked(Ok(sender));
+        let (views, latest) = watch::channel(View::new(&app, Vec::new()));
+        let handle = Handle::current();
+        let renderer = thread::spawn(move || render(terminal, latest, &handle));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (input_tx, input) = mpsc::unbounded_channel();
+        let logs = LogBuffer::default();
+        let mut ui = Ui {
+            views,
+            app,
+            input,
+            logs: &logs,
+        };
+        let progress = watch::Sender::new(STARTING);
+        let startup = progress.subscribe();
+        let (quit, quit_rx) = oneshot::channel();
+        let (node_tx, node_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = node_tx.send(node.clone());
+            progress.send_replace(Startup::Serving);
+            let _ = quit_rx.await;
+            drop((node, follower));
+            Ok(())
+        });
+        input_tx
+            .send(Event::Key(KeyCode::Char('q').into()))
+            .unwrap();
+        let node_task = NodeTask {
+            task,
+            startup,
+            node: node_rx,
+            quit,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ui.drive(node_task, Arc::new(signer)),
+        )
+        .await
+        .expect("the UI ends while the terminal blocks")
+        .unwrap();
+        assert_eq!(ui.app.notice.as_deref(), Some("shutting down..."));
+        assert!(Disk::running(dir.path()).unwrap().is_none());
+
+        drop(ui);
+        let renderer = join_within(renderer, Duration::from_millis(100))
+            .expect_err("the render thread is still blocked");
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 0);
+        drop(release);
+        assert!(matches!(
+            join_within(renderer, Duration::from_secs(5)),
+            Ok(Ok(Ok(())))
+        ));
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn the_log_buffer_keeps_the_last_thousand_lines() {

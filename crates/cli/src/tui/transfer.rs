@@ -528,7 +528,10 @@ mod tests {
             amount: U256::ZERO,
         };
         assert_eq!(
-            estimate(&node, sender, &zero).await.unwrap_err().to_string(),
+            estimate(&node, sender, &zero)
+                .await
+                .unwrap_err()
+                .to_string(),
             "the transfer reverts: no reason given"
         );
 

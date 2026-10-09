@@ -1,4 +1,5 @@
-//! Drawing the [`App`] with ratatui. Reads the state; changes nothing.
+//! Turning the [`App`] into a [`View`] and drawing it with ratatui. Reads the state; changes
+//! nothing.
 
 use std::time::Duration;
 
@@ -49,9 +50,36 @@ const HAPPY: [&str; 4] = ["  /\\_/\\", " ( ^.^ )  ~", "  > ^ <", " (\")_(\")"];
 /// The cat at a failed receipt.
 const SAD: [&str; 4] = ["  /\\_/\\", " ( ;.; )", "  > ^ <", " (\")_(\")"];
 
-/// Draws the whole screen; `logs` is the tail of the log buffer, oldest first.
-pub fn draw(frame: &mut Frame<'_>, app: &App, logs: &[String]) {
-    let pane = if app.logs { LOG_PANE_LINES + 2 } else { 0 };
+/// What the screen shows, built from the [`App`] on the control loop and drawn on the render
+/// thread. Holds no secret: the password is already masked.
+#[derive(Clone, Debug, Default)]
+pub struct View {
+    header: Line<'static>,
+    body: Vec<Line<'static>>,
+    footer: Vec<Line<'static>>,
+    /// The tail of the log buffer, oldest first, while the log pane is open.
+    logs: Option<Vec<String>>,
+}
+
+impl View {
+    /// The screen for `app`, with `logs` in the log pane when it is open.
+    pub fn new(app: &App, logs: Vec<String>) -> Self {
+        Self {
+            header: header_line(app),
+            body: body_lines(app),
+            footer: footer_lines(app),
+            logs: app.logs.then_some(logs),
+        }
+    }
+}
+
+/// Draws the whole screen.
+pub fn draw(frame: &mut Frame<'_>, view: View) {
+    let pane = if view.logs.is_some() {
+        LOG_PANE_LINES + 2
+    } else {
+        0
+    };
     let [header, body, footer, log_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -60,13 +88,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, logs: &[String]) {
     ])
     .areas(frame.area());
 
-    frame.render_widget(Paragraph::new(header_line(app)), header);
-    frame.render_widget(
-        Paragraph::new(body_lines(app)).wrap(Wrap { trim: false }),
-        body,
-    );
-    frame.render_widget(Paragraph::new(footer_lines(app)), footer);
-    if app.logs {
+    frame.render_widget(Paragraph::new(view.header), header);
+    frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
+    frame.render_widget(Paragraph::new(view.footer), footer);
+    if let Some(logs) = view.logs {
         let shown = usize::from(log_area.height.saturating_sub(2));
         let tail = &logs[logs.len().saturating_sub(shown)..];
         frame.render_widget(
@@ -349,7 +374,9 @@ mod tests {
 
     fn screen(app: &App, logs: &[String]) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, app, logs)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, View::new(app, logs.to_vec())))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let width = usize::from(buffer.area().width);
         buffer
@@ -436,7 +463,9 @@ mod tests {
         app.pinned(4, 6);
         assert!(screen(&app, &[]).contains(HINT));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        terminal
+            .draw(|frame| draw(frame, View::new(&app, Vec::new())))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let row = (0..30)
             .find(|&y| {
