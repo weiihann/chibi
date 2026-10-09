@@ -1900,12 +1900,14 @@ mod tests {
     }
 
     #[test]
-    fn tokens_are_unproven_until_every_pinned_key_is_held() {
+    fn tokens_are_unproven_until_seeded_and_every_pinned_key_is_held() {
         let mut app = ready(Network::Sepolia);
         assert!(app.tokens_unproven);
-        app.pinned(3, 5);
+        app.pinned(5, 5, false);
         assert!(app.tokens_unproven);
-        app.pinned(5, 5);
+        app.pinned(3, 5, true);
+        assert!(app.tokens_unproven);
+        app.pinned(5, 5, true);
         assert!(!app.tokens_unproven);
     }
 

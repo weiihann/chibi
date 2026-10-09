@@ -603,7 +603,7 @@ mod tests {
     fn the_token_row_says_more_tokens_appear_until_every_pinned_key_is_held() {
         const HINT: &str = "more tokens appear once their balances are proven";
         let mut app = ready();
-        app.pinned(4, 6);
+        app.pinned(4, 6, true);
         assert!(screen(&app, &[]).contains(HINT));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
@@ -624,7 +624,7 @@ mod tests {
         assert!(buffer[(hint_x, row)].modifier.contains(Modifier::DIM));
         assert!(!buffer[(2, row)].modifier.contains(Modifier::DIM));
 
-        app.pinned(6, 6);
+        app.pinned(6, 6, true);
         assert!(!screen(&app, &[]).contains(HINT));
     }
 

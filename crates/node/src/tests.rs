@@ -704,6 +704,38 @@ async fn a_seed_that_cannot_complete_is_retried_on_a_wake_without_a_new_head() {
     running.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_node_is_seeded_once_a_seed_completes() {
+    let fixture = two_token_world(250, 40);
+    fixture.fault(Fault::Unavailable(PAUSABLE_IMPL));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) = open(&fixture, dir.path(), BOTH, &watchlist(&[ALICE])).await;
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    assert!(!node.health().seeded, "the first seed could not complete");
+
+    fixture.heal();
+    let shared = Arc::clone(&follower.shared);
+    let running = tokio::spawn(follower.run());
+    tokio::time::sleep(SEED_RETRY).await;
+    shared.wake.notify_one();
+    let seeded = tokio::time::timeout(Duration::from_secs(60), async {
+        while !node.health().seeded {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(seeded.is_ok(), "the reseed completed");
+    running.abort();
+}
+
+#[tokio::test]
+async fn a_normal_start_is_seeded_after_the_first_step() {
+    let fixture = two_token_world(250, 40);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _follower) = start(&fixture, dir.path(), &[ALICE], BOTH).await;
+    assert!(node.health().seeded);
+}
+
 #[tokio::test]
 async fn every_registry_token_is_pinned_for_every_watched_address() {
     let fixture = two_token_world(250, 40);
