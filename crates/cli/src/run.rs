@@ -82,6 +82,13 @@ pub struct RunArgs {
     /// Set on the child that `--background` starts.
     #[arg(long, hide = true, conflicts_with = "background")]
     pub detached: bool,
+    /// Open the terminal UI: send ETH or a registry token from your keystore while JSON-RPC
+    /// keeps serving the wallet.
+    #[arg(long, conflicts_with_all = ["background", "detached"])]
+    pub tui: bool,
+    /// Start the terminal UI with the log pane open.
+    #[arg(long, requires = "tui")]
+    pub logs: bool,
 }
 
 /// The config at `path`. Without a file there, a config the user `named` with `--config` or
@@ -115,6 +122,15 @@ pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
     args.keys.apply(&mut config);
     config.validate()?;
     Ok(config)
+}
+
+/// The keystore `--tui` sends from.
+pub fn tui_keystore(config: &Config) -> eyre::Result<&Path> {
+    config.keystore.as_deref().ok_or_else(|| {
+        eyre::eyre!(
+            "--tui needs a keystore: pass --keystore PATH, or set keystore in the config (`chibi init --keystore PATH` writes it)"
+        )
+    })
 }
 
 /// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`.
@@ -470,7 +486,7 @@ mod tests {
             rpc_port: NonZeroU16::new(8745),
             keys: keys("http://127.0.0.1:5052/", "/srv/chibi"),
             background: true,
-            detached: false,
+            ..RunArgs::default()
         };
         assert_eq!(
             strings(detached_args(&args, Some(path))),
@@ -503,7 +519,7 @@ mod tests {
             rpc_port: NonZeroU16::new(9545),
             keys: keys("https://beacon.example/", "/srv/chibi"),
             background: true,
-            detached: false,
+            ..RunArgs::default()
         };
         let path = Path::new("/cfg/chibi.toml");
         for named in [Some(path), None] {

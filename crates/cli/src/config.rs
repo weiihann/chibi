@@ -89,6 +89,9 @@ pub struct Config {
         serialize_with = "serialize_contracts"
     )]
     pub contracts: Vec<TrackedContract>,
+    /// Absolute path of the encrypted keystore `chibi run --tui` sends from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keystore: Option<PathBuf>,
 }
 
 /// Config keys given on the command line: `chibi init` writes them into the config, and
@@ -124,6 +127,9 @@ pub struct ConfigArgs {
     /// Run no peer discovery; dial only the trusted and built-in peers.
     #[arg(long)]
     pub disable_discovery: bool,
+    /// Encrypted JSON keystore `chibi run --tui` sends from.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    pub keystore: Option<PathBuf>,
 }
 
 impl ConfigArgs {
@@ -152,6 +158,9 @@ impl ConfigArgs {
             config.discovery_port = Some(port);
         }
         config.disable_discovery |= self.disable_discovery;
+        if let Some(path) = &self.keystore {
+            config.keystore = Some(path.clone());
+        }
     }
 
     /// The flags that give the same keys again.
@@ -183,6 +192,9 @@ impl ConfigArgs {
         }
         if self.disable_discovery {
             argv.push("--disable-discovery".into());
+        }
+        if let Some(path) = &self.keystore {
+            argv.extend(["--keystore".into(), path.as_os_str().to_owned()]);
         }
         argv
     }
@@ -243,6 +255,8 @@ struct ConfigFile {
     disable_discovery: bool,
     #[serde(default)]
     contracts: Vec<ContractEntry>,
+    #[serde(default)]
+    keystore: Option<PathBuf>,
 }
 
 /// One `[[contracts]]` table as written.
@@ -263,6 +277,9 @@ impl TryFrom<ConfigFile> for Config {
         }
         if let Some(dir) = file.data_dir.as_ref().filter(|dir| !dir.is_absolute()) {
             return Err(InvalidConfig::RelativeDataDir(dir.clone()));
+        }
+        if let Some(path) = file.keystore.as_ref().filter(|path| !path.is_absolute()) {
+            return Err(InvalidConfig::RelativeKeystore(path.clone()));
         }
         let config = Self {
             contracts: parse_contracts(&file.contracts)?,
@@ -286,6 +303,7 @@ impl TryFrom<ConfigFile> for Config {
             max_outbound_peers: file.max_outbound_peers,
             max_inbound_peers: file.max_inbound_peers,
             disable_discovery: file.disable_discovery,
+            keystore: file.keystore,
         };
         config.validate()?;
         Ok(config)
@@ -314,6 +332,7 @@ impl Config {
             max_inbound_peers: None,
             disable_discovery: false,
             contracts: Vec::new(),
+            keystore: None,
         }
     }
 
@@ -594,6 +613,9 @@ pub enum InvalidConfig {
     /// `data_dir` would depend on the directory chibi is started from.
     #[error("data_dir {} is not an absolute path", .0.display())]
     RelativeDataDir(PathBuf),
+    /// `keystore` would depend on the directory chibi is started from.
+    #[error("keystore {} is not an absolute path", .0.display())]
+    RelativeKeystore(PathBuf),
     /// A `trusted_peers` or `boot_nodes` entry that is not an enode URL.
     #[error("{key}[{index}]: {reason}")]
     Enode {
@@ -931,6 +953,7 @@ mod tests {
             max_outbound_peers = 5
             max_inbound_peers = 0
             disable_discovery = true
+            keystore = "/keys/chibi.json"
 
             [[contracts]]
             address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
@@ -971,6 +994,7 @@ mod tests {
                     address: USDC,
                     slots: vec![U256::from(1)],
                 }],
+                keystore: Some(PathBuf::from("/keys/chibi.json")),
             }
         );
         let node = config.node_config(PathBuf::from("/data"));
