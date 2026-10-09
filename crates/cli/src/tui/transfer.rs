@@ -685,4 +685,30 @@ mod tests {
         );
         assert!(matches!(error, UnlockError::Unreadable { .. }));
     }
+
+    /// go-ethereum's accounts/keystore/testdata key, which carries an `address` field, and the
+    /// Web3 Secret Storage PBKDF2 test vector, which has none.
+    #[test]
+    fn geth_and_address_less_keystores_unlock_with_their_password_only() {
+        let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        for (file, password, expected) in [
+            (
+                "geth-keystore.json",
+                "foobar",
+                address!("0x7ef5a6135f1fd6a02593eedc869c6d41d934aef8"),
+            ),
+            (
+                "web3-secret-storage-pbkdf2.json",
+                "testpassword",
+                address!("0x008aeeda4d805471df9b2a5b0f38a0c3bcba786b"),
+            ),
+        ] {
+            let path = testdata.join(file);
+            assert_eq!(unlock(&path, password).unwrap().address(), expected, "{file}");
+            assert!(
+                matches!(unlock(&path, "wrong"), Err(UnlockError::WrongPassword)),
+                "{file}"
+            );
+        }
+    }
 }
