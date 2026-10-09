@@ -243,14 +243,14 @@ pub fn run(
     let spec = node_config.network.spec();
     let app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
+    let (input_tx, input) = mpsc::unbounded_channel();
+    let reader = thread::spawn(move || read_input(&input_tx));
     let (views, latest) = watch::channel(View::new(&app, Vec::new()));
     let handle = runtime.handle().clone();
     let renderer = Renderer {
         thread: Some(thread::spawn(move || render(terminal, latest, &handle))),
         release_raw,
     };
-    let (input_tx, input) = mpsc::unbounded_channel();
-    let reader = thread::spawn(move || read_input(&input_tx));
     let mut ui = Ui {
         views,
         app,
