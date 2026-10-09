@@ -430,9 +430,8 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Menu => "up/down choose · Enter select · Esc quit",
         Screen::Backup => "Enter I wrote them down · Esc back to the menu, discarding them",
         Screen::Confirm => "Enter check · Esc back to the menu, discarding the phrase",
-        Screen::Import | Screen::Existing | Screen::Password => {
-            "Enter continue · Esc back to the menu"
-        }
+        Screen::Import | Screen::Existing => "Enter continue · Esc back to the menu",
+        Screen::Password => "up/down field · Enter continue · Esc back to the menu",
         Screen::Unlock => "Enter unlock · Esc quit",
         Screen::Waiting | Screen::Excited | Screen::Paused => "l logs · q quit",
         Screen::Ready => {

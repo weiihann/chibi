@@ -977,13 +977,22 @@ impl App {
     }
 
     fn password_key(&mut self, key: Key) -> Option<Action> {
-        if key != Key::Enter {
-            let field = match self.setup.entry {
-                Entry::First => &mut self.password,
-                Entry::Again => &mut self.setup.again,
-            };
-            type_into(field, key, PASSWORD_BYTES);
-            return None;
+        match (key, self.setup.entry) {
+            (Key::Down, Entry::First) => return self.password_key(Key::Enter),
+            (Key::Up, Entry::Again) => {
+                self.setup.again.zeroize();
+                self.setup.entry = Entry::First;
+                return None;
+            }
+            (Key::Enter, _) => {}
+            (_, entry) => {
+                let field = match entry {
+                    Entry::First => &mut self.password,
+                    Entry::Again => &mut self.setup.again,
+                };
+                type_into(field, key, PASSWORD_BYTES);
+                return None;
+            }
         }
         match self.setup.entry {
             Entry::First if self.password.chars().count() < PASSWORD_MIN_CHARS => {
