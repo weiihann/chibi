@@ -322,6 +322,7 @@ impl Ui<'_> {
             let event = tokio::select! {
                 event = self.input.recv() => event,
                 _ = &mut shutdown => return Ok(None),
+                () = self.views.closed() => eyre::bail!("the terminal UI stopped drawing"),
             };
             let Some(Event::Key(key)) = event else {
                 if event.is_none() {
