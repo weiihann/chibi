@@ -497,7 +497,11 @@ mod tests {
     const REGISTRY: &[Token] = &[TKN];
 
     fn screen(app: &App, logs: &[String]) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        sized(app, logs, 100, 30)
+    }
+
+    fn sized(app: &App, logs: &[String], width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| draw(frame, View::new(app, logs.to_vec())))
             .unwrap();
@@ -771,5 +775,42 @@ mod tests {
         .filter(|c| !c.is_whitespace())
         .collect();
         assert!(shown.contains(&notice), "{shown}");
+    }
+
+    fn squeezed(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn the_quit_warning_shows_whole_over_a_pending_transfer_and_the_log_pane() {
+        let mut app = ready();
+        app.screen = Screen::Sending;
+        app.sending = Some(Sending {
+            draft: Draft {
+                asset: Asset::Eth,
+                to: SENDER,
+                amount: U256::from(1_000_000_000u64),
+            },
+            hash: Some(alloy_primitives::TxHash::ZERO),
+            state: SendState::Pending,
+            pending_heads: 0,
+        });
+        let warning = "a transfer is still pending; chibi's outbox rebroadcasts it on the next run. press q again to quit";
+        app.notice = Some(warning.to_owned());
+        app.logs = true;
+        let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
+        let shown = squeezed(&sized(&app, &logs, 100, 18));
+        assert!(shown.contains(&squeezed(warning)), "{shown}");
+    }
+
+    #[test]
+    fn a_long_notice_shows_whole_on_ready_with_the_log_pane() {
+        let mut app = ready();
+        let notice = "saved your wallet 0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025 to /home/someone/.config/chibi/keystores/0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025.json, but could not record it in /home/someone/.config/chibi/config.toml: the file is read-only. start with --keystore /home/someone/.config/chibi/keystores/0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025.json next time.";
+        app.notice = Some(notice.to_owned());
+        app.logs = true;
+        let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
+        let shown = squeezed(&sized(&app, &logs, 80, 24));
+        assert!(shown.contains(&squeezed(notice)), "{shown}");
     }
 }
