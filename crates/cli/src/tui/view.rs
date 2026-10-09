@@ -11,7 +11,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::app::{App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, Screen, SendState, show};
+use super::app::{
+    App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, SIDE_CAT_COLUMNS, Screen, SendState, show,
+};
+use super::cat::{self, Pose};
 use super::transfer::{Asset, Fee};
 use crate::format_units;
 
@@ -65,17 +68,25 @@ pub struct View {
     notice: Option<String>,
     /// The tail of the log buffer, oldest first, while the log pane is open.
     logs: Option<Vec<String>>,
+    /// The idle cat, drawn right of the form where it fits.
+    side: Vec<Line<'static>>,
 }
 
 impl View {
     /// The screen for `app` at `now`, with `logs` in the log pane when it is open.
-    pub fn new(app: &App, logs: Vec<String>, _now: Instant) -> Self {
+    pub fn new(app: &App, logs: Vec<String>, now: Instant) -> Self {
+        let side = if app.cat() == Some(Pose::Idle) {
+            cat::cropped(&cat::frame(Pose::Idle, app.cat_frame(now)))
+        } else {
+            Vec::new()
+        };
         Self {
             header: header_line(app),
-            body: body_lines(app),
+            body: body_lines(app, now),
             footer: footer_lines(app),
             notice: app.notice.clone(),
             logs: app.logs.then_some(logs),
+            side,
         }
     }
 }
@@ -113,7 +124,11 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     let log_area = take(pane);
 
     frame.render_widget(Paragraph::new(view.header), header);
+    let side = side_area(&view.body, &view.side, body);
     frame.render_widget(Paragraph::new(view.body).wrap(Wrap { trim: false }), body);
+    if let Some(side) = side {
+        frame.render_widget(Paragraph::new(view.side), side);
+    }
     if let Some(paragraph) = notice {
         frame.render_widget(paragraph, notice_area);
     }
@@ -133,6 +148,18 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     }
 }
 
+/// Where the side cat fits in `body`, two columns right of its widest line and level with
+/// its first, when `body` is at least [`SIDE_CAT_COLUMNS`] wide.
+fn side_area(lines: &[Line<'_>], side: &[Line<'_>], body: Rect) -> Option<Rect> {
+    let width = u16::try_from(side.iter().map(Line::width).max()?).ok()?;
+    let x = u16::try_from(lines.iter().map(Line::width).max().unwrap_or(0) + 2).ok()?;
+    let fits = body.width >= SIDE_CAT_COLUMNS && x.checked_add(width)? <= body.width;
+    let height = u16::try_from(side.len())
+        .unwrap_or(u16::MAX)
+        .min(body.height.saturating_sub(1));
+    fits.then(|| Rect::new(body.x + x, body.y + 1, width, height))
+}
+
 fn header_line(app: &App) -> Line<'static> {
     let mut spans = vec![
         Span::styled("chibi", Style::default().add_modifier(Modifier::BOLD)),
@@ -144,8 +171,17 @@ fn header_line(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn cat(lines: [&str; 4]) -> impl Iterator<Item = Line<'static>> {
-    lines.into_iter().map(|line| Line::raw(line.to_owned()))
+/// The pixel cat up at `now` if there is one, else `ascii`.
+fn cat_lines(app: &App, now: Instant, ascii: [&str; 4]) -> Vec<Line<'static>> {
+    app.cat().map_or_else(
+        || {
+            ascii
+                .into_iter()
+                .map(|line| Line::raw(line.to_owned()))
+                .collect()
+        },
+        |pose| cat::lines(&cat::frame(pose, app.cat_frame(now))),
+    )
 }
 
 /// Frame `n` of an animation, one step per tick.
@@ -153,7 +189,7 @@ fn pick<T: Copy, const N: usize>(frames: &[T; N], tick: u64) -> T {
     frames[usize::try_from(tick % N as u64).unwrap_or_default()]
 }
 
-fn body_lines(app: &App) -> Vec<Line<'static>> {
+fn body_lines(app: &App, now: Instant) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     match app.screen {
         Screen::Menu => menu(app, &mut lines),
@@ -164,7 +200,7 @@ fn body_lines(app: &App) -> Vec<Line<'static>> {
         Screen::Password => new_password(app, &mut lines),
         Screen::Unlock => unlock(app, &mut lines),
         Screen::Waiting => {
-            lines.extend(cat(pick(&DOZING, app.frame)));
+            lines.extend(cat_lines(app, now, pick(&DOZING, app.frame)));
             lines.push(Line::default());
             lines.push(Line::raw(format!(
                 "looking for a state peer · peers {} · state peers {} · {}",
@@ -174,13 +210,13 @@ fn body_lines(app: &App) -> Vec<Line<'static>> {
             )));
         }
         Screen::Excited => {
-            lines.extend(cat(pick(&EXCITED, app.frame)));
+            lines.extend(cat_lines(app, now, pick(&EXCITED, app.frame)));
             lines.push(Line::default());
             lines.push(Line::raw("found a state peer!"));
             lines.push(Line::raw("anchoring at a verified head..."));
         }
         Screen::Paused => {
-            lines.extend(cat(pick(&SLEEPY, app.frame)));
+            lines.extend(cat_lines(app, now, pick(&SLEEPY, app.frame)));
             lines.push(Line::default());
             lines.push(Line::raw(PAUSED));
             lines.push(Line::raw(
@@ -189,7 +225,7 @@ fn body_lines(app: &App) -> Vec<Line<'static>> {
         }
         Screen::Ready => form(app, &mut lines),
         Screen::Review => review(app, &mut lines),
-        Screen::Sending => sending(app, &mut lines),
+        Screen::Sending => sending(app, now, &mut lines),
     }
     lines
 }
@@ -385,13 +421,13 @@ fn review(app: &App, lines: &mut Vec<Line<'static>>) {
     }
 }
 
-fn sending(app: &App, lines: &mut Vec<Line<'static>>) {
+fn sending(app: &App, now: Instant, lines: &mut Vec<Line<'static>>) {
     let Some(sending) = &app.sending else {
         return;
     };
     match sending.state {
-        SendState::Succeeded => lines.extend(cat(HAPPY)),
-        SendState::Failed => lines.extend(cat(SAD)),
+        SendState::Succeeded => lines.extend(cat_lines(app, now, HAPPY)),
+        SendState::Failed => lines.extend(cat_lines(app, now, SAD)),
         SendState::Signing
         | SendState::Pending
         | SendState::Included

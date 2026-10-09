@@ -2,8 +2,10 @@
 //! terminal cell with half blocks in 24-bit colour.
 
 use std::ffi::OsString;
+use std::ops::Range;
 
-use ratatui::text::Line;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 
 /// Canvas width in pixels, one per column.
 pub const WIDTH: usize = 22;
@@ -13,6 +15,50 @@ pub const HEIGHT: usize = 16;
 
 /// A canvas of palette keys, `b'.'` where there is no pixel.
 pub type Grid = [[u8; WIDTH]; HEIGHT];
+
+/// No pixel.
+const EMPTY: u8 = b'.';
+
+/// Each key's colour: outline, orange fur, light fur, pink, eye, eye shine, star, z, heart.
+const PALETTE: [(u8, Color); 9] = [
+    (b'k', Color::Rgb(59, 42, 32)),
+    (b'o', Color::Rgb(244, 162, 89)),
+    (b'l', Color::Rgb(251, 211, 141)),
+    (b'p', Color::Rgb(242, 139, 155)),
+    (b'e', Color::Rgb(34, 34, 34)),
+    (b'w', Color::Rgb(255, 255, 255)),
+    (b'*', Color::Rgb(255, 214, 64)),
+    (b'z', Color::Rgb(150, 170, 220)),
+    (b'h', Color::Rgb(255, 105, 135)),
+];
+
+/// The cat's ears and brow, above its eyes.
+const HEAD: [&str; 5] = [
+    "..k..........k..",
+    ".kpk........kpk.",
+    ".kppk......kppk.",
+    ".kooooooooooook.",
+    "kooooooooooooook",
+];
+
+/// The cat's cheeks, nose and chin, below its eyes.
+const FACE_END: [&str; 5] = [
+    "kooooooppooooook",
+    "kolloooooooollok",
+    ".kooooolloooook.",
+    "..kkooooooookk..",
+    "....kkkkkkkk....",
+];
+
+const EYES_OPEN: [&str; 2] = ["kooeeooooooeeook", "kooewooooooewook"];
+const EYES_CLOSED: [&str; 2] = ["kooooooooooooook", "kookkoooooookkok"];
+const EYES_HALF: [&str; 2] = ["kooooooooooooook", "kooeeooooooeeook"];
+const EYES_HAPPY: [&str; 2] = ["kookkoooooookkok", "kokooooooooookok"];
+const EYES_WIDE: [&str; 2] = ["koeeeooooooeeeok", "koewwooooooewwok"];
+
+const Z: [&str; 3] = ["zzz", ".z.", "zzz"];
+const STAR: [&str; 3] = [".*.", "***", ".*."];
+const HEART: [&str; 3] = ["h.h", "hhh", ".h."];
 
 /// What the cat is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,28 +77,118 @@ pub enum Pose {
 
 /// Frame `n` of `pose`, one frame per 250 ms.
 pub fn frame(pose: Pose, n: u32) -> Grid {
-    let _ = (pose, n);
-    todo!()
+    let mut grid = [[EMPTY; WIDTH]; HEIGHT];
+    match pose {
+        Pose::Dozing => {
+            cat(&mut grid, EYES_CLOSED, 1, nth([3, 3, 4, 4], n));
+            let (x, y) = nth([(17, 6), (18, 4), (18, 2), (19, 0)], n);
+            stamp(&mut grid, &Z, x, y);
+        }
+        Pose::Excited => {
+            cat(&mut grid, EYES_WIDE, 3, nth([3, 2, 1, 2], n));
+            let [(x1, y1), (x2, y2)] = nth([[(0, 0), (19, 9)], [(19, 0), (0, 9)]], n);
+            stamp(&mut grid, &STAR, x1, y1);
+            stamp(&mut grid, &STAR, x2, y2);
+        }
+        Pose::Idle => {
+            let eyes = if n % 12 == 11 { EYES_CLOSED } else { EYES_OPEN };
+            cat(&mut grid, eyes, 3, 3);
+        }
+        Pose::Drowsy => {
+            let (eyes, y) = nth([(EYES_CLOSED, 3), (EYES_HALF, 4)], n / 3);
+            cat(&mut grid, eyes, 3, y);
+        }
+        Pose::Happy => {
+            cat(&mut grid, EYES_HAPPY, 3, nth([3, 1, 3, 1, 3, 3], n));
+            stamp(&mut grid, &HEART, 19, nth([4, 2, 0, 4, 2, 0], n));
+        }
+    }
+    grid
+}
+
+/// The value for frame `n` of a cycle.
+fn nth<T: Copy, const N: usize>(cycle: [T; N], n: u32) -> T {
+    cycle[n as usize % N]
+}
+
+/// The cat with `eyes`, its top left corner at (`x`, `y`).
+fn cat(grid: &mut Grid, eyes: [&str; 2], x: usize, y: usize) {
+    stamp(grid, &HEAD, x, y);
+    stamp(grid, &eyes, x, y + HEAD.len());
+    stamp(grid, &FACE_END, x, y + HEAD.len() + eyes.len());
+}
+
+/// Copies `sprite`'s pixels onto `grid` with its top left corner at (`x`, `y`), clipped to
+/// the canvas.
+fn stamp(grid: &mut Grid, sprite: &[&str], x: usize, y: usize) {
+    for (row, line) in grid.iter_mut().skip(y).zip(sprite) {
+        for (pixel, &key) in row.iter_mut().skip(x).zip(line.as_bytes()) {
+            if key != EMPTY {
+                *pixel = key;
+            }
+        }
+    }
 }
 
 /// The canvas as half-block rows: each cell's top pixel in the foreground of `▀`, its
 /// bottom one in the background, or `▄` when only the bottom pixel is set.
 pub fn lines(grid: &Grid) -> Vec<Line<'static>> {
-    let _ = grid;
-    todo!()
+    half_blocks(grid, 0..WIDTH, 0..HEIGHT / 2)
+}
+
+/// [`lines`] without the blank rows and columns around the pixels set.
+pub fn cropped(grid: &Grid) -> Vec<Line<'static>> {
+    let mut columns = (0..WIDTH).filter(|&x| grid.iter().any(|row| row[x] != EMPTY));
+    let mut rows = (0..HEIGHT).filter(|&y| grid[y].iter().any(|&key| key != EMPTY));
+    let (Some(left), Some(top)) = (columns.next(), rows.next()) else {
+        return Vec::new();
+    };
+    let right = columns.next_back().unwrap_or(left);
+    let bottom = rows.next_back().unwrap_or(top);
+    half_blocks(grid, left..right + 1, top / 2..bottom / 2 + 1)
+}
+
+/// The half-block cells of `columns` on cell `rows`, each holding pixel rows `2 * row` and
+/// `2 * row + 1`.
+fn half_blocks(grid: &Grid, columns: Range<usize>, rows: Range<usize>) -> Vec<Line<'static>> {
+    rows.map(|row| {
+        let (top, bottom) = (&grid[2 * row], &grid[2 * row + 1]);
+        Line::from(
+            columns
+                .clone()
+                .map(|x| cell(top[x], bottom[x]))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .collect()
+}
+
+fn cell(top: u8, bottom: u8) -> Span<'static> {
+    match (colour(top), colour(bottom)) {
+        (None, None) => Span::raw(" "),
+        (Some(top), None) => Span::styled("▀", Style::new().fg(top)),
+        (None, Some(bottom)) => Span::styled("▄", Style::new().fg(bottom)),
+        (Some(top), Some(bottom)) => Span::styled("▀", Style::new().fg(top).bg(bottom)),
+    }
+}
+
+/// `key`'s colour, `None` for no pixel.
+fn colour(key: u8) -> Option<Color> {
+    PALETTE
+        .iter()
+        .find(|&&(palette_key, _)| palette_key == key)
+        .map(|&(_, colour)| colour)
 }
 
 /// Whether the terminal draws 24-bit colour and colour is wanted: `COLORTERM` is
 /// `truecolor` or `24bit` and `NO_COLOR` is unset.
 pub fn supported(env: impl Fn(&str) -> Option<OsString>) -> bool {
-    let _ = env;
-    todo!()
+    env("COLORTERM").is_some_and(|colorterm| colorterm == "truecolor" || colorterm == "24bit")
+        && env("NO_COLOR").is_none()
 }
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Style};
-
     use super::*;
 
     const POSES: [Pose; 5] = [

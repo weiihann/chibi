@@ -28,7 +28,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
-use self::app::{Action, App, Balances};
+use self::app::{Action, App, Balances, CAT_FRAME};
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
 use self::wallet::Saved;
@@ -38,7 +38,8 @@ use crate::run::{self, STARTING, Served};
 /// Log lines kept for the log pane.
 const LOG_LINES: usize = 1_000;
 
-/// How often the TUI animates, reads the node's health, and tracks a sent transfer.
+/// How often the TUI animates the ASCII cats, reads the node's health, and tracks a sent
+/// transfer.
 const TICK: Duration = Duration::from_secs(1);
 
 /// How long the key reader waits for input before checking whether the TUI has gone.
@@ -261,10 +262,12 @@ pub fn run(
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
     let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
+    app.pixel_cats = cat::supported(process_env);
     if matches!(wallet, Wallet::Setup(_)) {
         app.setup(process_env("HOME").map(PathBuf::from));
     }
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
+    app.width = crossterm::terminal::size().map_or(0, |(width, _)| width);
     let (input_tx, input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
     let (views, latest) = watch::channel(View::new(&app, Vec::new(), Instant::now()));
@@ -366,14 +369,16 @@ struct Ui<'a> {
 
 impl Ui<'_> {
     /// Hands the render thread the screen for the current state.
-    fn draw(&self) -> eyre::Result<()> {
+    fn draw(&mut self) -> eyre::Result<()> {
         let logs = if self.app.logs {
             self.logs.tail(usize::from(view::LOG_PANE_LINES))
         } else {
             Vec::new()
         };
+        let now = Instant::now();
+        self.app.shown(now);
         self.views
-            .send(View::new(&self.app, logs, Instant::now()))
+            .send(View::new(&self.app, logs, now))
             .map_err(|_| eyre::eyre!("the terminal UI stopped drawing"))
     }
 
@@ -393,6 +398,9 @@ impl Ui<'_> {
                 _ = &mut shutdown => return Ok(None),
                 () = self.views.closed() => eyre::bail!("the terminal UI stopped drawing"),
             };
+            if let Some(Event::Resize(width, _)) = event {
+                self.app.width = width;
+            }
             let Some(Event::Key(key)) = event else {
                 if event.is_none() {
                     return Ok(None);
@@ -482,6 +490,8 @@ impl Ui<'_> {
         let mut tasks = JoinSet::new();
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut frames = tokio::time::interval(CAT_FRAME);
+        frames.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let ui: eyre::Result<eyre::Result<()>> = async {
             loop {
                 self.draw()?;
@@ -503,6 +513,9 @@ impl Ui<'_> {
                         }
                     }
                     Some(event) = self.input.recv() => {
+                        if let Event::Resize(width, _) = event {
+                            self.app.width = width;
+                        }
                         let Event::Key(key) = event else { continue };
                         match self.app.key(key) {
                             Some(Action::Quit) => {
@@ -537,6 +550,7 @@ impl Ui<'_> {
                         Err(err) if err.is_cancelled() => {}
                         Err(err) => return Err(err).wrap_err("a TUI task failed"),
                     },
+                    _ = frames.tick(), if self.app.cat().is_some() => {}
                     _ = ticks.tick() => {
                         self.app.tick(Instant::now());
                         if let Some(node) = &node {

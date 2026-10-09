@@ -457,20 +457,49 @@ impl App {
     /// Records `now` as when the screen up was entered, unless it is the screen last
     /// recorded.
     pub fn shown(&mut self, now: Instant) {
-        let _ = now;
-        todo!()
+        if self.entered.is_none_or(|(screen, _)| screen != self.screen) {
+            self.entered = Some((self.screen, now));
+        }
     }
 
     /// The pixel cat's frame at `now`: whole [`CAT_FRAME`]s since the screen up was entered,
     /// 0 before [`App::shown`] has seen it.
     pub fn cat_frame(&self, now: Instant) -> u32 {
-        let _ = now;
-        todo!()
+        self.entered
+            .filter(|&(screen, _)| screen == self.screen)
+            .map_or(0, |(_, since)| {
+                let steps =
+                    now.saturating_duration_since(since).as_millis() / CAT_FRAME.as_millis();
+                u32::try_from(steps).unwrap_or(u32::MAX)
+            })
     }
 
     /// The pixel cat the screen up shows, if any: only these screens animate.
     pub fn cat(&self) -> Option<Pose> {
-        todo!()
+        if !self.pixel_cats {
+            return None;
+        }
+        let succeeded = self
+            .sending
+            .as_ref()
+            .is_some_and(|sending| sending.state == SendState::Succeeded);
+        match self.screen {
+            Screen::Waiting => Some(Pose::Dozing),
+            Screen::Excited => Some(Pose::Excited),
+            Screen::Paused => Some(Pose::Drowsy),
+            Screen::Ready if self.width >= SIDE_CAT_COLUMNS => Some(Pose::Idle),
+            Screen::Sending if succeeded => Some(Pose::Happy),
+            Screen::Menu
+            | Screen::Backup
+            | Screen::Confirm
+            | Screen::Import
+            | Screen::Existing
+            | Screen::Password
+            | Screen::Unlock
+            | Screen::Ready
+            | Screen::Review
+            | Screen::Sending => None,
+        }
     }
 
     /// The keystore decrypted to `address`, or did not.
