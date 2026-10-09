@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_consensus::{SignableTransaction as _, TxEip4844, TxLegacy};
@@ -23,8 +24,8 @@ use crate::disk::{Disk, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR, Log};
 use crate::network::{MAINNET_ENS_RESOLVER, Token};
 use crate::node::{
-    BlockSel, ContractSnapshot, Follower, Held, Node, NodeError, Stepped, TrackedContract,
-    Watchlist, read_snapshot,
+    BlockSel, ContractSnapshot, Follower, Held, Node, NodeError, SEED_RETRY, Stepped,
+    TrackedContract, Watchlist, read_snapshot,
 };
 
 const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
@@ -666,6 +667,41 @@ async fn seeding_probes_every_token_at_once() {
         Key::Slot(PROXY, mapping_slot(ALICE)),
     ]);
     assert_eq!(pins, expected);
+}
+
+/// Waits, in paused time, until the pins hold every key in `keys`.
+async fn pinned(node: &Node<FixturePeers>, keys: &BTreeSet<Key>) -> bool {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !node.working().0.is_superset(keys) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_seed_that_cannot_complete_is_retried_on_a_wake_without_a_new_head() {
+    let fixture = two_token_world(250, 40);
+    fixture.fault(Fault::Unavailable(PAUSABLE_IMPL));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, follower) = open(&fixture, dir.path(), BOTH, &watchlist(&[ALICE])).await;
+    let head = node.head().num_hash();
+    let shared = Arc::clone(&follower.shared);
+    let running = tokio::spawn(follower.run());
+    let first = BTreeSet::from([Key::Slot(PROXY, mapping_slot(ALICE))]);
+    assert!(pinned(&node, &first).await, "the first seed ran");
+    assert!(node.working().0.is_disjoint(&pausable_keys()));
+
+    fixture.heal();
+    tokio::time::sleep(SEED_RETRY).await;
+    shared.wake.notify_one();
+    assert!(
+        pinned(&node, &pausable_keys()).await,
+        "the wake reseeds the pausable token"
+    );
+    assert_eq!(node.head().num_hash(), head, "no block was mined");
+    running.abort();
 }
 
 #[tokio::test]

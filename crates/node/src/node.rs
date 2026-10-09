@@ -50,6 +50,10 @@ const MISS_ROUNDS: u32 = 64;
 /// request always finds the other half.
 const SEED_IN_FLIGHT: usize = 8;
 
+/// Shortest gap between seeding runs a wake retries. A run's own requests wake the follower,
+/// so without it a seed that cannot complete would retry back to back.
+pub(crate) const SEED_RETRY: Duration = Duration::from_secs(2);
+
 /// Recent blocks sampled for the suggested tip, as reth's gas price oracle does.
 const FEE_BLOCKS: usize = 20;
 
