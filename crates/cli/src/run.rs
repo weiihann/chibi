@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, ConfigArgs, RpcHost, process_env};
 use crate::rpc::{self, RpcConfig};
+use crate::tui::{self, LogBuffer, transfer};
 
 /// The background chibi's log, in its data directory.
 pub const LOG_FILE: &str = "chibi.log";
@@ -133,23 +134,37 @@ pub fn tui_keystore(config: &Config) -> eyre::Result<&Path> {
     })
 }
 
-/// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`.
-/// `path` is absolute; `config_flag` is the config the user named, which must exist, repeated
-/// in hints and passed to the background child.
+/// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`,
+/// or runs it under the terminal UI with `--tui`. `path` is absolute; `config_flag` is the
+/// config the user named, which must exist, repeated in hints and passed to the background
+/// child.
 pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
+    let logs = args.tui.then(LogBuffer::default);
     if !args.background {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
-            .with_ansi(!args.detached)
-            .init();
+        let subscriber = tracing_subscriber::fmt().with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        );
+        match &logs {
+            Some(buffer) => subscriber
+                .with_ansi(false)
+                .with_writer(buffer.clone())
+                .init(),
+            None => subscriber.with_ansi(!args.detached).init(),
+        }
     }
     let config = load(path, config_flag.is_some(), args)?;
     let data_dir = config.network_dir(config.network, process_env)?;
     if args.background {
         return start_background(args, &config, &data_dir, config_flag);
     }
+    let keystore = match &logs {
+        Some(_) => {
+            let keystore = tui_keystore(&config)?;
+            transfer::check_readable(keystore)?;
+            Some(keystore.to_owned())
+        }
+        None => None,
+    };
     let rpc_config = config.rpc()?;
     let listener = rpc::bind(rpc_config.addr)?;
     let served = Served {
@@ -157,20 +172,47 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
         listener,
         url: config.rpc_url(),
     };
+    let node_config = config.node_config(data_dir);
     let runtime = tokio::runtime::Runtime::new()?;
-    let result = runtime.block_on(serve(config.node_config(data_dir), served, args.detached));
+    let result = match (keystore, logs) {
+        (Some(keystore), Some(logs)) => {
+            tui::run(&runtime, node_config, served, &keystore, &logs, args.logs)
+        }
+        _ => runtime.block_on(async {
+            let progress = watch::Sender::new(STARTING);
+            tokio::spawn(greet_state_peer(progress.subscribe()));
+            serve(
+                node_config,
+                served,
+                args.detached,
+                progress,
+                shutdown_signal(),
+                |_| {},
+            )
+            .await
+        }),
+    };
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
     result
 }
 
 /// The JSON-RPC side of a run: its settings, its already bound socket, and the URL wallets use.
-struct Served {
+pub struct Served {
     rpc: RpcConfig,
     listener: TcpListener,
     url: String,
 }
 
-async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre::Result<()> {
+/// Starts the node, reporting on `progress`, and serves JSON-RPC until `shutdown` resolves
+/// with its cause. `started` gets the node once it is anchored.
+pub async fn serve(
+    node_config: NodeConfig,
+    served: Served,
+    detached: bool,
+    progress: watch::Sender<Startup>,
+    shutdown: impl Future<Output = io::Result<&'static str>>,
+    started: impl FnOnce(&Node),
+) -> eyre::Result<()> {
     if detached {
         let mut hangup = signal(SignalKind::hangup())?;
         tokio::spawn(async move {
@@ -179,7 +221,6 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
             }
         });
     }
-    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     info!(
         network = %node_config.network,
@@ -190,15 +231,14 @@ async fn serve(node_config: NodeConfig, served: Served, detached: bool) -> eyre:
         "starting"
     );
     let data_dir = node_config.data_dir.clone();
-    let progress = watch::Sender::new(STARTING);
-    tokio::spawn(greet_state_peer(progress.subscribe()));
     let (node, follower) = tokio::select! {
-        started = Node::start(node_config, progress) => started?,
+        result = Node::start(node_config, progress) => result?,
         signal = &mut shutdown => {
             info!("shutting down on {}", signal?);
             return Ok(());
         }
     };
+    started(&node);
     let server = rpc::start(node.clone(), served.rpc, served.listener)?;
     if let Err(err) = Disk::announce(&data_dir, &served.url) {
         warn!(%err, "cannot record the JSON-RPC URL for `chibi status`");
@@ -299,7 +339,7 @@ fn persisting_unheld(previous: &BTreeSet<Key>, current: &[Key]) -> Option<(usize
 }
 
 /// Resolves with the name of the first Ctrl-C or SIGTERM.
-async fn shutdown_signal() -> io::Result<&'static str> {
+pub async fn shutdown_signal() -> io::Result<&'static str> {
     let mut terminate = signal(SignalKind::terminate())?;
     tokio::select! {
         result = tokio::signal::ctrl_c() => result.map(|()| "Ctrl-C"),

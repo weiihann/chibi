@@ -464,20 +464,25 @@ impl App {
     /// Handles one key press.
     pub fn key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl_c =
-            key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c'));
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        let key = Key::of(key.code);
         if self.screen == Screen::Unlock {
             return self.unlock_key(key, ctrl_c);
         }
-        if ctrl_c || key.code == KeyCode::Char('q') {
+        if ctrl_c || key == Some(Key::Char('q')) {
             return self.quit();
         }
         self.quit_armed = false;
-        if key.code == KeyCode::Char('l') {
+        let key = key?;
+        if key == Key::Char('l') {
             self.logs = !self.logs;
             return None;
         }
         match self.screen {
-            Screen::Ready => self.form_key(key),
+            Screen::Ready => {
+                self.form_key(key);
+                None
+            }
             Screen::Review => self.review_key(key),
             Screen::Sending => {
                 self.sending_key(key);
@@ -487,23 +492,23 @@ impl App {
         }
     }
 
-    fn unlock_key(&mut self, key: KeyEvent, ctrl_c: bool) -> Option<Action> {
-        if ctrl_c || key.code == KeyCode::Esc {
+    fn unlock_key(&mut self, key: Option<Key>, ctrl_c: bool) -> Option<Action> {
+        if ctrl_c || key == Some(Key::Esc) {
             return Some(Action::Quit);
         }
         if self.unlocking {
             return None;
         }
-        match key.code {
-            KeyCode::Char(c) => self.password.push(c),
-            KeyCode::Backspace => {
+        match key? {
+            Key::Char(c) => self.password.push(c),
+            Key::Backspace => {
                 self.password.pop();
             }
-            KeyCode::Enter if !self.password.is_empty() => {
+            Key::Enter if !self.password.is_empty() => {
                 self.unlocking = true;
                 return Some(Action::Unlock(std::mem::take(&mut self.password)));
             }
-            _ => {}
+            Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
         }
         None
     }
@@ -521,24 +526,22 @@ impl App {
         Some(Action::Quit)
     }
 
-    fn form_key(&mut self, key: KeyEvent) -> Option<Action> {
+    fn form_key(&mut self, key: Key) {
         const FIELDS: [Field; 3] = [Field::Token, Field::Amount, Field::To];
         let at = FIELDS
             .iter()
             .position(|field| *field == self.form.field)
             .unwrap_or_default();
-        match key.code {
-            KeyCode::Down | KeyCode::Tab => self.form.field = FIELDS[(at + 1) % FIELDS.len()],
-            KeyCode::Up | KeyCode::BackTab => {
-                self.form.field = FIELDS[(at + FIELDS.len() - 1) % FIELDS.len()];
-            }
-            KeyCode::Left | KeyCode::Right if self.form.field == Field::Token => {
+        match key {
+            Key::Down => self.form.field = FIELDS[(at + 1) % FIELDS.len()],
+            Key::Up => self.form.field = FIELDS[(at + FIELDS.len() - 1) % FIELDS.len()],
+            Key::Left | Key::Right if self.form.field == Field::Token => {
                 let assets = self.assets();
                 let at = assets
                     .iter()
                     .position(|asset| *asset == self.form.asset)
                     .unwrap_or_default();
-                let step = if key.code == KeyCode::Right {
+                let step = if key == Key::Right {
                     1
                 } else {
                     assets.len() - 1
@@ -546,7 +549,7 @@ impl App {
                 self.form.asset = assets[(at + step) % assets.len()];
                 self.form.amount_error = None;
             }
-            KeyCode::Char(c) => match self.form.field {
+            Key::Char(c) => match self.form.field {
                 Field::Amount if c.is_ascii_digit() || matches!(c, '.' | 'm' | 'a' | 'x') => {
                     self.form.amount.push(c);
                     self.form.amount_error = None;
@@ -557,7 +560,7 @@ impl App {
                 }
                 Field::Token | Field::Amount | Field::To => {}
             },
-            KeyCode::Backspace => match self.form.field {
+            Key::Backspace => match self.form.field {
                 Field::Amount => {
                     self.form.amount.pop();
                     self.form.amount_error = None;
@@ -568,15 +571,14 @@ impl App {
                 }
                 Field::Token => {}
             },
-            KeyCode::Enter => self.submit(),
-            _ => {}
+            Key::Enter => self.submit(),
+            Key::Left | Key::Right | Key::Esc => {}
         }
-        None
     }
 
-    fn review_key(&mut self, key: KeyEvent) -> Option<Action> {
-        match key.code {
-            KeyCode::Char('y') => {
+    fn review_key(&mut self, key: Key) -> Option<Action> {
+        match key {
+            Key::Char('y') => {
                 let review = self.review.filter(|review| review.refused.is_none())?;
                 self.review = None;
                 self.sending = Some(Sending {
@@ -589,21 +591,26 @@ impl App {
                 self.screen = Screen::Sending;
                 Some(Action::Send(review.draft, review.fee))
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            Key::Char('n') | Key::Esc => {
                 self.review = None;
                 self.screen = Screen::Ready;
                 None
             }
-            _ => None,
+            Key::Char(_)
+            | Key::Backspace
+            | Key::Enter
+            | Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right => None,
         }
     }
 
-    fn sending_key(&mut self, key: KeyEvent) {
+    fn sending_key(&mut self, key: Key) {
         let Some(sending) = &self.sending else {
             return;
         };
-        if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) || sending.state == SendState::Signing
-        {
+        if !matches!(key, Key::Enter | Key::Esc) || sending.state == SendState::Signing {
             return;
         }
         if sending.state == SendState::Succeeded {
@@ -729,6 +736,41 @@ impl App {
             },
         };
         Some(Draft { asset, to, amount })
+    }
+}
+
+/// The keys the screens act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    Char(char),
+    Backspace,
+    Enter,
+    Esc,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Key {
+    /// The key a terminal key code means here; Tab moves like Down. `None` for keys the TUI
+    /// ignores.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "crossterm has many keys the TUI ignores"
+    )]
+    const fn of(code: KeyCode) -> Option<Self> {
+        Some(match code {
+            KeyCode::Char(c) => Self::Char(c),
+            KeyCode::Backspace => Self::Backspace,
+            KeyCode::Enter => Self::Enter,
+            KeyCode::Esc => Self::Esc,
+            KeyCode::Up | KeyCode::BackTab => Self::Up,
+            KeyCode::Down | KeyCode::Tab => Self::Down,
+            KeyCode::Left => Self::Left,
+            KeyCode::Right => Self::Right,
+            _ => return None,
+        })
     }
 }
 

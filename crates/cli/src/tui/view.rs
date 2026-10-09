@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use alloy_primitives::U256;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -14,7 +14,7 @@ use super::transfer::{Asset, Fee};
 use crate::format_units;
 
 /// Log lines the log pane shows at most.
-const LOG_PANE_LINES: u16 = 10;
+pub const LOG_PANE_LINES: u16 = 10;
 
 /// The dozing cat while waiting for a state peer: it breathes, then peeks.
 const DOZING: [[&str; 4]; 3] = [

@@ -143,14 +143,18 @@ pub fn check_readable(path: &Path) -> Result<(), UnlockError> {
 /// Decrypts the keystore at `path` with `password`. Slow by design (scrypt or PBKDF2).
 pub fn unlock(path: &Path, password: &str) -> Result<PrivateKeySigner, UnlockError> {
     check_readable(path)?;
-    PrivateKeySigner::decrypt_keystore(path, password).map_err(|err| match err {
-        LocalSignerError::EthKeystoreError(eth_keystore::KeystoreError::MacMismatch) => {
+    PrivateKeySigner::decrypt_keystore(path, password).map_err(|err| {
+        if matches!(
+            err,
+            LocalSignerError::EthKeystoreError(eth_keystore::KeystoreError::MacMismatch)
+        ) {
             UnlockError::WrongPassword
+        } else {
+            UnlockError::Invalid {
+                path: path.to_owned(),
+                reason: err.to_string(),
+            }
         }
-        other => UnlockError::Invalid {
-            path: path.to_owned(),
-            reason: other.to_string(),
-        },
     })
 }
 
@@ -172,15 +176,13 @@ pub async fn estimate<P: Peers>(
         input,
         ..CallRequest::default()
     };
-    let gas_limit =
-        node.estimate_gas(request, BlockSel::Latest)
-            .await
-            .map_err(|err| match err {
-                NodeError::Estimate(EstimateError::Reverted { output }) => {
-                    TransferError::Reverts(revert_reason(&output))
-                }
-                other => TransferError::Node(other),
-            })?;
+    let gas_limit = match node.estimate_gas(request, BlockSel::Latest).await {
+        Ok(gas_limit) => gas_limit,
+        Err(NodeError::Estimate(EstimateError::Reverted { output })) => {
+            return Err(TransferError::Reverts(revert_reason(&output)));
+        }
+        Err(err) => return Err(err.into()),
+    };
     Ok(Fee {
         gas_limit,
         max_fee_per_gas: next_base_fee.saturating_mul(2).saturating_add(tip),
