@@ -13,7 +13,7 @@ use chibi_core::exec::{CallRequest, EstimateError};
 use chibi_core::wire;
 use chibi_node::{BlockSel, Node, NodeError, Peers, Token};
 
-use super::app::show;
+use super::app::{Tracked, show};
 
 alloy_sol_types::sol! {
     function transfer(address to, uint256 amount) returns (bool);
@@ -313,6 +313,21 @@ pub async fn send<P: Peers>(
     Ok(node.submit(&signed.encoded_2718()).await?)
 }
 
+/// Where the node has the sent transfer: its verified receipt, else whether a verified block
+/// includes it.
+pub fn track<P: Peers>(node: &Node<P>, hash: TxHash) -> Option<Tracked> {
+    if let Ok(Some(receipt)) = node.receipt(hash) {
+        return Some(Tracked::Receipt {
+            success: receipt.receipt.success(),
+        });
+    }
+    let submitted = node.transaction(hash).ok()??;
+    Some(match submitted.included {
+        Some(_) => Tracked::Included,
+        None => Tracked::Pending,
+    })
+}
+
 /// The revert reason the output carries, as shown to the user.
 fn revert_reason(output: &[u8]) -> String {
     if output.is_empty() {
@@ -478,6 +493,42 @@ mod tests {
             quote(&node, sender, &short).await.unwrap_err().to_string(),
             "your balance of 0.000000000000001 ETH does not cover the max fee 0.000058245 ETH"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_replaced_through_json_rpc_is_tracked_as_dropped() {
+        let signer = signer();
+        let sender = signer.address();
+        let fixture = Fixture::genesis([(sender, WorldAccount::eoa(eth(3)))]);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _follower) = start(&fixture, dir.path(), sender).await;
+        let draft = Draft {
+            asset: Asset::Eth,
+            to: BOB,
+            amount: eth(1),
+        };
+        let fee = estimate(&node, sender, &draft).await.unwrap();
+        let hash = send(&node, &signer, &draft, &fee).await.unwrap();
+        assert_eq!(track(&node, hash), Some(Tracked::Pending));
+
+        let replacement = TxEip1559 {
+            chain_id: node.chain_id(),
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 5_500_000_000,
+            max_priority_fee_per_gas: 2_000_000_000,
+            to: TxKind::Call(sender),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let signature = signer
+            .sign_hash_sync(&replacement.signature_hash())
+            .unwrap();
+        let replacement = wire::Transaction::Eip1559(replacement.into_signed(signature));
+        let replaced_by = node.submit(&replacement.encoded_2718()).await.unwrap();
+        assert_eq!(track(&node, replaced_by), Some(Tracked::Pending));
+        assert_eq!(track(&node, hash), Some(Tracked::Dropped));
     }
 
     fn token_world(holder: Address, balance: u64) -> Fixture {

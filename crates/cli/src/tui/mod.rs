@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
-use self::app::{Action, App, Balances, Tracked};
+use self::app::{Action, App, Balances};
 use self::transfer::{Quote, Quoted, UnlockError};
 use crate::run::{self, STARTING, Served};
 
@@ -328,7 +328,7 @@ impl Ui<'_> {
                             refresh_balances(node, &signer, self.app.registry, &done_tx);
                         }
                         if let Some(hash) = self.app.tracking()
-                            && let Some(tracked) = track(node, hash)
+                            && let Some(tracked) = transfer::track(node, hash)
                         {
                             self.app.tracked(tracked);
                         }
@@ -389,21 +389,6 @@ fn balances(holding: &Holding, registry: &[Token]) -> Balances {
             })
             .collect(),
     }
-}
-
-/// Where the node has the sent transfer: its verified receipt, else whether a verified block
-/// includes it.
-fn track(node: &Node, hash: TxHash) -> Option<Tracked> {
-    if let Ok(Some(receipt)) = node.receipt(hash) {
-        return Some(Tracked::Receipt {
-            success: receipt.receipt.success(),
-        });
-    }
-    let submitted = node.transaction(hash).ok()??;
-    Some(match submitted.included {
-        Some(_) => Tracked::Included,
-        None => Tracked::Pending,
-    })
 }
 
 #[cfg(test)]

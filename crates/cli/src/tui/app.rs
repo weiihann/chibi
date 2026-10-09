@@ -151,6 +151,8 @@ pub enum SendState {
     Failed,
     /// The node refused it; nothing was sent.
     Rejected(String),
+    /// Replaced or dropped after it was submitted: its nonce went to another transaction.
+    Dropped,
 }
 
 /// What the node reports for a sent transfer.
@@ -165,6 +167,8 @@ pub enum Tracked {
         /// Status 1.
         success: bool,
     },
+    /// The node no longer knows it: a transaction with its nonce replaced it or was mined.
+    Dropped,
 }
 
 /// The latest transfer sent.
@@ -422,6 +426,7 @@ impl App {
             Tracked::Included => SendState::Included,
             Tracked::Receipt { success: true } => SendState::Succeeded,
             Tracked::Receipt { success: false } => SendState::Failed,
+            Tracked::Dropped => SendState::Dropped,
         };
     }
 
@@ -1287,6 +1292,23 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Ready, ""));
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn a_replaced_or_dropped_transfer_stops_tracking_and_quits_without_a_warning() {
+        let hash = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let mut app = ready(Network::Sepolia);
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.sent(Ok(hash));
+        app.tracked(Tracked::Pending);
+        app.tracked(Tracked::Dropped);
+        assert_eq!(
+            (app.sending.as_ref().map(|s| &s.state), app.tracking()),
+            (Some(&SendState::Dropped), None)
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+        assert_eq!(app.notice, None);
     }
 
     #[test]

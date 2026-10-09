@@ -230,7 +230,11 @@ fn sending(app: &App, lines: &mut Vec<Line<'static>>) {
     match sending.state {
         SendState::Succeeded => lines.extend(cat(HAPPY)),
         SendState::Failed => lines.extend(cat(SAD)),
-        SendState::Signing | SendState::Pending | SendState::Included | SendState::Rejected(_) => {}
+        SendState::Signing
+        | SendState::Pending
+        | SendState::Included
+        | SendState::Rejected(_)
+        | SendState::Dropped => {}
     }
     lines.push(Line::raw(format!(
         "sending {} to {}",
@@ -251,6 +255,10 @@ fn sending(app: &App, lines: &mut Vec<Line<'static>>) {
         SendState::Succeeded => "sent! the receipt is verified with status 1".to_owned(),
         SendState::Failed => "the transfer failed: the verified receipt has status 0".to_owned(),
         SendState::Rejected(reason) => format!("not sent: {reason}"),
+        SendState::Dropped => {
+            "this transfer was replaced or dropped: its nonce was used by another transaction"
+                .to_owned()
+        }
     };
     lines.push(Line::raw(status));
 }
@@ -317,7 +325,8 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::tui::app::Balances;
+    use crate::tui::app::{Balances, Sending};
+    use crate::tui::transfer::Draft;
 
     const SENDER: Address = address!("0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025");
     const TKN: Token = Token {
@@ -429,6 +438,29 @@ mod tests {
         assert!(shown.contains("log line 29"), "{shown}");
         assert!(shown.contains("log line 20"), "{shown}");
         assert!(!shown.contains("log line 19"), "{shown}");
+    }
+
+    #[test]
+    fn a_replaced_or_dropped_transfer_says_its_nonce_was_used() {
+        let mut app = ready();
+        app.screen = Screen::Sending;
+        app.sending = Some(Sending {
+            draft: Draft {
+                asset: Asset::Eth,
+                to: SENDER,
+                amount: U256::from(1_000_000_000u64),
+            },
+            hash: Some(alloy_primitives::TxHash::ZERO),
+            state: SendState::Dropped,
+            pending_heads: 0,
+        });
+        let shown = screen(&app, &[]);
+        assert!(
+            shown.contains(
+                "this transfer was replaced or dropped: its nonce was used by another transaction"
+            ),
+            "{shown}"
+        );
     }
 
     #[test]
