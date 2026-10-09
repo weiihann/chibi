@@ -122,7 +122,7 @@ The keystore is an encrypted JSON keystore (Web3 Secret Storage, as `cast wallet
 Once unlocked, your address is watched for that run, so its ETH and every listed token are proven while chibi waits for a state peer. A dozing cat shows the wait, `looking for a state peer · peers N · state peers M · 1m20s`, and perks up at `found a state peer!`. Then the transfer form opens:
 
 - `from`: your checksummed address and its ETH balance.
-- `token`: ETH or a listed token you hold; left and right cycle through them.
+- `token`: ETH or a listed token you hold; left and right cycle through them. Tokens join once their balances are proven, usually at the first head after the form opens; until then the row says `more tokens appear once their balances are proven`.
 - `amount`: a decimal amount, or `max` for the whole token balance, or the ETH balance less the max fee. For `max` ETH the fee is estimated for the exact amount sent, since a recipient contract can spend more gas for a nonzero value, and never with a zero value, which a recipient may refuse; if the fee keeps moving that amount, chibi asks for an exact amount instead.
 - `to`: the recipient, `0x` and 40 hex digits. Mixed case must carry a valid checksum; all lowercase skips the check. The zero address is refused, and sending a token to its own contract warns.
 - `fee`: the estimated gas and the max fee, refreshed at each head. A transfer that would revert shows the reason and cannot be sent.

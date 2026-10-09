@@ -232,6 +232,9 @@ pub struct App {
     pub sender: Option<Address>,
     /// The sender's balances.
     pub balances: Balances,
+    /// Whether some pinned key is not held yet, so held tokens may be missing from the
+    /// balances. True until a health read says every pinned key is held.
+    pub tokens_unproven: bool,
     /// The latest head number seen.
     pub head: u64,
     /// State peers connected at the latest health tick or start-up report.
@@ -269,6 +272,7 @@ impl App {
             waiting: WaitCounts::default(),
             sender: None,
             balances: Balances::default(),
+            tokens_unproven: true,
             head: 0,
             state_peers: 0,
             form: Form::default(),
@@ -370,6 +374,11 @@ impl App {
     /// The sender's balances at a new snapshot.
     pub fn balances(&mut self, balances: Balances) {
         self.balances = balances;
+    }
+
+    /// The node holds `held` of its `total` pinned keys.
+    pub const fn pinned(&mut self, held: usize, total: usize) {
+        self.tokens_unproven = held < total;
     }
 
     /// Whether to refresh the balances at `head` with `pinned_held` pinned keys held,

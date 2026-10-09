@@ -16,6 +16,9 @@ use crate::format_units;
 /// Log lines the log pane shows at most.
 pub const LOG_PANE_LINES: u16 = 10;
 
+/// The token row's hint while some pinned key is not held yet.
+const TOKENS_UNPROVEN: &str = "more tokens appear once their balances are proven";
+
 /// The dozing cat while waiting for a state peer: it breathes, then peeks.
 const DOZING: [[&str; 4]; 3] = [
     ["  /\\_/\\", " ( -.- )  z", "  > ^ <", " (\")_(\")"],
@@ -162,7 +165,7 @@ fn form(app: &App, lines: &mut Vec<Line<'static>>) {
         let marker = if app.form.field == name { ">" } else { " " };
         Line::raw(format!("{marker} {label:<7} {value}"))
     };
-    lines.push(field(
+    let mut token = field(
         Field::Token,
         "token",
         format!(
@@ -170,7 +173,14 @@ fn form(app: &App, lines: &mut Vec<Line<'static>>) {
             asset.symbol(),
             balance(app.balance(asset), asset)
         ),
-    ));
+    );
+    if app.tokens_unproven {
+        token.push_span(Span::styled(
+            format!("   {TOKENS_UNPROVEN}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    lines.push(token);
     lines.push(field(Field::Amount, "amount", app.form.amount.clone()));
     if let Some(error) = &app.form.amount_error {
         lines.push(error_line(error));

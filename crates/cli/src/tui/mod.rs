@@ -333,6 +333,7 @@ impl Ui<'_> {
                         if let Some(node) = &node {
                             let health = node.health();
                             self.app.health(health.head.number, health.state_peers);
+                            self.app.pinned(health.pinned.held, health.pinned.total);
                             if self.app.balances_request(health.head.number, health.pinned.held) {
                                 refresh_balances(node, &signer, self.app.registry, &done_tx);
                             }
