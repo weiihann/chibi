@@ -222,9 +222,11 @@ mod tests {
             for n in 0..16 {
                 let grid = frame(pose, n);
                 assert_eq!(pixels(&grid), cat + overlays, "{pose:?} frame {n}");
-                let lines = lines(&grid);
-                assert_eq!(lines.len(), HEIGHT / 2, "{pose:?} frame {n}");
-                assert!(lines.iter().all(|line| line.width() == WIDTH));
+                for scale in 1..=3 {
+                    let lines = lines(&grid, scale);
+                    assert_eq!(lines.len(), HEIGHT / 2 * scale, "{pose:?} frame {n}");
+                    assert!(lines.iter().all(|line| line.width() == WIDTH * scale));
+                }
             }
         }
     }
@@ -322,7 +324,7 @@ mod tests {
         grid[1][2] = b'e';
         grid[0][3] = b'o';
         grid[1][3] = b'l';
-        let lines = lines(&grid);
+        let lines = lines(&grid, 1);
         let cells: Vec<(&str, Style)> = lines[0].spans[..4]
             .iter()
             .map(|span| (span.content.as_ref(), span.style))
@@ -342,6 +344,32 @@ mod tests {
             ]
         );
         assert_eq!(lines[1].to_string(), " ".repeat(WIDTH));
+    }
+
+    #[test]
+    fn scaling_turns_each_pixel_into_a_square_of_pixels() {
+        let mut grid = [[b'.'; WIDTH]; HEIGHT];
+        grid[0][0] = b'k';
+        grid[1][1] = b'k';
+        let lines = lines(&grid, 2);
+        let cells = |row: usize| -> Vec<(&str, Style)> {
+            lines[row].spans[..4]
+                .iter()
+                .map(|span| (span.content.as_ref(), span.style))
+                .collect()
+        };
+        let full = ("▀", Style::new().fg(OUTLINE).bg(OUTLINE));
+        let blank = (" ", Style::new());
+        assert_eq!(cells(0), [full, full, blank, blank]);
+        assert_eq!(cells(1), [blank, blank, full, full]);
+        assert_eq!(lines[2].to_string(), " ".repeat(2 * WIDTH));
+        assert_eq!(
+            cropped(&grid, 2)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["▀▀  ", "  ▀▀"]
+        );
     }
 
     #[test]

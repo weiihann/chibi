@@ -724,7 +724,7 @@ mod tests {
     use chibi_node::{Network, Startup, Token};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
+    use ratatui::buffer::{Buffer, Cell};
 
     use super::*;
     use crate::tui::app::{Balances, EXCITED_FOR, Picker, Sending};
@@ -740,7 +740,7 @@ mod tests {
     const REGISTRY: &[Token] = &[TKN];
 
     fn screen(app: &App, logs: &[String]) -> String {
-        sized(app, logs, 100, 30)
+        sized(app, logs, 120, 30)
     }
 
     fn sized(app: &App, logs: &[String], width: u16, height: u16) -> String {
@@ -760,6 +760,46 @@ mod tests {
             .draw(|frame| draw(frame, View::new(app, logs.to_vec(), Instant::now())))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// The text inside the card on a `width` x `height` terminal, one row per line.
+    fn inside(app: &App, logs: &[String], width: u16, height: u16) -> String {
+        let pane = if app.logs { LOG_PANE_LINES + 2 } else { 0 };
+        let card = card(Rect::new(0, 0, width, height), pane).unwrap();
+        let buffer = drawn(app, logs, width, height);
+        (card.y + 1..card.bottom() - 1)
+            .map(|y| {
+                (card.x + 2..card.right() - 2)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Asserts that `cat`'s cells are drawn with their top left corner at (`x`, `y`).
+    fn assert_cat_at(buffer: &Buffer, cat: &[Line<'_>], x: u16, y: u16) {
+        for (row, line) in (y..).zip(cat) {
+            for (column, span) in (x..).zip(&line.spans) {
+                let cell = &buffer[(column, row)];
+                assert_eq!(
+                    (
+                        cell.symbol(),
+                        Some(cell.fg).filter(|&fg| fg != Color::Reset),
+                        Some(cell.bg).filter(|&bg| bg != Color::Reset)
+                    ),
+                    (span.content.as_ref(), span.style.fg, span.style.bg),
+                    "({column}, {row})"
+                );
+            }
+        }
+    }
+
+    /// Row `y` of `buffer` from column `x` on.
+    fn row_from(buffer: &Buffer, x: u16, y: u16) -> String {
+        (x..buffer.area().width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
     }
 
     fn half_block(symbol: &str) -> bool {
@@ -803,6 +843,10 @@ mod tests {
         app.tick(now);
         assert!(screen(&app, &[]).contains(" ( o.- )"));
         assert!(!shown.contains('▀') && !shown.contains('▄'), "{shown}");
+        let buffer = drawn(&waiting(), &[], 120, 40);
+        assert!(row_from(&buffer, 53, 16).starts_with("  /\\_/\\ "));
+        assert!(row_from(&buffer, 53, 17).starts_with(" ( -.- )  z"));
+        assert_eq!(buffer[(52, 17)].symbol(), " ");
     }
 
     #[test]
@@ -816,11 +860,11 @@ mod tests {
             let cell = &buffer[(x, y)];
             (cell.symbol(), cell.fg, cell.bg)
         };
-        assert_eq!(cell(0, 3), (" ", Color::Reset, Color::Reset));
-        assert_eq!(cell(3, 3), ("▄", OUTLINE, Color::Reset));
-        assert_eq!(cell(2, 4), ("▀", OUTLINE, OUTLINE));
+        assert_eq!(cell(39, 10), (" ", Color::Reset, Color::Reset));
+        assert_eq!(cell(42, 10), ("▄", OUTLINE, Color::Reset));
+        assert_eq!(cell(41, 11), ("▀", OUTLINE, OUTLINE));
         assert_eq!(
-            cell(3, 4),
+            cell(42, 11),
             ("▀", Color::Rgb(242, 139, 155), Color::Rgb(242, 139, 155))
         );
         let shown = screen(&app, &[]);
@@ -829,6 +873,78 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("( -.- )"), "{shown}");
+    }
+
+    #[test]
+    fn the_card_is_centered_capped_and_gives_way_on_small_terminals() {
+        let card = |width, height, pane| card(Rect::new(0, 0, width, height), pane);
+        assert_eq!(card(200, 60, 0), Some(Rect::new(40, 12, 120, 36)));
+        assert_eq!(card(80, 24, 0), Some(Rect::new(2, 1, 76, 22)));
+        assert_eq!(
+            card(120, 40, LOG_PANE_LINES + 2),
+            Some(Rect::new(2, 1, 116, 38))
+        );
+        assert_eq!(card(43, 30, 0), None);
+        assert_eq!(card(80, 13, 0), None);
+    }
+
+    #[test]
+    fn waiting_sits_in_a_rounded_card_with_the_cat_twice_as_big_and_centered() {
+        let mut app = waiting();
+        app.pixel_cats = true;
+        app.width = 120;
+        let buffer = drawn(&app, &[], 120, 40);
+        let card = Rect::new(2, 2, 116, 36);
+        for (at, corner) in [
+            ((2, 2), "╭"),
+            ((117, 2), "╮"),
+            ((2, 37), "╰"),
+            ((117, 37), "╯"),
+        ] {
+            assert_eq!(buffer[at].symbol(), corner, "{at:?}");
+        }
+        let header = header_line(&app).to_string();
+        assert!(row_from(&buffer, 3, 2).starts_with(&header), "{header}");
+        for y in 0..40 {
+            for x in 0..120 {
+                if !card.contains((x, y).into()) {
+                    assert_eq!(buffer[(x, y)], Cell::default(), "({x}, {y})");
+                }
+            }
+        }
+        let cat = cat::lines(&cat::frame(Pose::Dozing, 0), 2);
+        assert_eq!(cat[0].width(), 44);
+        assert_cat_at(&buffer, &cat, 38, 10);
+        let status = "looking for a state peer · peers 12 · state peers 0 · 1m20s";
+        let x = 4 + (112 - u16::try_from(status.chars().count()).unwrap()) / 2;
+        assert!(row_from(&buffer, x, 27).starts_with(status));
+        assert_eq!(buffer[(x - 1, 27)].symbol(), " ");
+    }
+
+    #[test]
+    fn the_cat_is_its_own_size_on_an_80_by_24_terminal() {
+        let mut app = waiting();
+        app.pixel_cats = true;
+        app.width = 80;
+        let buffer = drawn(&app, &[], 80, 24);
+        assert_eq!(buffer[(2, 1)].symbol(), "╭");
+        assert_eq!(buffer[(77, 22)].symbol(), "╯");
+        assert_cat_at(&buffer, &cat::lines(&cat::frame(Pose::Dozing, 0), 1), 29, 6);
+        let status = "looking for a state peer · peers 12 · state peers 0 · 1m20s";
+        let x = 4 + (72 - u16::try_from(status.chars().count()).unwrap()) / 2;
+        assert!(row_from(&buffer, x, 15).starts_with(status));
+    }
+
+    #[test]
+    fn a_small_terminal_keeps_the_borderless_layout() {
+        let app = waiting();
+        let shown = sized(&app, &[], 40, 12);
+        assert!(shown.starts_with("chibi · "), "{shown}");
+        assert!(!shown.contains('╭') && !shown.contains('│'), "{shown}");
+        assert!(
+            shown.lines().last().unwrap().starts_with("l logs · q quit"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -875,8 +991,8 @@ mod tests {
         let plain = drawn(&app, &[], 100, 30);
         app.pixel_cats = true;
         let with_cat = drawn(&app, &[], 100, 30);
-        let form_right = (1..12)
-            .flat_map(|y| (0..100).map(move |x| (x, y)))
+        let form_right = (2..14)
+            .flat_map(|y| (4..96).map(move |x| (x, y)))
             .filter(|&at| plain[at].symbol() != " ")
             .map(|(x, _)| x)
             .max()
@@ -894,6 +1010,19 @@ mod tests {
             }
         }
         assert!(cat_cells > 50, "{cat_cells}");
+        let cat_columns = |buffer: &Buffer| {
+            let columns: Vec<u16> = buffer
+                .content()
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| half_block(cell.symbol()))
+                .map(|(at, _)| buffer.pos_of(at).0)
+                .collect();
+            columns.iter().max().unwrap() - columns.iter().min().unwrap() + 1
+        };
+        assert_eq!(cat_columns(&with_cat), 16);
+        app.width = 120;
+        assert_eq!(cat_columns(&drawn(&app, &[], 120, 40)), 32);
 
         app.pixel_cats = false;
         app.width = 60;
@@ -927,7 +1056,7 @@ mod tests {
             .find(|&x| buffer[(x, row)].symbol() == "m")
             .unwrap();
         assert!(buffer[(hint_x, row)].modifier.contains(Modifier::DIM));
-        assert!(!buffer[(2, row)].modifier.contains(Modifier::DIM));
+        assert!(!buffer[(6, row)].modifier.contains(Modifier::DIM));
 
         app.pinned(6, 6, true);
         assert!(!screen(&app, &[]).contains(HINT));
@@ -963,24 +1092,28 @@ mod tests {
     #[test]
     fn the_token_list_opens_below_the_token_row_and_leaves_the_form_in_place() {
         let mut app = on_the_token_row();
-        let closed = drawn(&app, &[], 120, 30);
-        let shown = sized(&app, &[], 120, 30);
+        let closed = drawn(&app, &[], 120, 40);
+        let shown = sized(&app, &[], 120, 40);
         assert!(
             shown.contains("> token   < WETH >   0.50 WETH   Enter to choose   more tokens"),
             "{shown}"
         );
-        let row: String = (0..120).map(|x| closed[(x, 3)].symbol()).collect();
+        assert!(
+            row_from(&closed, 4, 4).starts_with("  from    0x17c5"),
+            "{shown}"
+        );
+        let row = row_from(&closed, 0, 5);
         let hint_x = u16::try_from(row.find("Enter").unwrap()).unwrap();
-        assert!(closed[(hint_x, 3)].modifier.contains(Modifier::DIM));
-        assert!(!closed[(hint_x - 4, 3)].modifier.contains(Modifier::DIM));
+        assert!(closed[(hint_x, 5)].modifier.contains(Modifier::DIM));
+        assert!(!closed[(hint_x - 4, 5)].modifier.contains(Modifier::DIM));
         assert!(!shown.contains("choose a token"), "{shown}");
 
         app.form.picker = Some(Picker {
             filter: String::new(),
             highlighted: app.assets()[2],
         });
-        let open = drawn(&app, &[], 120, 30);
-        let shown = sized(&app, &[], 120, 30);
+        let open = drawn(&app, &[], 120, 40);
+        let shown = sized(&app, &[], 120, 40);
         for expected in [
             "┌choose a token",
             "│  ETH   Ether              3.00 ETH",
@@ -992,15 +1125,15 @@ mod tests {
             assert!(shown.contains(expected), "{expected}\n{shown}");
         }
         let corner = |symbol: &str| {
-            (0..30)
+            (0..40)
                 .flat_map(|y| (0..120).map(move |x| (x, y)))
                 .find(|&at| open[at].symbol() == symbol)
                 .unwrap()
         };
         let (left, top) = corner("┌");
         let (right, bottom) = corner("┘");
-        assert_eq!(top, 4, "{shown}");
-        for y in 0..30 {
+        assert_eq!((left, top), (6, 6), "{shown}");
+        for y in 0..40 {
             for x in 0..120 {
                 if !(left..=right).contains(&x) || !(top..=bottom).contains(&y) {
                     assert_eq!(open[(x, y)], closed[(x, y)], "({x}, {y})\n{shown}");
@@ -1012,7 +1145,7 @@ mod tests {
             filter: "dai".to_owned(),
             highlighted: Asset::Eth,
         });
-        let shown = sized(&app, &[], 120, 30);
+        let shown = sized(&app, &[], 120, 40);
         assert!(shown.contains("│no token matches"), "{shown}");
         assert!(shown.contains("│filter  dai"), "{shown}");
     }
@@ -1253,7 +1386,7 @@ mod tests {
         let config = Path::new("/home/someone/.config/chibi/config.toml");
         let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
         app.unrecorded(SENDER, path, config, "the file is read-only");
-        let shown: String = screen(&app, &[])
+        let shown: String = inside(&app, &[], 120, 30)
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
@@ -1290,7 +1423,7 @@ mod tests {
         app.notice = Some(warning.to_owned());
         app.logs = true;
         let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
-        let shown = squeezed(&sized(&app, &logs, 100, 18));
+        let shown = squeezed(&inside(&app, &logs, 100, 18));
         assert!(shown.contains(&squeezed(warning)), "{shown}");
     }
 
@@ -1301,7 +1434,7 @@ mod tests {
         app.notice = Some(notice.to_owned());
         app.logs = true;
         let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
-        let shown = squeezed(&sized(&app, &logs, 80, 24));
+        let shown = squeezed(&inside(&app, &logs, 80, 24));
         assert!(shown.contains(&squeezed(notice)), "{shown}");
     }
 
