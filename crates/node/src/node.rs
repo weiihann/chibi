@@ -1577,6 +1577,63 @@ pub enum NodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::B512;
+    use tokio::sync::watch;
+
+    use crate::devp2p::{Session, Sessions};
+    use crate::peers::PeerKey;
+
+    fn session(snap: bool) -> Session {
+        Session {
+            client: Arc::from("test"),
+            eth: 69,
+            snap,
+            dialable: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_state_peer_wait_reports_counts_each_second_then_the_found_peer() {
+        let (sessions, watched) = watch::channel(Sessions::new());
+        let (progress, mut seen) = watch::channel(Startup::Serving);
+        let waiting = tokio::spawn(async move { wait_for_state_peer(watched, 0, &progress).await });
+
+        seen.changed().await.unwrap();
+        assert_eq!(
+            *seen.borrow_and_update(),
+            Startup::Waiting {
+                peers: 0,
+                state_peers: 0,
+                elapsed: Duration::ZERO,
+            }
+        );
+        sessions.send_modify(|s| {
+            s.insert(PeerKey(B512::repeat_byte(1)), session(false));
+        });
+        seen.changed().await.unwrap();
+        assert_eq!(
+            *seen.borrow_and_update(),
+            Startup::Waiting {
+                peers: 1,
+                state_peers: 0,
+                elapsed: Duration::ZERO,
+            }
+        );
+        seen.changed().await.unwrap();
+        assert_eq!(
+            *seen.borrow_and_update(),
+            Startup::Waiting {
+                peers: 1,
+                state_peers: 0,
+                elapsed: Duration::from_secs(1),
+            }
+        );
+        sessions.send_modify(|s| {
+            s.insert(PeerKey(B512::repeat_byte(2)), session(true));
+        });
+        waiting.await.unwrap().unwrap();
+        assert_eq!(*seen.borrow_and_update(), Startup::FoundStatePeer);
+    }
 
     fn sample(tips: &[u128]) -> FeeSample {
         FeeSample {
