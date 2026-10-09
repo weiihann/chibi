@@ -465,6 +465,7 @@ fn elapsed(elapsed: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Instant;
 
     use alloy_primitives::{Address, address};
@@ -737,5 +738,28 @@ mod tests {
         assert!(shown.contains("  password  ********"), "{shown}");
         assert!(shown.contains("> again     *******"), "{shown}");
         assert!(!shown.contains("hunter"), "{shown}");
+    }
+
+    #[test]
+    fn a_wallet_saved_without_its_config_shows_the_whole_way_to_start_again() {
+        let path = Path::new(
+            "/home/someone/.config/chibi/keystores/0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025.json",
+        );
+        let config = Path::new("/home/someone/.config/chibi/config.toml");
+        let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
+        app.unrecorded(SENDER, path, config, "the file is read-only");
+        let shown: String = screen(&app, &[])
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let notice: String = format!(
+            "but could not record it in {}: the file is read-only. start with --keystore {} next time.",
+            config.display(),
+            path.display()
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        assert!(shown.contains(&notice), "{shown}");
     }
 }
