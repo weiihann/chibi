@@ -974,7 +974,7 @@ mod tests {
     use ratatui::buffer::{Buffer, Cell};
 
     use super::*;
-    use crate::tui::app::{Balances, EXCITED_FOR, Picker, Sending};
+    use crate::tui::app::{Balances, EXCITED_FOR, EnsName, Picker, Review, Sending};
     use crate::tui::transfer::Draft;
 
     const SENDER: Address = address!("0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025");
@@ -985,6 +985,7 @@ mod tests {
         decimals: 6,
     };
     const REGISTRY: &[Token] = &[TKN];
+    const WEIHAN: Address = address!("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7");
 
     fn screen(app: &App, logs: &[String]) -> String {
         sized(app, logs, 120, 30)
@@ -1225,6 +1226,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(U256::from(3_000_000_000_000_000_000u64)),
             tokens: vec![(TKN, U256::from(1_500_000))],
+            name: None,
         });
         app
     }
@@ -1242,6 +1244,95 @@ mod tests {
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");
         }
+    }
+
+    #[test]
+    fn the_header_names_the_primary_name_before_the_address() {
+        let mut app = ready();
+        assert_eq!(
+            header_line(&app).to_string(),
+            "chibi · sepolia · 0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025"
+        );
+        app.balances(Balances {
+            name: Some("weihan.eth".to_owned()),
+            ..app.balances.clone()
+        });
+        assert_eq!(
+            header_line(&app).to_string(),
+            "chibi · sepolia · weihan.eth · 0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025"
+        );
+    }
+
+    #[test]
+    fn the_to_row_shows_a_name_resolving_then_its_address_or_why_not() {
+        let mut app = ready();
+        app.form.field = Field::To;
+        app.form.to = "weihan.eth".to_owned();
+        let weihan = EnsName::parse("weihan.eth").unwrap();
+        assert_eq!(app.resolve_request(), Some(weihan.clone()));
+        let rows = inside_rows(&app, 120, 40);
+        let to = rows.iter().position(|row| row == "> to      weihan.eth").unwrap();
+        assert_eq!(rows[to + 1], "          resolving...");
+
+        app.resolved(&weihan, Ok(WEIHAN));
+        let rows = inside_rows(&app, 120, 40);
+        assert_eq!(
+            rows[to + 1],
+            "          → 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7"
+        );
+
+        let offchain = "offchain.eth is served offchain, which chibi does not follow";
+        app.form.to = "offchain.eth".to_owned();
+        let name = app.resolve_request().unwrap();
+        app.resolved(&name, Err(offchain.to_owned()));
+        let buffer = drawn(&app, &[], 120, 40);
+        let rows = inside_rows(&app, 120, 40);
+        assert_eq!(rows[to + 1], format!("          {offchain}"));
+        let card = card(Rect::new(0, 0, 120, 40), 0).unwrap();
+        let row = card.y + 1 + u16::try_from(to + 1).unwrap();
+        assert_eq!(buffer[(card.x + 12, row)].fg, Color::Red);
+    }
+
+    #[test]
+    fn on_the_to_field_the_footer_quits_with_ctrl_c_and_drops_the_log_key() {
+        let mut app = ready();
+        app.form.field = Field::To;
+        assert_eq!(
+            inside_rows(&app, 120, 40).last().map(String::as_str),
+            Some(
+                "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · Ctrl-C quit"
+            )
+        );
+    }
+
+    #[test]
+    fn review_shows_the_name_and_the_address_it_resolved_to() {
+        let mut app = ready();
+        app.review = Some(Review {
+            draft: Draft {
+                asset: Asset::Eth,
+                to: WEIHAN,
+                amount: U256::from(1_000_000_000_000_000u64),
+            },
+            name: Some(EnsName::parse("weihan.eth").unwrap()),
+            fee: Fee {
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_750_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+            },
+            refused: None,
+        });
+        app.screen = Screen::Review;
+        let rows = inside_rows(&app, 120, 40);
+        let to = rows
+            .iter()
+            .position(|row| row.trim_start() == "to       weihan.eth")
+            .unwrap();
+        assert_eq!(
+            rows[to + 1].trim_start(),
+            "0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7"
+        );
+        assert_eq!(rows[to + 1].find("0x"), rows[to].find("weihan"));
     }
 
     #[test]
@@ -1343,6 +1434,7 @@ mod tests {
                 (USDC, U256::from(25_000_000)),
                 (WETH, U256::from(500_000_000_000_000_000u64)),
             ],
+            name: None,
         });
         app.form.asset = Asset::Token(WETH);
         app.form.field = Field::Token;
@@ -1428,6 +1520,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(U256::from(4_019_083_742_425_574_983u64)),
             tokens: vec![(TKN, U256::from(1_500_000))],
+            name: None,
         });
         app.form.field = Field::Token;
         app
@@ -1645,6 +1738,7 @@ mod tests {
                 .zip(1..)
                 .map(|(symbol, byte)| (token(symbol, byte), U256::from(1_000_000)))
                 .collect(),
+            name: None,
         });
         app.form.field = Field::Token;
         let closed = drawn(&app, &[], 120, 13);

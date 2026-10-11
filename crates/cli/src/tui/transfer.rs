@@ -360,7 +360,8 @@ fn revert_reason(output: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::address;
+    use alloy_primitives::{address, b256, bytes, hex};
+    use chibi_core::exec::{HaltReason, Output};
     use chibi_core::testing::{
         WorldAccount, eth, mapping_slot, pausable_token_code, transfer_calldata,
     };
@@ -368,6 +369,7 @@ mod tests {
     use chibi_node::{Disk, Follower, Watchlist};
 
     use super::*;
+    use crate::tui::app::EnsName;
 
     const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
     const TOKEN: Address = address!("0x00000000000000000000000000000000000070c3");
@@ -401,6 +403,141 @@ mod tests {
 
     fn signer() -> PrivateKeySigner {
         PrivateKeySigner::from_slice(&KEY).unwrap()
+    }
+
+    const WEIHAN: Address = address!("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7");
+    const RESOLVER: Address = address!("0x000000000000000000000000000000000000e75e");
+    /// `resolve`'s answer for `weihan.eth`: `addr` returning WEIHAN, from resolver
+    /// 0x7025C56698efc0E19de7678D0E3c32075C21B393.
+    const RESOLVED: &str = "00000000000000000000000000000000000000000000000000000000000000400000000000000000000000007025c56698efc0e19de7678d0e3c32075c21b39300000000000000000000000000000000000000000000000000000000000000200000000000000000000000003499ddf9e66b53ca484554d5309bf32521aae5a7";
+
+    #[test]
+    fn the_resolve_call_asks_the_universal_resolver_for_the_names_address() {
+        let name = EnsName::parse("weihan.eth").unwrap();
+        assert_eq!(
+            alloy_ens::namehash(name.as_str()),
+            b256!("0x5c7eb2b28554bc20493ee897ce9d4dcfcf2381334d87daf50efa491f77e9d62c")
+        );
+        let request = resolve_request(RESOLVER, WEIHAN, &name).unwrap();
+        assert_eq!(
+            (request.from, request.to, request.value),
+            (Some(WEIHAN), TxKind::Call(RESOLVER), U256::ZERO)
+        );
+        assert_eq!(
+            request.input,
+            bytes!(
+                "9061b923"
+                "0000000000000000000000000000000000000000000000000000000000000040"
+                "0000000000000000000000000000000000000000000000000000000000000080"
+                "000000000000000000000000000000000000000000000000000000000000000c"
+                "0677656968616e03657468000000000000000000000000000000000000000000"
+                "0000000000000000000000000000000000000000000000000000000000000024"
+                "3b3b57de5c7eb2b28554bc20493ee897ce9d4dcfcf2381334d87daf50efa491f"
+                "77e9d62c00000000000000000000000000000000000000000000000000000000"
+            )
+        );
+        let dns = hex!("0677656968616e0365746800");
+        assert!(request.input.windows(dns.len()).any(|bytes| bytes == dns));
+    }
+
+    #[test]
+    fn the_resolvers_answer_is_an_address_or_says_why_not() {
+        let name = EnsName::parse("weihan.eth").unwrap();
+        let gas = Default::default();
+        let success = |output: &str| {
+            Ok(ExecutionResult::Success {
+                reason: revm::context_interface::result::SuccessReason::Return,
+                gas,
+                logs: Vec::new(),
+                output: Output::Call(Bytes::from(hex::decode(output).unwrap())),
+            })
+        };
+        let revert = |output: &str| {
+            Ok(ExecutionResult::Revert {
+                gas,
+                logs: Vec::new(),
+                output: Bytes::from(hex::decode(output).unwrap()),
+            })
+        };
+        let cases: [(Result<ExecutionResult<HaltReason>, NodeError>, Result<Address, &str>); 9] = [
+            (success(RESOLVED), Ok(WEIHAN)),
+            (
+                success(concat!(
+                    "0000000000000000000000000000000000000000000000000000000000000040",
+                    "0000000000000000000000007025c56698efc0e19de7678d0e3c32075c21b393",
+                    "0000000000000000000000000000000000000000000000000000000000000020",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                )),
+                Err("weihan.eth has no address"),
+            ),
+            (
+                success(concat!(
+                    "0000000000000000000000000000000000000000000000000000000000000040",
+                    "0000000000000000000000007025c56698efc0e19de7678d0e3c32075c21b393",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                )),
+                Err("weihan.eth has no address"),
+            ),
+            (
+                success("2a"),
+                Err("could not resolve weihan.eth: the resolver answered 0x2a"),
+            ),
+            (
+                revert(concat!(
+                    "556f1830",
+                    "000000000000000000000000eeeeeeee14d718c2b47d9923deab1335e144eeee",
+                )),
+                Err("weihan.eth is served offchain, which chibi does not follow"),
+            ),
+            (
+                revert(concat!(
+                    "77209fe8",
+                    "0000000000000000000000000000000000000000000000000000000000000020",
+                    "000000000000000000000000000000000000000000000000000000000000000c",
+                    "0677656968616e03657468000000000000000000000000000000000000000000",
+                )),
+                Err("weihan.eth is not registered"),
+            ),
+            (
+                revert(concat!(
+                    "08c379a0",
+                    "0000000000000000000000000000000000000000000000000000000000000020",
+                    "0000000000000000000000000000000000000000000000000000000000000004",
+                    "6e6f706500000000000000000000000000000000000000000000000000000000",
+                )),
+                Err("could not resolve weihan.eth: nope"),
+            ),
+            (
+                revert(""),
+                Err("could not resolve weihan.eth: no reason given"),
+            ),
+            (
+                Err(NodeError::Disk("locked".to_owned())),
+                Err("could not resolve weihan.eth: data directory: locked"),
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(resolution(&name, result), expected.map_err(str::to_owned));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_resolves_through_the_node_against_resolver_code() {
+        let signer = signer();
+        let sender = signer.address();
+        let returns_resolved = [
+            hex!("6080600c60003960806000f3").as_slice(),
+            &hex::decode(RESOLVED).unwrap(),
+        ]
+        .concat();
+        let fixture = Fixture::genesis([
+            (sender, WorldAccount::eoa(eth(3))),
+            (RESOLVER, WorldAccount::contract(returns_resolved)),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _follower) = start(&fixture, dir.path(), sender).await;
+        let name = EnsName::parse("weihan.eth").unwrap();
+        assert_eq!(resolve(&node, RESOLVER, sender, &name).await, Ok(WEIHAN));
     }
 
     #[tokio::test]

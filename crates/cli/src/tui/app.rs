@@ -1582,6 +1582,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(eth(3_000)),
             tokens: vec![(TKN, U256::from(1_500_000))],
+            name: None,
         });
         app
     }
@@ -1808,7 +1809,7 @@ mod tests {
         submit(&mut app, "", BOB, Ok(FEE));
         assert_eq!(app.screen, Screen::Review);
         app.health(103, 0);
-        assert_eq!((app.screen, app.review), (Screen::Paused, None));
+        assert_eq!((app.screen, app.review.as_ref()), (Screen::Paused, None));
         assert_eq!(press(&mut app, KeyCode::Char('y')), None);
         app.health(104, 1);
         assert_eq!(app.screen, Screen::Ready);
@@ -1828,6 +1829,7 @@ mod tests {
             app.review,
             Some(Review {
                 draft,
+                name: None,
                 fee: FEE,
                 refused: None,
             })
@@ -1848,7 +1850,7 @@ mod tests {
         submit(&mut app, "1", BOB, Ok(FEE));
         assert_eq!(app.screen, Screen::Review);
         assert_eq!(
-            app.review.and_then(|review| review.refused),
+            app.review.as_ref().and_then(|review| review.refused),
             Some("sending on mainnet is not enabled yet")
         );
         assert_eq!(press(&mut app, KeyCode::Char('y')), None);
@@ -1980,6 +1982,194 @@ mod tests {
         }
     }
 
+    const WEIHAN: Address = address!("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7");
+
+    fn name(text: &str) -> EnsName {
+        EnsName::parse(text).unwrap()
+    }
+
+    #[test]
+    fn the_recipient_is_an_address_or_a_lowercased_ascii_name() {
+        let parsed = |text: &str| match parse_recipient(text) {
+            Ok(Recipient::Address(address)) => Ok(address.to_checksum(None)),
+            Ok(Recipient::Name(name)) => Ok(name.to_string()),
+            Err(reason) => Err(reason),
+        };
+        let malformed = "expected 0x followed by 40 hex digits, or a name like name.eth";
+        for (text, expected) in [
+            ("WeiHan.eth", Ok("weihan.eth")),
+            ("_dmarc.weihan.eth", Ok("_dmarc.weihan.eth")),
+            ("w-1.eth", Ok("w-1.eth")),
+            ("weihan", Err(malformed)),
+            ("a..eth", Err(malformed)),
+            ("weihan.eth.", Err(malformed)),
+            ("ab--c.eth", Err(malformed)),
+            ("a_b.eth", Err(malformed)),
+            ("wei han.eth", Err(malformed)),
+            (
+                "wéi.eth",
+                Err(
+                    "chibi takes names in plain letters, digits and hyphens; paste the address for others",
+                ),
+            ),
+            ("", Err("enter the recipient's address")),
+            (
+                "0x0000000000000000000000000000000000000b0b",
+                Ok("0x0000000000000000000000000000000000000b0B"),
+            ),
+            ("0x123", Err("expected 0x followed by 40 hex digits")),
+            ("0xweihan.eth", Err("expected 0x followed by 40 hex digits")),
+            (
+                "0x0000000000000000000000000000000000000000",
+                Err("refusing to send to the zero address"),
+            ),
+            (
+                "0x7f02C3E3c98b133055B8B348B2Ac625669Ed295d",
+                Err("the checksum does not match; check the address, or type it all lowercase"),
+            ),
+        ] {
+            assert_eq!(
+                parsed(text),
+                expected.map(str::to_owned).map_err(str::to_owned),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_name_is_resolved_once_and_a_stale_answer_is_ignored() {
+        let mut app = ready(Network::Sepolia);
+        typed(&mut app, "1");
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "alice.eth");
+        assert_eq!(app.resolve_request(), Some(name("alice.eth")));
+        assert_eq!(app.resolve_request(), None);
+        assert_eq!(app.resolution(), Some(&Resolution::Pending));
+
+        for _ in 0.."alice.eth".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        typed(&mut app, "WeiHan.eth");
+        assert_eq!(app.resolve_request(), Some(name("weihan.eth")));
+        assert_eq!(app.resolve_request(), None);
+        app.resolved(&name("alice.eth"), Ok(BOB.parse().unwrap()));
+        assert_eq!(app.resolution(), Some(&Resolution::Pending));
+        assert_eq!(app.estimate_request(), None);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.screen, errors(&app)),
+            (
+                Screen::Ready,
+                [None, Some("waiting for weihan.eth to resolve"), None]
+            )
+        );
+
+        app.resolved(&name("weihan.eth"), Ok(WEIHAN));
+        assert_eq!(app.resolution(), Some(&Resolution::Resolved(WEIHAN)));
+        assert_eq!(errors(&app), [None, None, None]);
+        assert_eq!(app.resolve_request(), None);
+        app.health(101, 1);
+        assert_eq!(app.resolve_request(), None);
+        let draft = Draft {
+            asset: Asset::Eth,
+            to: WEIHAN,
+            amount: eth(1_000),
+        };
+        assert_eq!(app.estimate_request(), Some(Quote::Exact(draft)));
+        app.estimated(
+            Quote::Exact(draft),
+            app.head,
+            Ok(Quoted { draft, fee: FEE }),
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(
+            app.review,
+            Some(Review {
+                draft,
+                name: Some(name("weihan.eth")),
+                fee: FEE,
+                refused: None,
+            })
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            Some(Action::Send(draft, FEE))
+        );
+    }
+
+    #[test]
+    fn a_failed_name_says_why_and_is_asked_again_at_the_next_head() {
+        let mut app = ready(Network::Sepolia);
+        typed(&mut app, "1");
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "nobody.eth");
+        assert_eq!(app.resolve_request(), Some(name("nobody.eth")));
+        app.resolved(
+            &name("nobody.eth"),
+            Err("nobody.eth is not registered".to_owned()),
+        );
+        assert_eq!(
+            app.resolution(),
+            Some(&Resolution::Failed("nobody.eth is not registered".to_owned()))
+        );
+        assert_eq!(app.resolve_request(), None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.screen, errors(&app)),
+            (
+                Screen::Ready,
+                [None, Some("nobody.eth is not registered"), None]
+            )
+        );
+        app.health(101, 1);
+        assert_eq!(app.resolve_request(), Some(name("nobody.eth")));
+
+        typed(&mut app, "x");
+        app.resolved(&name("nobody.eth"), Ok(WEIHAN));
+        assert_eq!(app.resolution(), None);
+        for _ in 0.."nobody.ethx".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        typed(&mut app, BOB);
+        assert_eq!(app.resolve_request(), None);
+        assert_eq!(app.form.resolution, None);
+    }
+
+    #[test]
+    fn a_name_resolved_to_a_token_contract_warns() {
+        let mut app = ready(Network::Sepolia);
+        app.form.asset = Asset::Token(TKN);
+        app.form.field = Field::To;
+        typed(&mut app, "token.eth");
+        app.resolve_request();
+        app.resolved(&name("token.eth"), Ok(TOKEN));
+        assert_eq!(
+            app.to_warning().as_deref(),
+            Some("this is the TKN contract itself; tokens sent to it are usually lost")
+        );
+    }
+
+    #[test]
+    fn q_and_l_type_into_the_to_field_and_ctrl_c_still_quits() {
+        let mut app = ready(Network::Sepolia);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.form.field, Field::To);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert_eq!(press(&mut app, KeyCode::Char('l')), None);
+        assert_eq!((app.form.to.as_str(), app.logs), ("ql", false));
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Quit)
+        );
+        press(&mut app, KeyCode::Up);
+        assert_eq!(press(&mut app, KeyCode::Char('l')), None);
+        assert!(app.logs);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
     #[test]
     fn a_reverting_or_unknown_fee_blocks_review() {
         let mut app = ready(Network::Sepolia);
@@ -2015,14 +2205,14 @@ mod tests {
         app.form.asset = Asset::Token(TKN);
         submit(&mut app, "max", BOB, Ok(FEE));
         assert_eq!(
-            app.review.map(|review| review.draft.amount),
+            app.review.as_ref().map(|review| review.draft.amount),
             Some(U256::from(1_500_000))
         );
 
         let mut app = ready(Network::Sepolia);
         submit(&mut app, "max", BOB, Ok(FEE));
         assert_eq!(
-            app.review.map(|review| review.draft.amount),
+            app.review.as_ref().map(|review| review.draft.amount),
             Some(U256::from(2_999_942_250_000_000_000u64))
         );
 
@@ -2030,6 +2220,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(U256::from(1_000)),
             tokens: Vec::new(),
+            name: None,
         });
         let short =
             "your balance of 0.000000000000001 ETH does not cover the max fee 0.00005775 ETH";
@@ -2044,6 +2235,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(eth(3_000)),
             tokens: Vec::new(),
+            name: None,
         });
         submit(&mut app, "max", BOB, Ok(FEE));
         assert_eq!(errors(&app), [Some("you hold no TKN"), None, None]);
@@ -2092,6 +2284,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(eth(3_000)),
             tokens: vec![(USDC, U256::from(25_000_000)), (WETH, eth(500))],
+            name: None,
         });
         app.form.asset = Asset::Token(WETH);
         app.form.field = Field::Token;
@@ -2170,6 +2363,7 @@ mod tests {
         app.balances(Balances {
             eth: Some(eth(3_000)),
             tokens: vec![(USDC, U256::from(25_000_000))],
+            name: None,
         });
         assert_eq!(picker(&app), Some(("", 0)));
         press(&mut app, KeyCode::Enter);
@@ -2270,6 +2464,7 @@ mod tests {
         assert_eq!(app.tracking(), None);
         press(&mut app, KeyCode::Enter);
         assert_eq!((app.screen, app.form.amount.as_str()), (Screen::Ready, ""));
+        press(&mut app, KeyCode::Up);
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
     }
 
@@ -2287,12 +2482,14 @@ mod tests {
         app.refreshed(Some(Balances {
             eth: Some(eth(3_000)),
             tokens: Vec::new(),
+            name: None,
         }));
         assert!(!app.balances_request(100, 3));
         assert!(app.balances_request(100, 5));
         app.refreshed(Some(Balances {
             eth: Some(eth(3_000)),
             tokens: vec![(TKN, U256::from(1_500_000))],
+            name: None,
         }));
         assert_eq!(app.assets(), [Asset::Eth, Asset::Token(TKN)]);
         assert!(!app.balances_request(100, 5));

@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn balances_list_registry_tokens_held_with_a_nonzero_balance() {
+    fn balances_list_registry_tokens_held_with_a_nonzero_balance_and_a_printable_name() {
         const fn token(symbol: &'static str) -> Token {
             Token {
                 symbol,
@@ -962,7 +962,7 @@ mod tests {
         let registry = [token("AAA"), token("BBB"), token("CCC"), token("DDD")];
         let holding = Holding {
             address: address!("0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025"),
-            name: None,
+            name: Some("weihan.eth".to_owned()),
             balance: Some(U256::from(7)),
             nonce: Some(0),
             tokens: vec![
@@ -977,7 +977,13 @@ mod tests {
             Balances {
                 eth: Some(U256::from(7)),
                 tokens: vec![(registry[0], U256::from(1)), (registry[2], U256::from(3))],
+                name: Some("weihan.eth".to_owned()),
             }
         );
+        let spoofed = Holding {
+            name: Some("\u{202e}hte.nahiew".to_owned()),
+            ..holding
+        };
+        assert_eq!(balances(&spoofed, &registry).name, None);
     }
 }
