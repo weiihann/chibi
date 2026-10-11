@@ -194,6 +194,10 @@ impl fmt::Display for EnsName {
     }
 }
 
+/// Which resolution request an answer belongs to; each request gets a larger one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestId(u64);
+
 /// What the node answered for a name in the recipient field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution {
@@ -224,8 +228,8 @@ pub struct Form {
     pub fee_error: Option<String>,
     /// The token list, while it is open over the form.
     pub picker: Option<Picker>,
-    /// The name last asked for and its answer.
-    pub resolution: Option<(EnsName, Resolution)>,
+    /// The name last asked for, the request that asked it, and its answer.
+    pub resolution: Option<(EnsName, RequestId, Resolution)>,
 }
 
 /// The token list opened from the token row.
@@ -528,6 +532,7 @@ pub struct App {
     balances_asked: Option<(u64, usize)>,
     refreshing: bool,
     resolve_head: u64,
+    last_request: RequestId,
     excited_since: Option<Instant>,
     entered: Option<(Screen, Instant)>,
     serving: bool,
@@ -563,6 +568,7 @@ impl App {
             balances_asked: None,
             refreshing: false,
             resolve_head: 0,
+            last_request: RequestId(0),
             excited_since: None,
             serving: false,
             pixel_cats: false,
@@ -859,9 +865,9 @@ impl App {
         }
     }
 
-    /// The name in the recipient field to resolve, marking it asked: a name not asked yet,
-    /// or one that failed at an earlier head. Only while the form is up.
-    pub fn resolve_request(&mut self) -> Option<EnsName> {
+    /// The name in the recipient field to resolve, marking it asked under a fresh request id:
+    /// a name not asked yet, or one that failed at an earlier head. Only while the form is up.
+    pub fn resolve_request(&mut self) -> Option<(EnsName, RequestId)> {
         let Ok(Recipient::Name(name)) = parse_recipient(&self.form.to) else {
             self.form.resolution = None;
             return None;
@@ -869,7 +875,7 @@ impl App {
         if self.screen != Screen::Ready {
             return None;
         }
-        if let Some((asked, resolution)) = &self.form.resolution
+        if let Some((asked, _, resolution)) = &self.form.resolution
             && *asked == name
         {
             match resolution {
@@ -878,18 +884,21 @@ impl App {
                 Resolution::Failed(_) => {}
             }
         }
-        self.form.resolution = Some((name.clone(), Resolution::Pending));
+        self.last_request = RequestId(self.last_request.0 + 1);
+        self.form.resolution = Some((name.clone(), self.last_request, Resolution::Pending));
         self.resolve_head = self.head;
-        Some(name)
+        Some((name, self.last_request))
     }
 
-    /// The node resolved `name`; applied only while the recipient field still holds it.
-    pub fn resolved(&mut self, name: &EnsName, result: Result<Address, String>) {
-        if !matches!(parse_recipient(&self.form.to), Ok(Recipient::Name(typed)) if typed == *name) {
+    /// The node answered request `id`; applied only while it is the latest request and the
+    /// recipient field still holds its name.
+    pub fn resolved(&mut self, id: RequestId, result: Result<Address, String>) {
+        let Ok(Recipient::Name(typed)) = parse_recipient(&self.form.to) else {
             return;
-        }
-        if let Some((asked, resolution)) = &mut self.form.resolution
-            && asked == name
+        };
+        if let Some((asked, current, resolution)) = &mut self.form.resolution
+            && *current == id
+            && *asked == typed
         {
             *resolution = match result {
                 Ok(address) => Resolution::Resolved(address),
@@ -907,8 +916,8 @@ impl App {
         self.form
             .resolution
             .as_ref()
-            .filter(|(asked, _)| *asked == name)
-            .map(|(_, resolution)| resolution)
+            .filter(|(asked, _, _)| *asked == name)
+            .map(|(_, _, resolution)| resolution)
     }
 
     /// The address the recipient field sends to, with the reason there is none yet.
@@ -2266,10 +2275,7 @@ mod tests {
         typed(&mut app, "nobody.eth");
         let (nobody, id) = app.resolve_request().unwrap();
         assert_eq!(nobody, name("nobody.eth"));
-        app.resolved(
-            id,
-            Err("nobody.eth is not registered".to_owned()),
-        );
+        app.resolved(id, Err("nobody.eth is not registered".to_owned()));
         assert_eq!(
             app.resolution(),
             Some(&Resolution::Failed(

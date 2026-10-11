@@ -28,7 +28,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
-use self::app::{Action, App, Balances, CAT_FRAME, EnsName};
+use self::app::{Action, App, Balances, CAT_FRAME, RequestId};
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
 use self::wallet::Saved;
@@ -239,7 +239,7 @@ fn release_raw() {
 enum Done {
     Balances(Option<Balances>),
     Estimated(Box<(Quote, u64, Result<Quoted, String>)>),
-    Resolved(EnsName, Result<Address, String>),
+    Resolved(RequestId, Result<Address, String>),
     Sent(Result<TxHash, String>),
 }
 
@@ -549,7 +549,7 @@ impl Ui<'_> {
                             let (quote, head, quoted) = *estimated;
                             self.app.estimated(quote, head, quoted);
                         }
-                        Ok(Done::Resolved(name, resolved)) => self.app.resolved(&name, resolved),
+                        Ok(Done::Resolved(id, resolved)) => self.app.resolved(id, resolved),
                         Ok(Done::Sent(sent)) => self.app.sent(sent),
                         Err(err) if err.is_cancelled() => {}
                         Err(err) => return Err(err).wrap_err("a TUI task failed"),
@@ -576,12 +576,12 @@ impl Ui<'_> {
                         }
                     }
                 }
-                if let (Some(node), Some(name)) = (&node, self.app.resolve_request()) {
+                if let (Some(node), Some((name, id))) = (&node, self.app.resolve_request()) {
                     let node = node.clone();
                     let from = signer.address();
                     tasks.spawn(async move {
                         let resolved = transfer::resolve(&node, resolver, from, &name).await;
-                        Done::Resolved(name, resolved)
+                        Done::Resolved(id, resolved)
                     });
                 }
                 if let (Some(node), Some(quote)) = (&node, self.app.estimate_request()) {

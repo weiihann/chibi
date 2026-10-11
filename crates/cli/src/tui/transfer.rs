@@ -411,15 +411,23 @@ pub fn resolution(
         }
         Err(err) => return Err(format!("could not resolve {name}: {err}")),
     };
-    let malformed = || format!("could not resolve {name}: the resolver answered {output}");
-    let (answer, _) = <(Bytes, Address)>::abi_decode_params(&output).map_err(|_| malformed())?;
+    let malformed = || {
+        format!("could not resolve {name}: the resolver returned something other than an address")
+    };
+    let answer = <(Bytes, Address)>::abi_decode_params(&output)
+        .ok()
+        .filter(|decoded| decoded.abi_encode_params() == *output)
+        .ok_or_else(malformed)?
+        .0;
     if answer.is_empty() {
         return Err(format!("{name} has no address"));
     }
-    match Address::abi_decode(&answer) {
-        Ok(Address::ZERO) => Err(format!("{name} has no address")),
-        Ok(address) => Ok(address),
-        Err(_) => Err(malformed()),
+    match <[u8; 32]>::try_from(answer.as_ref()) {
+        Ok(word) if word[..12] == [0; 12] => match Address::from_slice(&word[12..]) {
+            Address::ZERO => Err(format!("{name} has no address")),
+            address => Ok(address),
+        },
+        _ => Err(malformed()),
     }
 }
 
@@ -566,10 +574,7 @@ mod tests {
                 )),
                 Err("weihan.eth has no address"),
             ),
-            (
-                success("2a"),
-                Err(NOT_AN_ADDRESS),
-            ),
+            (success("2a"), Err(NOT_AN_ADDRESS)),
             (
                 success(concat!(
                     "0000000000000000000000000000000000000000000000000000000000000040",
