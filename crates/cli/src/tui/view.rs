@@ -1302,7 +1302,8 @@ mod tests {
         app.form.field = Field::To;
         app.form.to = "weihan.eth".to_owned();
         let weihan = EnsName::parse("weihan.eth").unwrap();
-        assert_eq!(app.resolve_request(), Some(weihan.clone()));
+        let (asked, id) = app.resolve_request().unwrap();
+        assert_eq!(asked, weihan);
         let rows = inside_rows(&app, 120, 40);
         let to = rows
             .iter()
@@ -1310,7 +1311,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows[to + 1], "          resolving...");
 
-        app.resolved(&weihan, Ok(WEIHAN));
+        app.resolved(id, Ok(WEIHAN));
         let rows = inside_rows(&app, 120, 40);
         assert_eq!(
             rows[to + 1],
@@ -1319,8 +1320,8 @@ mod tests {
 
         let offchain = "offchain.eth is served offchain, which chibi does not follow";
         app.form.to = "offchain.eth".to_owned();
-        let name = app.resolve_request().unwrap();
-        app.resolved(&name, Err(offchain.to_owned()));
+        let (_, id) = app.resolve_request().unwrap();
+        app.resolved(id, Err(offchain.to_owned()));
         let buffer = drawn(&app, &[], 120, 40);
         let rows = inside_rows(&app, 120, 40);
         assert_eq!(rows[to + 1], format!("          {offchain}"));

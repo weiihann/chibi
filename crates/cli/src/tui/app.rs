@@ -2198,7 +2198,8 @@ mod tests {
         typed(&mut app, "1");
         press(&mut app, KeyCode::Down);
         typed(&mut app, "alice.eth");
-        assert_eq!(app.resolve_request(), Some(name("alice.eth")));
+        let (alice, alice_id) = app.resolve_request().unwrap();
+        assert_eq!(alice, name("alice.eth"));
         assert_eq!(app.resolve_request(), None);
         assert_eq!(app.resolution(), Some(&Resolution::Pending));
 
@@ -2206,9 +2207,10 @@ mod tests {
             press(&mut app, KeyCode::Backspace);
         }
         typed(&mut app, "WeiHan.eth");
-        assert_eq!(app.resolve_request(), Some(name("weihan.eth")));
+        let (weihan, weihan_id) = app.resolve_request().unwrap();
+        assert_eq!(weihan, name("weihan.eth"));
         assert_eq!(app.resolve_request(), None);
-        app.resolved(&name("alice.eth"), Ok(BOB.parse().unwrap()));
+        app.resolved(alice_id, Ok(BOB.parse().unwrap()));
         assert_eq!(app.resolution(), Some(&Resolution::Pending));
         assert_eq!(app.estimate_request(), None);
 
@@ -2221,7 +2223,7 @@ mod tests {
             )
         );
 
-        app.resolved(&name("weihan.eth"), Ok(WEIHAN));
+        app.resolved(weihan_id, Ok(WEIHAN));
         assert_eq!(app.resolution(), Some(&Resolution::Resolved(WEIHAN)));
         assert_eq!(errors(&app), [None, None, None]);
         assert_eq!(app.resolve_request(), None);
@@ -2262,9 +2264,10 @@ mod tests {
         typed(&mut app, "1");
         press(&mut app, KeyCode::Down);
         typed(&mut app, "nobody.eth");
-        assert_eq!(app.resolve_request(), Some(name("nobody.eth")));
+        let (nobody, id) = app.resolve_request().unwrap();
+        assert_eq!(nobody, name("nobody.eth"));
         app.resolved(
-            &name("nobody.eth"),
+            id,
             Err("nobody.eth is not registered".to_owned()),
         );
         assert_eq!(
@@ -2283,10 +2286,11 @@ mod tests {
             )
         );
         app.health(101, 1);
-        assert_eq!(app.resolve_request(), Some(name("nobody.eth")));
+        let (nobody, id) = app.resolve_request().unwrap();
+        assert_eq!(nobody, name("nobody.eth"));
 
         typed(&mut app, "x");
-        app.resolved(&name("nobody.eth"), Ok(WEIHAN));
+        app.resolved(id, Ok(WEIHAN));
         assert_eq!(app.resolution(), None);
         for _ in 0.."nobody.ethx".len() {
             press(&mut app, KeyCode::Backspace);
@@ -2297,13 +2301,30 @@ mod tests {
     }
 
     #[test]
+    fn an_older_answer_for_a_name_typed_again_is_ignored() {
+        let mut app = ready(Network::Sepolia);
+        typed(&mut app, "1");
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "weihan.eth");
+        let (_, older) = app.resolve_request().unwrap();
+        press(&mut app, KeyCode::Backspace);
+        assert!(app.resolve_request().is_some());
+        typed(&mut app, "h");
+        let (weihan, newer) = app.resolve_request().unwrap();
+        assert_eq!(weihan, name("weihan.eth"));
+        app.resolved(newer, Ok(WEIHAN));
+        app.resolved(older, Ok(BOB.parse().unwrap()));
+        assert_eq!(app.resolution(), Some(&Resolution::Resolved(WEIHAN)));
+    }
+
+    #[test]
     fn a_name_resolved_to_a_token_contract_warns() {
         let mut app = ready(Network::Sepolia);
         app.form.asset = Asset::Token(TKN);
         app.form.field = Field::To;
         typed(&mut app, "token.eth");
-        app.resolve_request();
-        app.resolved(&name("token.eth"), Ok(TOKEN));
+        let (_, id) = app.resolve_request().unwrap();
+        app.resolved(id, Ok(TOKEN));
         assert_eq!(
             app.to_warning().as_deref(),
             Some("this is the TKN contract itself; tokens sent to it are usually lost")
