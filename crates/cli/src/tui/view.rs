@@ -12,7 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
 use super::app::{
-    App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, SIDE_CAT_COLUMNS, Screen, SendState, show,
+    App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, Resolution, SIDE_CAT_COLUMNS, Screen,
+    SendState, show,
 };
 use super::cat::{self, Pose};
 use super::transfer::{Asset, Fee};
@@ -426,6 +427,9 @@ fn header_line(app: &App) -> Line<'static> {
         Span::styled("chibi", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(" · {}", app.network)),
     ];
+    if let Some(name) = &app.balances.name {
+        spans.push(Span::raw(format!(" · {name}")));
+    }
     if let Some(sender) = app.sender {
         spans.push(Span::raw(format!(" · {}", sender.to_checksum(None))));
     }
@@ -655,11 +659,24 @@ fn form(app: &App, rows: &mut Vec<Row>) -> usize {
     rows.push(field(Field::To, "to", vec![Span::raw(app.form.to.clone())]));
     if let Some(error) = &app.form.to_error {
         rows.push(Row::Text(error_line(error)));
-    } else if let Some(warning) = app.to_warning() {
-        rows.push(Row::Text(Line::styled(
-            format!("          {warning}"),
-            Style::default().fg(Color::Yellow),
-        )));
+    } else {
+        match app.resolution() {
+            Some(Resolution::Pending) => {
+                rows.push(Row::Text(Line::styled("          resolving...", dim)));
+            }
+            Some(Resolution::Resolved(address)) => rows.push(Row::Text(Line::styled(
+                format!("          → {}", address.to_checksum(None)),
+                dim,
+            ))),
+            Some(Resolution::Failed(reason)) => rows.push(Row::Text(error_line(reason))),
+            None => {}
+        }
+        if let Some(warning) = app.to_warning() {
+            rows.push(Row::Text(Line::styled(
+                format!("          {warning}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
     }
     let fee = match app.fee() {
         Some(Ok(fee)) => fee_text(fee),
@@ -805,7 +822,7 @@ impl Popup {
 }
 
 fn review(app: &App, lines: &mut Vec<Line<'static>>) {
-    let Some(review) = app.review else {
+    let Some(review) = &app.review else {
         return;
     };
     let draft = review.draft;
@@ -815,10 +832,19 @@ fn review(app: &App, lines: &mut Vec<Line<'static>>) {
         "  network  {} (chain id {})",
         app.network, app.chain_id
     )));
-    lines.push(Line::raw(format!(
-        "  to       {}",
-        draft.to.to_checksum(None)
-    )));
+    match &review.name {
+        Some(name) => {
+            lines.push(Line::raw(format!("  to       {name}")));
+            lines.push(Line::raw(format!(
+                "           {}",
+                draft.to.to_checksum(None)
+            )));
+        }
+        None => lines.push(Line::raw(format!(
+            "  to       {}",
+            draft.to.to_checksum(None)
+        ))),
+    }
     lines.push(Line::raw(format!(
         "  amount   {}",
         show(draft.amount, draft.asset)
@@ -892,6 +918,13 @@ fn keys(app: &App) -> &'static [&'static str] {
         Screen::Password => &["up/down field", "Enter continue", "Esc back to the menu"],
         Screen::Unlock => &["Enter unlock", "Esc quit"],
         Screen::Waiting | Screen::Excited | Screen::Paused => &["l logs", "q quit"],
+        Screen::Ready if app.typing_recipient() => &[
+            "up/down field",
+            "Enter or left/right token",
+            "type amount (or max) and to",
+            "Enter review",
+            "Ctrl-C quit",
+        ],
         Screen::Ready => &[
             "up/down field",
             "Enter or left/right token",
@@ -1271,7 +1304,10 @@ mod tests {
         let weihan = EnsName::parse("weihan.eth").unwrap();
         assert_eq!(app.resolve_request(), Some(weihan.clone()));
         let rows = inside_rows(&app, 120, 40);
-        let to = rows.iter().position(|row| row == "> to      weihan.eth").unwrap();
+        let to = rows
+            .iter()
+            .position(|row| row == "> to      weihan.eth")
+            .unwrap();
         assert_eq!(rows[to + 1], "          resolving...");
 
         app.resolved(&weihan, Ok(WEIHAN));

@@ -1,6 +1,7 @@
 //! The TUI's screens as a state machine: keys, start-up progress, peer counts and node
 //! results in; what the event loop should do out. No terminal and no network here.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,13 @@ pub const PASSWORD_MIN_CHARS: usize = 8;
 
 /// Shown with the new recovery phrase.
 pub const BACKUP_WARNING: &str = "write these words down. anyone with them controls this wallet. chibi will not show them again.";
+
+/// Why a recipient that is neither an address nor a name cannot be sent to.
+const NOT_RECIPIENT: &str = "expected 0x followed by 40 hex digits, or a name like name.eth";
+
+/// Why a name with a character outside ASCII is refused.
+const NAME_NOT_ASCII: &str =
+    "chibi takes names in plain letters, digits and hyphens; paste the address for others";
 
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +140,69 @@ pub struct Balances {
     pub eth: Option<U256>,
     /// Registry tokens with a nonzero balance, in registry order.
     pub tokens: Vec<(Token, U256)>,
+    /// The sender's primary ENS name, if it has one that prints as itself.
+    pub name: Option<String>,
+}
+
+/// The recipient field: an address, or a name to resolve to one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recipient {
+    /// Sent to as typed.
+    Address(Address),
+    /// Sent to the address the node resolves it to.
+    Name(EnsName),
+}
+
+/// An ENS name of lowercase ASCII labels, as [`EnsName::parse`] accepts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnsName(String);
+
+impl EnsName {
+    /// `text` lowercased, if it is ASCII and has at least two labels, each non-empty, of
+    /// `a-z`, `0-9`, `-` and a leading `_`, with no `--` at its third and fourth characters.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if !text.is_ascii() {
+            return Err(NAME_NOT_ASCII.to_owned());
+        }
+        let name = text.to_ascii_lowercase();
+        let label = |label: &str| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.get(2..4) != Some(b"--")
+                && bytes.iter().enumerate().all(|(at, &byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'
+                        || byte == b'_' && at == 0
+                })
+        };
+        if name.split('.').count() < 2 || !name.split('.').all(label) {
+            return Err(NOT_RECIPIENT.to_owned());
+        }
+        Ok(Self(name))
+    }
+
+    /// The name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnsName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What the node answered for a name in the recipient field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// Asked; no answer yet.
+    Pending,
+    /// The name's address.
+    Resolved(Address),
+    /// Why it has no address chibi can send to.
+    Failed(String),
 }
 
 /// The transfer form's input and the messages shown beside each field.
@@ -153,6 +224,8 @@ pub struct Form {
     pub fee_error: Option<String>,
     /// The token list, while it is open over the form.
     pub picker: Option<Picker>,
+    /// The name last asked for and its answer.
+    pub resolution: Option<(EnsName, Resolution)>,
 }
 
 /// The token list opened from the token row.
@@ -209,6 +282,7 @@ impl Default for Form {
             to_error: None,
             fee_error: None,
             picker: None,
+            resolution: None,
         }
     }
 }
@@ -225,10 +299,12 @@ pub struct Estimate {
 }
 
 /// A transfer ready to sign, or refused on this network.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Review {
     /// The transfer.
     pub draft: Draft,
+    /// The name the recipient was typed as, resolved to the draft's recipient.
+    pub name: Option<EnsName>,
     /// Its gas and fee caps.
     pub fee: Fee,
     /// Why it cannot be sent here, if it cannot.
@@ -451,6 +527,7 @@ pub struct App {
     quit_armed: bool,
     balances_asked: Option<(u64, usize)>,
     refreshing: bool,
+    resolve_head: u64,
     excited_since: Option<Instant>,
     entered: Option<(Screen, Instant)>,
     serving: bool,
@@ -485,6 +562,7 @@ impl App {
             setup: Setup::new(),
             balances_asked: None,
             refreshing: false,
+            resolve_head: 0,
             excited_since: None,
             serving: false,
             pixel_cats: false,
@@ -781,6 +859,70 @@ impl App {
         }
     }
 
+    /// The name in the recipient field to resolve, marking it asked: a name not asked yet,
+    /// or one that failed at an earlier head. Only while the form is up.
+    pub fn resolve_request(&mut self) -> Option<EnsName> {
+        let Ok(Recipient::Name(name)) = parse_recipient(&self.form.to) else {
+            self.form.resolution = None;
+            return None;
+        };
+        if self.screen != Screen::Ready {
+            return None;
+        }
+        if let Some((asked, resolution)) = &self.form.resolution
+            && *asked == name
+        {
+            match resolution {
+                Resolution::Pending | Resolution::Resolved(_) => return None,
+                Resolution::Failed(_) if self.resolve_head == self.head => return None,
+                Resolution::Failed(_) => {}
+            }
+        }
+        self.form.resolution = Some((name.clone(), Resolution::Pending));
+        self.resolve_head = self.head;
+        Some(name)
+    }
+
+    /// The node resolved `name`; applied only while the recipient field still holds it.
+    pub fn resolved(&mut self, name: &EnsName, result: Result<Address, String>) {
+        if !matches!(parse_recipient(&self.form.to), Ok(Recipient::Name(typed)) if typed == *name) {
+            return;
+        }
+        if let Some((asked, resolution)) = &mut self.form.resolution
+            && asked == name
+        {
+            *resolution = match result {
+                Ok(address) => Resolution::Resolved(address),
+                Err(reason) => Resolution::Failed(reason),
+            };
+            self.form.to_error = None;
+        }
+    }
+
+    /// The answer for the name in the recipient field, if one was asked.
+    pub fn resolution(&self) -> Option<&Resolution> {
+        let Ok(Recipient::Name(name)) = parse_recipient(&self.form.to) else {
+            return None;
+        };
+        self.form
+            .resolution
+            .as_ref()
+            .filter(|(asked, _)| *asked == name)
+            .map(|(_, resolution)| resolution)
+    }
+
+    /// The address the recipient field sends to, with the reason there is none yet.
+    fn recipient(&self) -> Result<Address, String> {
+        match parse_recipient(&self.form.to)? {
+            Recipient::Address(address) => Ok(address),
+            Recipient::Name(name) => match self.resolution() {
+                Some(Resolution::Resolved(address)) => Ok(*address),
+                Some(Resolution::Failed(reason)) => Err(reason.clone()),
+                Some(Resolution::Pending) | None => Err(format!("waiting for {name} to resolve")),
+            },
+        }
+    }
+
     /// The node answered the submission.
     pub fn sent(&mut self, result: Result<TxHash, String>) {
         let Some(sending) = self.sending.as_mut() else {
@@ -863,7 +1005,7 @@ impl App {
         let Asset::Token(token) = self.form.asset else {
             return None;
         };
-        let to = parse_address(&self.form.to).ok()?;
+        let to = self.recipient().ok()?;
         (to == token.address).then(|| {
             format!(
                 "this is the {} contract itself; tokens sent to it are usually lost",
@@ -884,7 +1026,8 @@ impl App {
             return self.setup_key(key, ctrl_c);
         }
         let picking = self.screen == Screen::Ready && self.form.picker.is_some();
-        if ctrl_c || (!picking && key == Some(Key::Char('q'))) {
+        let typing = self.typing_recipient();
+        if ctrl_c || (!picking && !typing && key == Some(Key::Char('q'))) {
             return self.quit();
         }
         self.quit_armed = false;
@@ -893,7 +1036,7 @@ impl App {
             self.picker_key(key);
             return None;
         }
-        if key == Key::Char('l') {
+        if !typing && key == Key::Char('l') {
             self.logs = !self.logs;
             return None;
         }
@@ -918,6 +1061,11 @@ impl App {
             | Screen::Excited
             | Screen::Paused => None,
         }
+    }
+
+    /// Whether the recipient field takes every typed character, `q` and `l` included.
+    pub fn typing_recipient(&self) -> bool {
+        self.screen == Screen::Ready && self.form.picker.is_none() && self.form.field == Field::To
     }
 
     fn unlock_key(&mut self, key: Option<Key>, ctrl_c: bool) -> Option<Action> {
@@ -1195,7 +1343,7 @@ impl App {
                     self.form.amount.push(c);
                     self.form.amount_error = None;
                 }
-                Field::To if c.is_ascii_hexdigit() || c == 'x' => {
+                Field::To if !c.is_control() => {
                     self.form.to.push(c);
                     self.form.to_error = None;
                 }
@@ -1264,8 +1412,7 @@ impl App {
     fn review_key(&mut self, key: Key) -> Option<Action> {
         match key {
             Key::Char('y') => {
-                let review = self.review.filter(|review| review.refused.is_none())?;
-                self.review = None;
+                let review = self.review.take_if(|review| review.refused.is_none())?;
                 self.sending = Some(Sending {
                     draft: review.draft,
                     hash: None,
@@ -1308,7 +1455,7 @@ impl App {
     /// Checks every field; on success shows Review with the quoted draft and fee. The fee is
     /// only judged once the other fields make a quote to ask.
     fn submit(&mut self) {
-        let to = parse_recipient(&self.form.to);
+        let to = self.recipient();
         let quoted = self.quote().map(|_| match self.quoted() {
             Some(Ok(quoted)) => Ok(*quoted),
             Some(Err(reason)) => Err(reason.clone()),
@@ -1331,8 +1478,13 @@ impl App {
         let (Ok(_), Ok(()), Some(Ok(quoted))) = (to, amount, quoted) else {
             return;
         };
+        let name = match parse_recipient(&self.form.to) {
+            Ok(Recipient::Name(name)) => Some(name),
+            Ok(Recipient::Address(_)) | Err(_) => None,
+        };
         self.review = Some(Review {
             draft: quoted.draft,
+            name,
             fee: quoted.fee,
             refused: (self.network != Network::Sepolia).then_some(MAINNET_REFUSED),
         });
@@ -1403,7 +1555,7 @@ impl App {
     /// What the fee is quoted for: the form's draft, `max` of a token as its balance, and
     /// `max` ETH as the balance less the fee of sending it.
     fn quote(&self) -> Option<Quote> {
-        let to = parse_recipient(&self.form.to).ok()?;
+        let to = self.recipient().ok()?;
         let asset = self.form.asset;
         Some(match (self.amount().ok()?, asset) {
             (Amount::Exact(amount), _) => Quote::Exact(Draft { asset, to, amount }),
@@ -1490,14 +1642,18 @@ fn erase_last(password: &mut String) {
     }
 }
 
-/// The recipient field as an address, with the reason it cannot be sent to.
-fn parse_recipient(text: &str) -> Result<Address, String> {
-    if text.trim().is_empty() {
+/// The recipient field as an address or a name, with the reason it cannot be sent to.
+fn parse_recipient(text: &str) -> Result<Recipient, String> {
+    let text = text.trim();
+    if text.is_empty() {
         return Err("enter the recipient's address".to_owned());
+    }
+    if !text.starts_with("0x") {
+        return EnsName::parse(text).map(Recipient::Name);
     }
     match parse_address(text) {
         Ok(Address::ZERO) => Err("refusing to send to the zero address".to_owned()),
-        Ok(address) => Ok(address),
+        Ok(address) => Ok(Recipient::Address(address)),
         Err(AddressError::Malformed(_)) => Err("expected 0x followed by 40 hex digits".to_owned()),
         Err(AddressError::Checksum(_)) => Err(
             "the checksum does not match; check the address, or type it all lowercase".to_owned(),
@@ -2015,7 +2171,7 @@ mod tests {
             ("", Err("enter the recipient's address")),
             (
                 "0x0000000000000000000000000000000000000b0b",
-                Ok("0x0000000000000000000000000000000000000b0B"),
+                Ok("0x0000000000000000000000000000000000000B0b"),
             ),
             ("0x123", Err("expected 0x followed by 40 hex digits")),
             ("0xweihan.eth", Err("expected 0x followed by 40 hex digits")),
@@ -2113,7 +2269,9 @@ mod tests {
         );
         assert_eq!(
             app.resolution(),
-            Some(&Resolution::Failed("nobody.eth is not registered".to_owned()))
+            Some(&Resolution::Failed(
+                "nobody.eth is not registered".to_owned()
+            ))
         );
         assert_eq!(app.resolve_request(), None);
         press(&mut app, KeyCode::Enter);

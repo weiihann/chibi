@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::TxHash;
+use alloy_primitives::{Address, TxHash};
 use alloy_signer_local::PrivateKeySigner;
 use chibi_node::{Holding, Node, NodeConfig, Peers, Startup, Token};
 use crossterm::event::{self, Event, KeyEventKind};
@@ -28,11 +28,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
-use self::app::{Action, App, Balances, CAT_FRAME};
+use self::app::{Action, App, Balances, CAT_FRAME, EnsName};
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
 use self::wallet::Saved;
 use crate::config::process_env;
+use crate::names::printable;
 use crate::run::{self, STARTING, Served};
 
 /// Log lines kept for the log pane.
@@ -238,6 +239,7 @@ fn release_raw() {
 enum Done {
     Balances(Option<Balances>),
     Estimated(Box<(Quote, u64, Result<Quoted, String>)>),
+    Resolved(EnsName, Result<Address, String>),
     Sent(Result<TxHash, String>),
 }
 
@@ -492,6 +494,7 @@ impl Ui<'_> {
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut frames = tokio::time::interval(CAT_FRAME);
         frames.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let resolver = self.app.network.spec().ens_resolver;
         let ui: eyre::Result<eyre::Result<()>> = async {
             loop {
                 self.draw()?;
@@ -546,6 +549,7 @@ impl Ui<'_> {
                             let (quote, head, quoted) = *estimated;
                             self.app.estimated(quote, head, quoted);
                         }
+                        Ok(Done::Resolved(name, resolved)) => self.app.resolved(&name, resolved),
                         Ok(Done::Sent(sent)) => self.app.sent(sent),
                         Err(err) if err.is_cancelled() => {}
                         Err(err) => return Err(err).wrap_err("a TUI task failed"),
@@ -571,6 +575,14 @@ impl Ui<'_> {
                             }
                         }
                     }
+                }
+                if let (Some(node), Some(name)) = (&node, self.app.resolve_request()) {
+                    let node = node.clone();
+                    let from = signer.address();
+                    tasks.spawn(async move {
+                        let resolved = transfer::resolve(&node, resolver, from, &name).await;
+                        Done::Resolved(name, resolved)
+                    });
                 }
                 if let (Some(node), Some(quote)) = (&node, self.app.estimate_request()) {
                     let node = node.clone();
@@ -623,7 +635,8 @@ fn refresh_balances<P: Peers>(
     });
 }
 
-/// The ETH balance and every registry token held with a nonzero balance.
+/// The ETH balance, every registry token held with a nonzero balance, and the primary name
+/// if it prints as itself.
 fn balances(holding: &Holding, registry: &[Token]) -> Balances {
     Balances {
         eth: holding.balance,
@@ -639,6 +652,7 @@ fn balances(holding: &Holding, registry: &[Token]) -> Balances {
                     .map(|amount| (*token, amount))
             })
             .collect(),
+        name: holding.name.clone().filter(|name| printable(name)),
     }
 }
 

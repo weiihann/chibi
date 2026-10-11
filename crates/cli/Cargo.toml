@@ -22,6 +22,7 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
+alloy-ens.workspace = true
 alloy-signer = "2.5"
 alloy-signer-local = { version = "2.5", features = ["keystore", "mnemonic"] }
 eth-keystore = "0.5"

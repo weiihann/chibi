@@ -1,4 +1,5 @@
-//! Unlocking the keystore, and building, signing and submitting a transfer from it.
+//! Unlocking the keystore, resolving a recipient's name, and building, signing and
+//! submitting a transfer from it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,16 +9,29 @@ use alloy_eips::eip2718::Encodable2718 as _;
 use alloy_primitives::{Address, Bytes, TxHash, TxKind, U256};
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::{LocalSignerError, PrivateKeySigner};
-use alloy_sol_types::SolCall as _;
-use chibi_core::exec::{CallRequest, EstimateError};
+use alloy_sol_types::{SolCall as _, SolError as _, SolValue as _};
+use chibi_core::exec::{CallRequest, EstimateError, ExecutionResult, HaltReason};
 use chibi_core::wire;
 use chibi_node::{BlockSel, Node, NodeError, Peers, Token};
 
-use super::app::{Tracked, show};
+use super::app::{EnsName, Tracked, show};
 
 alloy_sol_types::sol! {
     function transfer(address to, uint256 amount) returns (bool);
+
+    /// ENS UniversalResolver: runs `data` on `name`'s resolver, which `name` is DNS-encoded
+    /// for. Reverts with `OffchainLookup` for names served through CCIP-read.
+    function resolve(bytes name, bytes data) external view returns (bytes, address);
+
+    /// A resolver's Ethereum address for the name whose namehash is `node`.
+    function addr(bytes32 node) external view returns (address);
+
+    /// The UniversalResolver finds no resolver for `name`.
+    error ResolverNotFound(bytes name);
 }
+
+/// The selector of ERC-3668's `OffchainLookup`, which asks the caller to follow CCIP-read.
+const OFFCHAIN_LOOKUP: [u8; 4] = [0x55, 0x6f, 0x18, 0x30];
 
 /// What a transfer moves: ether or a registry token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +363,78 @@ pub fn track<P: Peers>(node: &Node<P>, hash: TxHash) -> Option<Tracked> {
     })
 }
 
+/// The UniversalResolver at `resolver` asked by `from` for `name`'s Ethereum address:
+/// `resolve(dns(name), addr(namehash(name)))`.
+pub fn resolve_request(
+    resolver: Address,
+    from: Address,
+    name: &EnsName,
+) -> Result<CallRequest, String> {
+    let dns = alloy_ens::try_dns_encode(name.as_str())
+        .map_err(|err| format!("could not resolve {name}: {err}"))?;
+    let data = addrCall {
+        node: alloy_ens::namehash(name.as_str()),
+    };
+    let call = resolveCall {
+        name: dns.into(),
+        data: data.abi_encode().into(),
+    };
+    Ok(CallRequest {
+        from: Some(from),
+        to: TxKind::Call(resolver),
+        input: call.abi_encode().into(),
+        ..CallRequest::default()
+    })
+}
+
+/// What the UniversalResolver's answer to [`resolve_request`] means for `name`: its
+/// address, or why chibi has none to send to.
+pub fn resolution(
+    name: &EnsName,
+    result: Result<ExecutionResult<HaltReason>, NodeError>,
+) -> Result<Address, String> {
+    let output = match result {
+        Ok(ExecutionResult::Success { output, .. }) => output.into_data(),
+        Ok(ExecutionResult::Revert { output, .. }) => {
+            return Err(if output.starts_with(&OFFCHAIN_LOOKUP) {
+                format!("{name} is served offchain, which chibi does not follow")
+            } else if output.starts_with(&ResolverNotFound::SELECTOR) {
+                format!("{name} is not registered")
+            } else {
+                format!("could not resolve {name}: {}", revert_reason(&output))
+            });
+        }
+        Ok(ExecutionResult::Halt { reason, .. }) => {
+            return Err(format!(
+                "could not resolve {name}: the call halted: {reason:?}"
+            ));
+        }
+        Err(err) => return Err(format!("could not resolve {name}: {err}")),
+    };
+    let malformed = || format!("could not resolve {name}: the resolver answered {output}");
+    let (answer, _) = <(Bytes, Address)>::abi_decode_params(&output).map_err(|_| malformed())?;
+    if answer.is_empty() {
+        return Err(format!("{name} has no address"));
+    }
+    match Address::abi_decode(&answer) {
+        Ok(Address::ZERO) => Err(format!("{name} has no address")),
+        Ok(address) => Ok(address),
+        Err(_) => Err(malformed()),
+    }
+}
+
+/// Resolves `name` through the UniversalResolver at `resolver`, asked by `from`, over state
+/// the node proves at the head. Never follows CCIP-read.
+pub async fn resolve<P: Peers>(
+    node: &Node<P>,
+    resolver: Address,
+    from: Address,
+    name: &EnsName,
+) -> Result<Address, String> {
+    let request = resolve_request(resolver, from, name)?;
+    resolution(name, node.call(request, BlockSel::Latest).await)
+}
+
 /// The revert reason the output carries, as shown to the user.
 fn revert_reason(output: &[u8]) -> String {
     if output.is_empty() {
@@ -361,7 +447,7 @@ fn revert_reason(output: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, b256, bytes, hex};
-    use chibi_core::exec::{HaltReason, Output};
+    use chibi_core::exec::Output;
     use chibi_core::testing::{
         WorldAccount, eth, mapping_slot, pausable_token_code, transfer_calldata,
     };
@@ -459,7 +545,7 @@ mod tests {
                 output: Bytes::from(hex::decode(output).unwrap()),
             })
         };
-        let cases: [(Result<ExecutionResult<HaltReason>, NodeError>, Result<Address, &str>); 9] = [
+        let cases = [
             (success(RESOLVED), Ok(WEIHAN)),
             (
                 success(concat!(
@@ -505,7 +591,7 @@ mod tests {
                     "0000000000000000000000000000000000000000000000000000000000000004",
                     "6e6f706500000000000000000000000000000000000000000000000000000000",
                 )),
-                Err("could not resolve weihan.eth: nope"),
+                Err("could not resolve weihan.eth: revert: nope"),
             ),
             (
                 revert(""),
