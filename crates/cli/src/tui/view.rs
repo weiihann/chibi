@@ -2331,6 +2331,49 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_address_taller_than_the_body_shows_its_first_rows() {
+        let address = |name: &'static str| Row::Form {
+            label: Span::raw(name),
+            values: (0..9).map(|i| Span::raw(format!("{i} TOKEN"))).collect(),
+        };
+        let hint = || vec![Row::Text(Line::raw("hint"))];
+        let text = |list: WatchList, height: u16| {
+            list.rows(height)
+                .into_iter()
+                .take(usize::from(height))
+                .map(|row| match row {
+                    Row::Text(line) => line.to_string().trim_end().to_owned(),
+                    Row::Form { .. } => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let one = WatchList::new(vec![address("0xA")], 0, hint(), 10);
+        assert_eq!(text(one, 3), ["0xA", "   0 TOKEN", "   1 TOKEN"]);
+        let two = || WatchList::new(vec![address("0xA"), address("0xB")], 1, hint(), 10);
+        assert_eq!(text(two(), 3), ["0xB", "   0 TOKEN", "   1 TOKEN"]);
+        let mut expected = vec!["  ↑ 1 more".to_owned(), "0xB".to_owned()];
+        expected.extend((0..9).map(|i| format!("   {i} TOKEN")));
+        assert_eq!(text(two(), 11), expected);
+        assert!(text(two(), 0).is_empty());
+    }
+
+    #[test]
+    fn an_oversized_watched_address_shows_its_address_with_the_log_pane_open() {
+        let mut app = watching_only(&[WEIHAN]);
+        app.refreshed(vec![(
+            WEIHAN,
+            Balances {
+                eth: Some(U256::from(1)),
+                tokens: vec![(TKN, U256::from(1_500_000)); 200],
+                name: None,
+            },
+        )]);
+        app.logs = true;
+        let shown = inside(&app, &[], 80, 24);
+        assert!(shown.contains(&WEIHAN.to_checksum(None)), "{shown}");
+    }
+
+    #[test]
     fn a_watch_list_that_fits_shows_no_scroll_marks_or_key() {
         let twelve: Vec<Address> = (1..=12).map(Address::with_last_byte).collect();
         for app in [watching(), watching_only(&twelve)] {
