@@ -11,7 +11,7 @@ use alloy_signer_local::coins_bip39::{English, Mnemonic, MnemonicError, Wordlist
 use alloy_signer_local::{LocalSignerError, MnemonicBuilder, PrivateKeySigner};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, parse_address};
 
 /// The longest secret accepted at import, in bytes: its buffer's fixed capacity, room for
 /// 24 words of up to 8 letters.
@@ -268,6 +268,56 @@ fn record(
     keystore: &Path,
     fault: &dyn Fn(&Path) -> io::Result<()>,
 ) -> Result<(), SaveError> {
+    let created = Config {
+        keystore: Some(keystore.to_owned()),
+        ..Config::default()
+    };
+    edit_config(config, created, fault, |document| {
+        let value = keystore
+            .to_str()
+            .ok_or_else(|| format!("{} is not UTF-8", keystore.display()))?;
+        document["keystore"] = toml_edit::value(value);
+        Ok(())
+    })
+}
+
+/// Appends `address` to `addresses` in the config file at `config` unless it is listed,
+/// keeping everything else in it, or creates it with the defaults and `address`. The error is
+/// why it could not, without the config's path.
+pub fn record_address(config: &Path, address: Address) -> Result<(), String> {
+    let created = Config {
+        addresses: vec![address],
+        ..Config::default()
+    };
+    edit_config(config, created, &|_| Ok(()), |document| {
+        let addresses = document
+            .entry("addresses")
+            .or_insert_with(|| toml_edit::value(toml_edit::Array::new()))
+            .as_array_mut()
+            .ok_or_else(|| "`addresses` is not a list".to_owned())?;
+        let listed = addresses
+            .iter()
+            .any(|value| value.as_str().and_then(|text| parse_address(text).ok()) == Some(address));
+        if !listed {
+            addresses.push(address.to_checksum(None));
+        }
+        Ok(())
+    })
+    .map_err(|err| match err {
+        SaveError::Write { source, .. } => source.to_string(),
+        SaveError::Config { reason, .. } => reason,
+        SaveError::Derive(_) | SaveError::Encrypt(_) | SaveError::Save(_) => err.to_string(),
+    })
+}
+
+/// Applies `edit` to the config file at `config`, keeping everything else in it, or creates
+/// it as `created`, replacing it whole either way.
+fn edit_config(
+    config: &Path,
+    created: Config,
+    fault: &dyn Fn(&Path) -> io::Result<()>,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<(), SaveError> {
     let write_error = |source| SaveError::Write {
         path: config.to_owned(),
         source,
@@ -275,10 +325,6 @@ fn record(
     let text = match fs::read_to_string(config) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let created = Config {
-                keystore: Some(keystore.to_owned()),
-                ..Config::default()
-            };
             let text = toml::to_string(&created).map_err(ConfigError::from)?;
             return replace(config, &text, fault).map_err(write_error);
         }
@@ -288,13 +334,10 @@ fn record(
         path: config.to_owned(),
         reason,
     };
-    let value = keystore
-        .to_str()
-        .ok_or_else(|| invalid(format!("{} is not UTF-8", keystore.display())))?;
     let mut document: toml_edit::DocumentMut = text
         .parse()
         .map_err(|err: toml_edit::TomlError| invalid(err.to_string()))?;
-    document["keystore"] = toml_edit::value(value);
+    edit(&mut document).map_err(invalid)?;
     replace(config, &document.to_string(), fault).map_err(write_error)
 }
 
