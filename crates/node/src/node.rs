@@ -55,6 +55,9 @@ const SEED_IN_FLIGHT: usize = 8;
 /// so without it a seed that cannot complete would retry back to back.
 pub(crate) const SEED_RETRY: Duration = Duration::from_secs(2);
 
+/// Pause before anchoring tries again after a header fetch failed.
+const ANCHOR_RETRY: Duration = Duration::from_secs(2);
+
 /// Recent blocks sampled for the suggested tip, as reth's gas price oracle does.
 const FEE_BLOCKS: usize = 20;
 
@@ -572,6 +575,29 @@ async fn wait_latest(heads: &mut Heads) -> Result<chibi_core::TrustedHash, NodeE
     latest.ok_or(NodeError::NotReady)
 }
 
+/// The header of the light client's latest head, retried until a fetch succeeds or one fails
+/// in a way a later try cannot fix.
+async fn anchor_header<P: Peers>(
+    peers: &P,
+    heads: &mut Heads,
+) -> Result<VerifiedHeader, NodeError> {
+    loop {
+        let trusted = wait_latest(heads).await?;
+        match fetch::header(peers, trusted).await {
+            Err(
+                err @ (NodeError::Net(
+                    NetError::Rejected | NetError::Timeout | NetError::NoPeer { .. },
+                )
+                | NodeError::Unprovable(_)),
+            ) => {
+                warn!(target: "chibi::node", %err, "anchoring failed; retrying");
+                tokio::time::sleep(ANCHOR_RETRY).await;
+            }
+            fetched => return fetched,
+        }
+    }
+}
+
 /// The block the start-up status counts forward from: the head the last run saved, if it is
 /// on `spec`'s network and newer than the network's clock block, else that clock block. The
 /// save came after the head's own timestamp, so counting from it cannot run ahead.
@@ -597,8 +623,7 @@ impl<P: Peers> Node<P> {
         watch: &Watchlist,
     ) -> Result<(Self, Follower<P>), NodeError> {
         let peers = Paced::new(peers);
-        let trusted = wait_latest(&mut heads).await?;
-        let anchor = fetch::header(&peers, trusted).await?;
+        let anchor = anchor_header(&peers, &mut heads).await?;
         let working = WorkingSet::new(WORKING_SET_CAP, watch.pins(), disk.load_keys()?);
         let keys_saved = KeysSaved {
             membership: working.membership(),
