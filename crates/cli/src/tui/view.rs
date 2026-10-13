@@ -166,14 +166,17 @@ impl WatchList {
         }
     }
 
-    /// The end of the addresses shown in a body `height` rows tall: from the first, those
-    /// that fit between the top row and `after`, less a row for `↓ N more` when some below
-    /// do not.
-    fn end(&self, height: u16) -> usize {
+    /// What a body `height` rows tall shows: the end of the addresses shown, then whether
+    /// it shows `↓ N more`, the top row and `after`. Normally the addresses that fit between
+    /// the top row and `after`, less a row for `↓ N more` when some below do not. When the
+    /// first shown does not fit so, it is shown anyway, clipped at the bottom, and the rest
+    /// fill what room is left: addresses that fit whole, `↓ N more`, the top row, `after`.
+    fn shown(&self, height: u16) -> (usize, bool, bool, bool) {
+        let len = self.addresses.len();
         let room = usize::from(height).saturating_sub(1 + self.after_rows);
         let rest = &self.addresses[self.first..];
         if rest.iter().map(|(_, rows)| rows).sum::<usize>() <= room {
-            return self.addresses.len();
+            return (len, false, true, true);
         }
         let room = room.saturating_sub(1);
         let mut used = 0;
@@ -185,35 +188,55 @@ impl WatchList {
             used += rows;
             end += 1;
         }
-        end
+        if end > self.first {
+            return (end, end < len, true, true);
+        }
+        let mut room = usize::from(height);
+        for (_, rows) in rest {
+            if end > self.first && *rows > room {
+                break;
+            }
+            room = room.saturating_sub(*rows);
+            end += 1;
+        }
+        let down = end < len && room > 0;
+        room -= usize::from(down);
+        let top = room > 0;
+        room -= usize::from(top);
+        (end, down, top, self.after_rows <= room)
     }
 
     /// Whether a body `height` rows tall hides some address.
     fn scrolls(&self, height: u16) -> bool {
-        self.first > 0 || self.end(height) < self.addresses.len()
+        self.first > 0 || self.shown(height).0 < self.addresses.len()
     }
 
     /// The page rows for a body `height` rows tall: a dim `↑ N more` (else a blank row), the
     /// addresses shown, a dim `↓ N more` when some below are hidden, then `after`.
     fn rows(mut self, height: u16) -> Vec<Row> {
         let dim = Style::default().add_modifier(Modifier::DIM);
-        let (first, end, len) = (self.first, self.end(height), self.addresses.len());
-        let top = if first > 0 {
-            Line::styled(format!("  ↑ {first} more"), dim)
-        } else {
-            Line::default()
-        };
-        let mut rows = vec![Row::Text(top)];
+        let (first, len) = (self.first, self.addresses.len());
+        let (end, down, top, after) = self.shown(height);
+        let mut rows = Vec::new();
+        if top {
+            rows.push(Row::Text(if first > 0 {
+                Line::styled(format!("  ↑ {first} more"), dim)
+            } else {
+                Line::default()
+            }));
+        }
         for (lines, _) in self.addresses.drain(first..end) {
             rows.extend(lines.into_iter().map(Row::Text));
         }
-        if end < len {
+        if down {
             rows.push(Row::Text(Line::styled(
                 format!("  ↓ {} more", len - end),
                 dim,
             )));
         }
-        rows.extend(self.after.into_iter().map(Row::Text));
+        if after {
+            rows.extend(self.after.into_iter().map(Row::Text));
+        }
         rows
     }
 }
@@ -2348,12 +2371,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let one = WatchList::new(vec![address("0xA")], 0, hint(), 10);
-        assert_eq!(text(one, 3), ["0xA", "   0 TOKEN", "   1 TOKEN"]);
+        assert_eq!(text(one, 3), ["0xA0 TOKEN", "   1 TOKEN", "   2 TOKEN"]);
         let two = || WatchList::new(vec![address("0xA"), address("0xB")], 1, hint(), 10);
-        assert_eq!(text(two(), 3), ["0xB", "   0 TOKEN", "   1 TOKEN"]);
-        let mut expected = vec!["  ↑ 1 more".to_owned(), "0xB".to_owned()];
-        expected.extend((0..9).map(|i| format!("   {i} TOKEN")));
-        assert_eq!(text(two(), 11), expected);
+        assert_eq!(text(two(), 3), ["0xB0 TOKEN", "   1 TOKEN", "   2 TOKEN"]);
+        let mut expected = vec!["  ↑ 1 more".to_owned(), "0xB0 TOKEN".to_owned()];
+        expected.extend((1..9).map(|i| format!("   {i} TOKEN")));
+        assert_eq!(text(two(), 10), expected);
         assert!(text(two(), 0).is_empty());
     }
 
