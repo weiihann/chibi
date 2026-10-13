@@ -2662,24 +2662,30 @@ mod tests {
         app.tick(now + EXCITED_FOR);
         assert!(app.balances_request(100, 3));
         assert!(!app.balances_request(100, 3));
-        app.refreshed(Some(Balances::default()));
+        app.refreshed(vec![(SENDER, Balances::default())]);
         assert!(app.balances_request(100, 3));
-        app.refreshed(Some(Balances {
-            eth: Some(eth(3_000)),
-            tokens: Vec::new(),
-            name: None,
-        }));
+        app.refreshed(vec![(
+            SENDER,
+            Balances {
+                eth: Some(eth(3_000)),
+                tokens: Vec::new(),
+                name: None,
+            },
+        )]);
         assert!(!app.balances_request(100, 3));
         assert!(app.balances_request(100, 5));
-        app.refreshed(Some(Balances {
-            eth: Some(eth(3_000)),
-            tokens: vec![(TKN, U256::from(1_500_000))],
-            name: None,
-        }));
+        app.refreshed(vec![(
+            SENDER,
+            Balances {
+                eth: Some(eth(3_000)),
+                tokens: vec![(TKN, U256::from(1_500_000))],
+                name: None,
+            },
+        )]);
         assert_eq!(app.assets(), [Asset::Eth, Asset::Token(TKN)]);
         assert!(!app.balances_request(100, 5));
         assert!(app.balances_request(101, 5));
-        app.refreshed(None);
+        app.refreshed(Vec::new());
         assert_eq!(app.balance(Asset::Token(TKN)), Some(U256::from(1_500_000)));
         assert!(!app.balances_request(101, 5));
     }
@@ -2782,9 +2788,11 @@ mod tests {
         press(&mut app, KeyCode::Down);
         assert_eq!(app.setup.choice, Choice::Existing);
         press(&mut app, KeyCode::Down);
+        assert_eq!(app.setup.choice, Choice::Watch);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.setup.choice, Choice::Create);
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.setup.choice, Choice::Existing);
+        assert_eq!(app.setup.choice, Choice::Watch);
         assert_eq!(press(&mut app, KeyCode::Char('q')), None);
         assert_eq!(app.screen, Screen::Menu);
         assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::Quit));
@@ -3089,5 +3097,209 @@ mod tests {
         press(&mut app, KeyCode::Down);
         typed(&mut app, "long enough");
         assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::Save));
+    }
+
+    fn watching_setup(addresses: &[Address]) -> App {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.watch_list(addresses);
+        app.setup(None);
+        app
+    }
+
+    #[test]
+    fn the_menu_offers_watching_last_and_starts_on_it_only_when_something_is_watched() {
+        assert_eq!(
+            Choice::ALL,
+            [
+                Choice::Create,
+                Choice::Import,
+                Choice::Existing,
+                Choice::Watch
+            ]
+        );
+        assert_eq!(
+            Choice::Watch.label(),
+            "just watch balances, without a wallet"
+        );
+        assert_eq!(watching_setup(&[]).setup.choice, Choice::Create);
+        assert_eq!(watching_setup(&[WEIHAN]).setup.choice, Choice::Watch);
+    }
+
+    #[test]
+    fn choosing_to_watch_what_the_run_watches_starts_the_node_without_a_wallet() {
+        let mut app = watching_setup(&[WEIHAN, SENDER]);
+        assert_eq!(press(&mut app, KeyCode::Enter), Some(Action::Watch));
+        assert_eq!(app.screen, Screen::Waiting);
+        assert_eq!(app.sender, None);
+        assert_eq!(
+            app.watched,
+            [(WEIHAN, Balances::default()), (SENDER, Balances::default())]
+        );
+    }
+
+    #[test]
+    fn choosing_to_watch_nothing_asks_for_an_address_and_says_what_it_expected() {
+        let mut app = watching_setup(&[]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.setup.choice, Choice::Watch);
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(app.screen, Screen::WatchAddress);
+        for (text, expected) in [
+            ("", "enter the address to watch"),
+            (
+                "weihan.eth",
+                "enter the address; names resolve only once the node runs",
+            ),
+            ("0x1234", "expected 0x followed by 40 hex digits"),
+            (
+                "0x3499Ddf9E66b53Ca484554d5309Bf32521AAE5a7",
+                "the checksum does not match; check the address, or type it all lowercase",
+            ),
+            (
+                "0x0000000000000000000000000000000000000000",
+                "refusing to watch the zero address",
+            ),
+        ] {
+            app.setup.address.clear();
+            typed(&mut app, text);
+            assert_eq!(press(&mut app, KeyCode::Enter), None, "{text}");
+            assert_eq!(app.setup.error.as_deref(), Some(expected), "{text}");
+            assert_eq!(app.screen, Screen::WatchAddress);
+            assert_eq!(app.setup.address, text);
+        }
+        app.setup.address.clear();
+        typed(&mut app, "0x3499ddf9e66b53ca484554d5309bf32521aae5a7");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Action::Record(WEIHAN))
+        );
+        assert_eq!(app.screen, Screen::Waiting);
+        assert_eq!(app.sender, None);
+        assert_eq!(app.watched, [(WEIHAN, Balances::default())]);
+        assert_eq!(app.setup.error, None);
+    }
+
+    #[test]
+    fn esc_on_the_address_prompt_returns_to_the_menu() {
+        let mut app = watching_setup(&[]);
+        app.setup.choice = Choice::Watch;
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "0x12");
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(app.screen, Screen::Menu);
+        assert_eq!(app.setup.choice, Choice::Watch);
+        assert_eq!(app.setup.address, "");
+        assert_eq!(press(&mut app, KeyCode::Esc), Some(Action::Quit));
+    }
+
+    #[test]
+    fn an_address_the_config_cannot_record_is_watched_for_this_run() {
+        let mut app = watching_setup(&[]);
+        app.setup.choice = Choice::Watch;
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "0x3499ddf9e66b53ca484554d5309bf32521aae5a7");
+        press(&mut app, KeyCode::Enter);
+        app.unrecorded_address(
+            WEIHAN,
+            Path::new("/etc/chibi/config.toml"),
+            "the file is read-only",
+        );
+        assert_eq!(app.screen, Screen::Waiting);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "watching 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 for this run; could not add it to /etc/chibi/config.toml: the file is read-only. pass --address 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 next time"
+            )
+        );
+    }
+
+    #[test]
+    fn tab_on_unlock_wipes_the_password_and_watches_instead() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        app.watch_list(&[WEIHAN]);
+        typed(&mut app, "half a password");
+        assert_eq!(press(&mut app, KeyCode::Tab), Some(Action::Watch));
+        assert!(app.password.is_empty());
+        assert_eq!(app.screen, Screen::Waiting);
+        assert_eq!(app.sender, None);
+
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        typed(&mut app, "half a password");
+        assert_eq!(press(&mut app, KeyCode::Tab), None);
+        assert!(app.password.is_empty());
+        assert_eq!(app.screen, Screen::WatchAddress);
+        assert_eq!(press(&mut app, KeyCode::Esc), None);
+        assert_eq!(app.screen, Screen::Unlock);
+    }
+
+    /// Watching WEIHAN and SENDER, serving with a state peer.
+    fn watching() -> App {
+        let mut app = watching_setup(&[WEIHAN, SENDER]);
+        press(&mut app, KeyCode::Enter);
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        app.tick(now + EXCITED_FOR);
+        app.health(100, 1);
+        app
+    }
+
+    #[test]
+    fn serving_while_watching_shows_the_watched_balances_and_q_quits() {
+        let mut app = watching();
+        assert_eq!(app.screen, Screen::Watching);
+        app.health(101, 0);
+        assert_eq!(app.screen, Screen::Paused);
+        app.health(102, 1);
+        assert_eq!(app.screen, Screen::Watching);
+        assert_eq!(press(&mut app, KeyCode::Char('l')), None);
+        assert!(app.logs);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn watching_never_asks_for_an_estimate_a_resolution_or_a_send() {
+        let mut app = watching();
+        for code in [
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(press(&mut app, code), None);
+        }
+        app.form.amount = "1".to_owned();
+        app.form.to = "weihan.eth".to_owned();
+        assert_eq!(app.resolve_request(), None);
+        app.form.to = BOB.to_owned();
+        assert_eq!(app.estimate_request(), None);
+        assert_eq!(app.screen, Screen::Watching);
+    }
+
+    #[test]
+    fn every_watched_address_refreshes_until_its_eth_is_proven() {
+        let mut app = watching();
+        let held = |eth: Option<U256>| Balances {
+            eth,
+            tokens: Vec::new(),
+            name: None,
+        };
+        assert!(app.balances_request(100, 3));
+        app.refreshed(vec![(SENDER, held(Some(eth(1_000))))]);
+        assert_eq!(app.watched, [(WEIHAN, held(None)), (SENDER, held(Some(eth(1_000))))]);
+        assert!(app.balances_request(100, 3));
+        app.refreshed(vec![
+            (SENDER, held(Some(eth(1_000)))),
+            (WEIHAN, held(Some(eth(2_000)))),
+        ]);
+        assert_eq!(
+            app.watched,
+            [
+                (WEIHAN, held(Some(eth(2_000)))),
+                (SENDER, held(Some(eth(1_000))))
+            ]
+        );
+        assert!(!app.balances_request(100, 3));
+        assert!(app.balances_request(101, 3));
     }
 }

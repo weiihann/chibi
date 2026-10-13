@@ -1002,6 +1002,7 @@ mod tests {
 
     use alloy_primitives::{Address, address};
     use chibi_node::{Network, Startup, Token};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer, Cell};
@@ -1854,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_offers_three_ways_to_get_a_wallet() {
+    fn setup_offers_three_ways_to_get_a_wallet_or_just_watching() {
         let mut app = setting_up();
         let shown = screen(&app, &[]);
         for expected in [
@@ -1862,6 +1863,7 @@ mod tests {
             "> create a new wallet",
             "  import a private key or recovery phrase",
             "  use an existing keystore file",
+            "  just watch balances, without a wallet",
             "up/down choose · Enter select · Esc quit",
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");
@@ -2012,5 +2014,98 @@ mod tests {
         assert_eq!(rows[0], tall[0], "{shown}");
         assert_eq!(squeezed(&rows[1..3].concat()), squeezed(notice), "{shown}");
         assert_eq!(rows[3], tall[26], "{shown}");
+    }
+
+    /// Watching WEIHAN, named and holding 3 ETH and 1.5 TKN, and SENDER holding 0.25 ETH.
+    fn watching() -> App {
+        let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
+        app.watch_list(&[WEIHAN, SENDER]);
+        app.setup(None);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        app.tick(now + EXCITED_FOR);
+        app.health(100, 1);
+        app.refreshed(vec![
+            (
+                WEIHAN,
+                Balances {
+                    eth: Some(U256::from(3_000_000_000_000_000_000u64)),
+                    tokens: vec![(TKN, U256::from(1_500_000))],
+                    name: Some("weihan.eth".to_owned()),
+                },
+            ),
+            (
+                SENDER,
+                Balances {
+                    eth: Some(U256::from(250_000_000_000_000_000u64)),
+                    tokens: Vec::new(),
+                    name: None,
+                },
+            ),
+        ]);
+        app
+    }
+
+    #[test]
+    fn watching_lists_each_address_with_its_name_and_balances() {
+        const HINT: &str = "more tokens appear once their balances are proven";
+        let mut app = watching();
+        assert_eq!(app.screen, Screen::Watching);
+        assert_eq!(header_line(&app).to_string(), "chibi · sepolia · watching");
+        let shown = inside(&app, &[], 120, 40);
+        let weihan = shown
+            .find("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7   weihan.eth   3.00 ETH   1.50 TKN")
+            .expect(&shown);
+        let sender = shown
+            .find("0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025   0.25 ETH")
+            .expect(&shown);
+        assert!(weihan < sender, "{shown}");
+        assert!(shown.contains(HINT), "{shown}");
+        assert!(shown.contains("l logs · q quit"), "{shown}");
+        for absent in ["from", "amount", "fee", "Enter review"] {
+            assert!(!shown.contains(absent), "{absent}\n{shown}");
+        }
+        app.pinned(6, 6, true);
+        assert!(!inside(&app, &[], 120, 40).contains(HINT));
+    }
+
+    #[test]
+    fn watching_clips_on_tiny_terminals_without_panicking() {
+        let mut app = watching();
+        app.pixel_cats = true;
+        app.width = 120;
+        let logs: Vec<String> = (0..30).map(|i| format!("log line {i}")).collect();
+        for logs_open in [false, true] {
+            app.logs = logs_open;
+            for (width, height) in [(1, 1), (10, 3), (30, 5), (43, 13), (44, 14), (70, 16)] {
+                let shown = sized(&app, &logs, width, height);
+                assert_eq!(shown.lines().count(), usize::from(height));
+            }
+        }
+    }
+
+    #[test]
+    fn the_address_prompt_and_unlock_name_their_keys() {
+        let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
+        assert!(
+            screen(&app, &[]).contains("Enter unlock · Tab watch only · Esc quit"),
+            "{}",
+            screen(&app, &[])
+        );
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for c in "0x12".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let shown = screen(&app, &[]);
+        for expected in [
+            "the address to watch",
+            "address  0x12",
+            "expected 0x followed by 40 hex digits",
+            "Enter watch · Esc back",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
     }
 }
