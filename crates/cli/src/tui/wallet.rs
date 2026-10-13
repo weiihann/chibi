@@ -618,10 +618,10 @@ mod tests {
     const BOB: &str = "0x0000000000000000000000000000000000000b0b";
 
     #[test]
-    fn a_watched_address_creates_the_config_with_the_defaults() {
+    fn a_watched_address_creates_the_config_and_its_directory_with_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("chibi").join("config.toml");
-        fs::create_dir(dir.path().join("chibi")).unwrap();
+        let chibi = dir.path().join(".config").join("chibi");
+        let config = chibi.join("config.toml");
         record_address(&config, WEIHAN).unwrap();
         assert_eq!(
             Config::load(&config).unwrap(),
@@ -629,6 +629,10 @@ mod tests {
                 addresses: vec![WEIHAN],
                 ..Config::default()
             })
+        );
+        assert_eq!(
+            fs::metadata(&chibi).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 
