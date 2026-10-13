@@ -3344,7 +3344,7 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some(
-                "watching 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 for this run; could not add it to /etc/chibi/config.toml: the file is read-only. pass --address 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 next time"
+                "watching 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 for this run; could not add it to /etc/chibi/config.toml: the file is read-only. add \"0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7\" to addresses in that file to keep watching it"
             )
         );
     }
