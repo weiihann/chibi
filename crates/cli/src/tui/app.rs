@@ -698,7 +698,7 @@ impl App {
     pub fn unrecorded_address(&mut self, address: Address, config: &Path, reason: &str) {
         let address = address.to_checksum(None);
         self.notice = Some(format!(
-            "watching {address} for this run; could not add it to {}: {reason}. pass --address {address} next time",
+            "watching {address} for this run; could not add it to {}: {reason}. add \"{address}\" to addresses in that file to keep watching it",
             config.display()
         ));
     }
