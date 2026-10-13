@@ -570,4 +570,87 @@ mod tests {
             0o400
         );
     }
+
+    const WEIHAN: Address = address!("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7");
+    const BOB: &str = "0x0000000000000000000000000000000000000b0b";
+
+    #[test]
+    fn a_watched_address_creates_the_config_with_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("chibi").join("config.toml");
+        fs::create_dir(dir.path().join("chibi")).unwrap();
+        record_address(&config, WEIHAN).unwrap();
+        assert_eq!(
+            Config::load(&config).unwrap(),
+            Some(Config {
+                addresses: vec![WEIHAN],
+                ..Config::default()
+            })
+        );
+    }
+
+    #[test]
+    fn a_watched_address_keeps_every_other_config_key_and_the_keystore() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let text = "# my chibi\n\
+                    network = \"mainnet\"\n\
+                    rpc_port = 8645\n\
+                    keystore = \"/keys/chibi.json\"\n";
+        fs::write(&config, text).unwrap();
+        fs::set_permissions(&config, Permissions::from_mode(0o640)).unwrap();
+        let before = Config::load(&config).unwrap().unwrap();
+        record_address(&config, WEIHAN).unwrap();
+        let written = fs::read_to_string(&config).unwrap();
+        assert!(written.starts_with(text), "{written}");
+        assert!(
+            written.contains("addresses = [\"0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7\"]"),
+            "{written}"
+        );
+        assert_eq!(
+            Config::load(&config).unwrap(),
+            Some(Config {
+                addresses: vec![WEIHAN],
+                ..before
+            })
+        );
+        assert_eq!(mode(&config), 0o640);
+        assert_eq!(entries(dir.path()), vec![config]);
+    }
+
+    #[test]
+    fn a_watched_address_is_appended_once_to_the_listed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, format!("addresses = [\"{BOB}\"]\n")).unwrap();
+        record_address(&config, WEIHAN).unwrap();
+        let once = fs::read_to_string(&config).unwrap();
+        record_address(&config, WEIHAN).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), once);
+        assert_eq!(
+            Config::load(&config).unwrap().unwrap().addresses,
+            vec![address_of_text(BOB), WEIHAN]
+        );
+    }
+
+    #[test]
+    fn a_read_only_config_refuses_the_address_and_is_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let text = "network = \"mainnet\"\n";
+        fs::write(&config, text).unwrap();
+        fs::set_permissions(&config, Permissions::from_mode(0o400)).unwrap();
+        let reason = record_address(&config, WEIHAN).unwrap_err();
+        assert!(
+            !reason.is_empty() && !reason.contains("config.toml"),
+            "{reason}"
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        assert_eq!(mode(&config), 0o400);
+        assert_eq!(entries(dir.path()), vec![config]);
+    }
+
+    fn address_of_text(text: &str) -> Address {
+        text.parse().unwrap()
+    }
 }
