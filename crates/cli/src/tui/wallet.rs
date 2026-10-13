@@ -326,6 +326,13 @@ fn edit_config(
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let text = toml::to_string(created).map_err(ConfigError::from)?;
+            if let Some(dir) = config.parent() {
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)
+                    .map_err(write_error)?;
+            }
             return replace(config, &text, fault).map_err(write_error);
         }
         Err(err) => return Err(write_error(err)),
