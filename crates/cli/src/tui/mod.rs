@@ -10,7 +10,7 @@ pub mod wallet;
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -237,7 +237,7 @@ fn release_raw() {
 
 /// What a background task finished.
 enum Done {
-    Balances(Option<Balances>),
+    Balances(Vec<(Address, Balances)>),
     Estimated(Box<(Quote, u64, Result<Quoted, String>)>),
     Resolved(RequestId, Result<Address, String>),
     Sent(Result<TxHash, String>),
@@ -248,24 +248,35 @@ enum Done {
 pub enum Wallet {
     /// The keystore `--keystore` or the config names.
     Keystore(PathBuf),
-    /// None is named: set one up, saving it beside the config file at this path.
-    Setup(PathBuf),
+    /// None is named: set one up, saving it beside the config file.
+    Setup,
 }
 
-/// Unlocks or sets up the wallet, then runs the node under the UI until the user quits, a
-/// signal arrives, or the node stops.
+/// How the run goes once the node starts: sending from a wallet, or only watching balances.
+enum Session {
+    /// Sends from this signer.
+    Wallet(Arc<PrivateKeySigner>),
+    /// Shows the watched addresses' balances; nothing is estimated, resolved or sent.
+    Watch,
+}
+
+/// Unlocks or sets up the wallet, or chooses to watch without one, then runs the node under
+/// the UI until the user quits, a signal arrives, or the node stops. `config` is the config
+/// file a new keystore or watched address is recorded in.
 pub fn run(
     runtime: &Runtime,
     mut node_config: NodeConfig,
     served: Served,
     wallet: Wallet,
+    config: &Path,
     logs: &LogBuffer,
     logs_open: bool,
 ) -> eyre::Result<()> {
     let spec = node_config.network.spec();
     let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
     app.pixel_cats = cat::supported(process_env);
-    if matches!(wallet, Wallet::Setup(_)) {
+    app.watch_list(&node_config.watch.addresses);
+    if wallet == Wallet::Setup {
         app.setup(process_env("HOME").map(PathBuf::from));
     }
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
@@ -285,12 +296,17 @@ pub fn run(
         logs,
     };
     let result = runtime.block_on(async {
-        let Some(signer) = ui.wallet(wallet).await? else {
+        let Some(session) = ui.session(wallet, config).await? else {
             return Ok(());
         };
-        let address = signer.address();
-        if !node_config.watch.addresses.contains(&address) {
-            node_config.watch.addresses.push(address);
+        let watched = match &session {
+            Session::Wallet(signer) => vec![signer.address()],
+            Session::Watch => ui.app.watched.iter().map(|(address, _)| *address).collect(),
+        };
+        for address in watched {
+            if !node_config.watch.addresses.contains(&address) {
+                node_config.watch.addresses.push(address);
+            }
         }
         let progress = watch::Sender::new(STARTING);
         let startup = progress.subscribe();
@@ -318,7 +334,7 @@ pub fn run(
             node,
             quit,
         };
-        ui.drive(node_task, Arc::new(signer)).await
+        ui.drive(node_task, session).await
     });
     drop(ui);
     let rendered = renderer
@@ -384,12 +400,13 @@ impl Ui<'_> {
             .map_err(|_| eyre::eyre!("the terminal UI stopped drawing"))
     }
 
-    /// Unlocks the named keystore, or sets up a wallet, until a signer is ready. `None` when
-    /// the user quits first.
-    async fn wallet(&mut self, wallet: Wallet) -> eyre::Result<Option<PrivateKeySigner>> {
-        let (mut keystore, config) = match wallet {
-            Wallet::Keystore(path) => (Some(path), None),
-            Wallet::Setup(config) => (None, Some(config)),
+    /// Unlocks the named keystore, or sets up a wallet, until a signer is ready, or watches
+    /// without one. A new keystore or watched address is recorded in the config file at
+    /// `config`. `None` when the user quits first.
+    async fn session(&mut self, wallet: Wallet, config: &Path) -> eyre::Result<Option<Session>> {
+        let mut keystore = match wallet {
+            Wallet::Keystore(path) => Some(path),
+            Wallet::Setup => None,
         };
         let shutdown = run::shutdown_signal();
         tokio::pin!(shutdown);
@@ -424,7 +441,7 @@ impl Ui<'_> {
                     match unlocked {
                         Ok(signer) => {
                             self.app.unlocked(Ok(signer.address()));
-                            return Ok(Some(signer));
+                            return Ok(Some(Session::Wallet(Arc::new(signer))));
                         }
                         Err(UnlockError::WrongPassword) => {
                             self.app
@@ -435,13 +452,12 @@ impl Ui<'_> {
                 }
                 Some(Action::Open(path)) => keystore = Some(path),
                 Some(Action::Save) => {
-                    let (Some(secret), Some(config)) = (self.app.take_secret(), config.clone())
-                    else {
+                    let Some(secret) = self.app.take_secret() else {
                         eyre::bail!("the TUI asked to save with no wallet to save");
                     };
                     self.draw()?;
                     let password = self.app.take_password();
-                    let target = config.clone();
+                    let target = config.to_owned();
                     let (saved, password) = tokio::task::spawn_blocking(move || {
                         (wallet::save(&secret, &password, &target), password)
                     })
@@ -450,12 +466,12 @@ impl Ui<'_> {
                     match saved {
                         Ok(Saved::Written(signer, path)) => {
                             self.app.saved(signer.address(), &path);
-                            return Ok(Some(signer));
+                            return Ok(Some(Session::Wallet(Arc::new(signer))));
                         }
                         Ok(Saved::Unrecorded(signer, path, reason)) => {
                             self.app
-                                .unrecorded(signer.address(), &path, &config, &reason);
-                            return Ok(Some(signer));
+                                .unrecorded(signer.address(), &path, config, &reason);
+                            return Ok(Some(Session::Wallet(Arc::new(signer))));
                         }
                         Ok(Saved::Exists(address, path)) => {
                             self.app.kept(address, &path);
@@ -463,6 +479,18 @@ impl Ui<'_> {
                         }
                         Err(err) => self.app.save_failed(&err.to_string()),
                     }
+                }
+                Some(Action::Watch) => return Ok(Some(Session::Watch)),
+                Some(Action::Record(address)) => {
+                    let target = config.to_owned();
+                    let recorded = tokio::task::spawn_blocking(move || {
+                        wallet::record_address(&target, address)
+                    })
+                    .await?;
+                    if let Err(reason) = recorded {
+                        self.app.unrecorded_address(address, config, &reason);
+                    }
+                    return Ok(Some(Session::Watch));
                 }
                 Some(Action::Quit) => return Ok(None),
                 Some(Action::Send(..)) | None => {}
@@ -477,7 +505,7 @@ impl Ui<'_> {
     async fn drive<P: Peers>(
         &mut self,
         node_task: NodeTask<P>,
-        signer: Arc<PrivateKeySigner>,
+        session: Session,
     ) -> eyre::Result<()> {
         let NodeTask {
             task: mut serving,
@@ -530,8 +558,8 @@ impl Ui<'_> {
                                 }
                             }
                             Some(Action::Send(draft, fee)) => {
-                                if let Some(node) = node.clone() {
-                                    let signer = Arc::clone(&signer);
+                                if let (Some(node), Session::Wallet(signer)) = (node.clone(), &session) {
+                                    let signer = Arc::clone(signer);
                                     tasks.spawn(async move {
                                         let sent = transfer::send(&node, &signer, &draft, &fee)
                                             .await
@@ -540,7 +568,14 @@ impl Ui<'_> {
                                     });
                                 }
                             }
-                            Some(Action::Unlock | Action::Save | Action::Open(_)) | None => {}
+                            Some(
+                                Action::Unlock
+                                | Action::Save
+                                | Action::Open(_)
+                                | Action::Watch
+                                | Action::Record(_),
+                            )
+                            | None => {}
                         }
                     }
                     Some(finished) = tasks.join_next() => match finished {
@@ -566,7 +601,7 @@ impl Ui<'_> {
                                 health.seeded,
                             );
                             if self.app.balances_request(health.head.number, health.pinned.held) {
-                                refresh_balances(node, &signer, self.app.registry, &mut tasks);
+                                refresh_balances(node, self.app.registry, &mut tasks);
                             }
                             if let Some(hash) = self.app.tracking()
                                 && let Some(tracked) = transfer::track(node, hash)
@@ -576,6 +611,9 @@ impl Ui<'_> {
                         }
                     }
                 }
+                let Session::Wallet(signer) = &session else {
+                    continue;
+                };
                 if let (Some(node), Some((name, id))) = (&node, self.app.resolve_request()) {
                     let node = node.clone();
                     let from = signer.address();
@@ -615,22 +653,21 @@ impl Ui<'_> {
     }
 }
 
-/// Computes the display snapshot off the event loop and answers the sender's balances.
+/// Computes the display snapshot off the event loop and answers the balances of every
+/// address it holds.
 fn refresh_balances<P: Peers>(
     node: &Node<P>,
-    signer: &PrivateKeySigner,
     registry: &'static [Token],
     tasks: &mut JoinSet<Done>,
 ) {
     let node = node.clone();
-    let address = signer.address();
     tasks.spawn_blocking(move || {
         let snapshot = node.status().snapshot;
         let balances = snapshot
             .holdings
             .iter()
-            .find(|h| h.address == address)
-            .map(|holding| balances(holding, registry));
+            .map(|holding| (holding.address, balances(holding, registry)))
+            .collect();
         Done::Balances(balances)
     });
 }
@@ -759,7 +796,10 @@ mod tests {
         };
         let unlocked = tokio::time::timeout(
             Duration::from_secs(5),
-            ui.wallet(Wallet::Keystore(PathBuf::from("/nonexistent"))),
+            ui.session(
+                Wallet::Keystore(PathBuf::from("/nonexistent")),
+                Path::new("/nonexistent/config.toml"),
+            ),
         )
         .await
         .expect("the prompt ends without input");
@@ -863,7 +903,7 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(5),
-            ui.drive(node_task, Arc::new(signer)),
+            ui.drive(node_task, Session::Wallet(Arc::new(signer))),
         )
         .await
         .expect("the UI ends while the terminal blocks")

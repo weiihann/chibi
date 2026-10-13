@@ -272,7 +272,7 @@ fn record(
         keystore: Some(keystore.to_owned()),
         ..Config::default()
     };
-    edit_config(config, created, fault, |document| {
+    edit_config(config, &created, fault, |document| {
         let value = keystore
             .to_str()
             .ok_or_else(|| format!("{} is not UTF-8", keystore.display()))?;
@@ -289,7 +289,7 @@ pub fn record_address(config: &Path, address: Address) -> Result<(), String> {
         addresses: vec![address],
         ..Config::default()
     };
-    edit_config(config, created, &|_| Ok(()), |document| {
+    edit_config(config, &created, &|_| Ok(()), |document| {
         let addresses = document
             .entry("addresses")
             .or_insert_with(|| toml_edit::value(toml_edit::Array::new()))
@@ -314,7 +314,7 @@ pub fn record_address(config: &Path, address: Address) -> Result<(), String> {
 /// it as `created`, replacing it whole either way.
 fn edit_config(
     config: &Path,
-    created: Config,
+    created: &Config,
     fault: &dyn Fn(&Path) -> io::Result<()>,
     edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 ) -> Result<(), SaveError> {
@@ -325,7 +325,7 @@ fn edit_config(
     let text = match fs::read_to_string(config) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let text = toml::to_string(&created).map_err(ConfigError::from)?;
+            let text = toml::to_string(created).map_err(ConfigError::from)?;
             return replace(config, &text, fault).map_err(write_error);
         }
         Err(err) => return Err(write_error(err)),

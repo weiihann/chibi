@@ -126,14 +126,14 @@ pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
 }
 
 /// Where `--tui` gets its key: the keystore the flag or the config names, which must be
-/// readable, else a wallet set up in the UI and saved beside the config file at `path`.
-pub fn tui_wallet(config: &Config, path: &Path) -> eyre::Result<Wallet> {
+/// readable, else a wallet set up in the UI.
+pub fn tui_wallet(config: &Config) -> eyre::Result<Wallet> {
     match &config.keystore {
         Some(keystore) => {
             transfer::check_readable(keystore)?;
             Ok(Wallet::Keystore(keystore.clone()))
         }
-        None => Ok(Wallet::Setup(path.to_owned())),
+        None => Ok(Wallet::Setup),
     }
 }
 
@@ -161,7 +161,7 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
         return start_background(args, &config, &data_dir, config_flag);
     }
     let wallet = match &logs {
-        Some(_) => Some(tui_wallet(&config, path)?),
+        Some(_) => Some(tui_wallet(&config)?),
         None => None,
     };
     let rpc_config = config.rpc()?;
@@ -174,9 +174,15 @@ pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Res
     let node_config = config.node_config(data_dir);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = match (wallet, logs) {
-        (Some(wallet), Some(logs)) => {
-            tui::run(&runtime, node_config, served, wallet, &logs, args.logs)
-        }
+        (Some(wallet), Some(logs)) => tui::run(
+            &runtime,
+            node_config,
+            served,
+            wallet,
+            path,
+            &logs,
+            args.logs,
+        ),
         _ => runtime.block_on(async {
             let progress = watch::Sender::new(STARTING);
             tokio::spawn(greet_state_peer(progress.subscribe()));
@@ -712,25 +718,19 @@ mod tests {
         fs::write(&path, format!("keystore = {keystore:?}\n")).unwrap();
         let config = load(&path, true, &run_args(&["--tui"])).unwrap();
         assert_eq!(config.keystore, Some(keystore.clone()));
-        assert_eq!(
-            tui_wallet(&config, &path).unwrap(),
-            Wallet::Keystore(keystore)
-        );
+        assert_eq!(tui_wallet(&config).unwrap(), Wallet::Keystore(keystore));
 
         let args = run_args(&["--tui", "--logs", "--keystore", "b.json"]);
         assert!(args.tui && args.logs);
         let config = load(&path, true, &args).unwrap();
         let flagged = config.keystore.clone().unwrap();
         assert!(flagged.is_absolute() && flagged.ends_with("b.json"));
-        let error = tui_wallet(&config, &path).unwrap_err().to_string();
+        let error = tui_wallet(&config).unwrap_err().to_string();
         assert!(error.starts_with("cannot read the keystore"), "{error}");
 
         fs::write(&path, "").unwrap();
         let config = load(&path, true, &run_args(&["--tui"])).unwrap();
-        assert_eq!(
-            tui_wallet(&config, &path).unwrap(),
-            Wallet::Setup(path.clone())
-        );
+        assert_eq!(tui_wallet(&config).unwrap(), Wallet::Setup);
 
         fs::write(&path, "keystore = \"a.json\"\n").unwrap();
         let error = format!("{:#}", load(&path, true, &RunArgs::default()).unwrap_err());

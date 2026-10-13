@@ -65,6 +65,8 @@ pub enum Screen {
     Existing,
     /// The new keystore's password, typed twice.
     Password,
+    /// The address to watch, when the run watches none.
+    WatchAddress,
     /// The keystore password prompt, before the node starts.
     Unlock,
     /// Waiting for the first state peer.
@@ -73,6 +75,8 @@ pub enum Screen {
     Excited,
     /// The transfer form.
     Ready,
+    /// The watched addresses and their balances, without a wallet.
+    Watching,
     /// No state peer connected: nothing can be proven, so nothing is sent.
     Paused,
     /// The transfer as it will be signed.
@@ -92,6 +96,7 @@ impl Screen {
                 | Self::Import
                 | Self::Existing
                 | Self::Password
+                | Self::WatchAddress
         )
     }
 }
@@ -116,6 +121,10 @@ pub enum Action {
     Save,
     /// Unlock the keystore at this path from now on.
     Open(PathBuf),
+    /// Start the node watching the run's addresses, without a wallet.
+    Watch,
+    /// Add this address to the config's `addresses`, then watch as [`Action::Watch`].
+    Record(Address),
     /// Sign and submit this transfer.
     Send(Draft, Fee),
     /// Shut the node down and leave.
@@ -387,11 +396,13 @@ pub enum Choice {
     Import,
     /// A keystore file the user has.
     Existing,
+    /// No wallet: only the balances of watched addresses.
+    Watch,
 }
 
 impl Choice {
     /// The menu, top to bottom.
-    pub const ALL: [Self; 3] = [Self::Create, Self::Import, Self::Existing];
+    pub const ALL: [Self; 4] = [Self::Create, Self::Import, Self::Existing, Self::Watch];
 
     /// The menu line.
     pub const fn label(self) -> &'static str {
@@ -399,6 +410,7 @@ impl Choice {
             Self::Create => "create a new wallet",
             Self::Import => "import a private key or recovery phrase",
             Self::Existing => "use an existing keystore file",
+            Self::Watch => "just watch balances, without a wallet",
         }
     }
 }
@@ -431,6 +443,8 @@ pub struct Setup {
     pub input: Zeroizing<String>,
     /// The existing keystore's path as typed.
     pub path: String,
+    /// The address to watch as typed.
+    pub address: String,
     /// The new password typed again, in a buffer of [`PASSWORD_BYTES`].
     pub again: Zeroizing<String>,
     /// The password field taking the keys.
@@ -452,6 +466,7 @@ impl Setup {
             asking: 0,
             input: Zeroizing::new(String::with_capacity(SECRET_BYTES)),
             path: String::new(),
+            address: String::new(),
             again: Zeroizing::new(String::with_capacity(PASSWORD_BYTES)),
             entry: Entry::First,
             error: None,
@@ -467,6 +482,7 @@ impl Setup {
         self.input.zeroize();
         self.again.zeroize();
         self.path.clear();
+        self.address.clear();
         self.asking = 0;
         self.entry = Entry::First;
         self.error = None;
@@ -499,8 +515,11 @@ pub struct App {
     pub unlock_error: Option<String>,
     /// Peer counts while waiting for a state peer.
     pub waiting: WaitCounts,
-    /// The unlocked address.
+    /// The unlocked address; `None` while watching without a wallet.
     pub sender: Option<Address>,
+    /// The run's watched addresses in config order, with their balances at the latest
+    /// snapshot.
+    pub watched: Vec<(Address, Balances)>,
     /// The sender's balances.
     pub balances: Balances,
     /// Whether some pinned key is not held yet, so held tokens may be missing from the
@@ -529,6 +548,7 @@ pub struct App {
     /// The terminal's width in columns.
     pub width: u16,
     quit_armed: bool,
+    address_back: Screen,
     balances_asked: Option<(u64, usize)>,
     refreshing: bool,
     resolve_head: u64,
@@ -553,6 +573,7 @@ impl App {
             unlock_error: None,
             waiting: WaitCounts::default(),
             sender: None,
+            watched: Vec::new(),
             balances: Balances::default(),
             tokens_unproven: true,
             head: 0,
@@ -564,6 +585,7 @@ impl App {
             sending: None,
             notice: None,
             quit_armed: false,
+            address_back: Screen::Unlock,
             setup: Setup::new(),
             balances_asked: None,
             refreshing: false,
@@ -617,7 +639,7 @@ impl App {
             Screen::Waiting => Some(Pose::Dozing),
             Screen::Excited => Some(Pose::Excited),
             Screen::Paused => Some(Pose::Drowsy),
-            Screen::Ready if self.width >= SIDE_CAT_COLUMNS => Some(Pose::Idle),
+            Screen::Ready | Screen::Watching if self.width >= SIDE_CAT_COLUMNS => Some(Pose::Idle),
             Screen::Sending if succeeded => Some(Pose::Happy),
             Screen::Menu
             | Screen::Backup
@@ -625,8 +647,10 @@ impl App {
             | Screen::Import
             | Screen::Existing
             | Screen::Password
+            | Screen::WatchAddress
             | Screen::Unlock
             | Screen::Ready
+            | Screen::Watching
             | Screen::Review
             | Screen::Sending => None,
         }
@@ -646,11 +670,37 @@ impl App {
         }
     }
 
-    /// Opens the setup menu, for a run that names no keystore. `home` is what `~/` stands
-    /// for in a keystore path.
+    /// The run's watched addresses, in config order.
+    pub fn watch_list(&mut self, addresses: &[Address]) {
+        self.watched = addresses
+            .iter()
+            .map(|address| (*address, Balances::default()))
+            .collect();
+    }
+
+    /// Whether the session watches without a wallet: past setup and unlock with no sender.
+    pub const fn watch_only(&self) -> bool {
+        self.sender.is_none() && !self.screen.is_setup() && !matches!(self.screen, Screen::Unlock)
+    }
+
+    /// Opens the setup menu, for a run that names no keystore, on the watch choice when the
+    /// run watches an address. `home` is what `~/` stands for in a keystore path.
     pub fn setup(&mut self, home: Option<PathBuf>) {
         self.setup.home = home;
+        if !self.watched.is_empty() {
+            self.setup.choice = Choice::Watch;
+        }
         self.screen = Screen::Menu;
+    }
+
+    /// `address`, typed at the prompt, is watched for this run but could not be added to the
+    /// config file at `config`, for `reason`.
+    pub fn unrecorded_address(&mut self, address: Address, config: &Path, reason: &str) {
+        let address = address.to_checksum(None);
+        self.notice = Some(format!(
+            "watching {address} for this run; could not add it to {}: {reason}. pass --address {address} next time",
+            config.display()
+        ));
     }
 
     /// The wallet was encrypted to a new keystore at `path` and is unlocked as `address`.
@@ -766,7 +816,7 @@ impl App {
                 self.review = None;
                 self.screen = Screen::Paused;
             }
-            Screen::Ready | Screen::Paused => {
+            Screen::Ready | Screen::Watching | Screen::Paused => {
                 self.screen = self.form_screen();
                 if self.screen != Screen::Ready {
                     self.form.picker = None;
@@ -778,6 +828,7 @@ impl App {
             | Screen::Import
             | Screen::Existing
             | Screen::Password
+            | Screen::WatchAddress
             | Screen::Unlock
             | Screen::Waiting
             | Screen::Excited
@@ -786,12 +837,15 @@ impl App {
         }
     }
 
-    /// The form when a state peer is connected, else Paused.
+    /// The form, or the watched balances without a wallet, when a state peer is connected,
+    /// else Paused.
     const fn form_screen(&self) -> Screen {
         if self.state_peers == 0 {
             Screen::Paused
-        } else {
+        } else if self.sender.is_some() {
             Screen::Ready
+        } else {
+            Screen::Watching
         }
     }
 
@@ -806,11 +860,18 @@ impl App {
     }
 
     /// Whether to refresh the balances at `head` with `pinned_held` pinned keys held,
-    /// marking it asked: when either changed since the last refresh, or while ETH is
-    /// unproven. Never while a refresh is outstanding.
+    /// marking it asked: when either changed since the last refresh, or while some ETH
+    /// balance shown is unproven. Never while a refresh is outstanding.
     pub fn balances_request(&mut self, head: u64, pinned_held: usize) -> bool {
         let at = (head, pinned_held);
-        if self.refreshing || self.balances_asked == Some(at) && self.balances.eth.is_some() {
+        let proven = match self.sender {
+            Some(_) => self.balances.eth.is_some(),
+            None => self
+                .watched
+                .iter()
+                .all(|(_, balances)| balances.eth.is_some()),
+        };
+        if self.refreshing || self.balances_asked == Some(at) && proven {
             return false;
         }
         self.balances_asked = Some(at);
@@ -818,11 +879,17 @@ impl App {
         true
     }
 
-    /// A refresh finished, with the sender's balances if the snapshot holds them.
-    pub fn refreshed(&mut self, balances: Option<Balances>) {
+    /// A refresh finished, with the balances of every address the snapshot holds. An
+    /// address it does not hold keeps its last balances.
+    pub fn refreshed(&mut self, balances: Vec<(Address, Balances)>) {
         self.refreshing = false;
-        if let Some(balances) = balances {
-            self.balances(balances);
+        for (address, balances) in balances {
+            if self.sender == Some(address) {
+                self.balances(balances.clone());
+            }
+            if let Some((_, watched)) = self.watched.iter_mut().find(|(at, _)| *at == address) {
+                *watched = balances;
+            }
         }
     }
 
@@ -1027,9 +1094,10 @@ impl App {
     pub fn key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        let tab = key.code == KeyCode::Tab;
         let key = Key::of(key.code);
         if self.screen == Screen::Unlock {
-            return self.unlock_key(key, ctrl_c);
+            return self.unlock_key(key, ctrl_c, tab);
         }
         if self.screen.is_setup() {
             return self.setup_key(key, ctrl_c);
@@ -1065,9 +1133,11 @@ impl App {
             | Screen::Import
             | Screen::Existing
             | Screen::Password
+            | Screen::WatchAddress
             | Screen::Unlock
             | Screen::Waiting
             | Screen::Excited
+            | Screen::Watching
             | Screen::Paused => None,
         }
     }
@@ -1077,13 +1147,16 @@ impl App {
         self.screen == Screen::Ready && self.form.picker.is_none() && self.form.field == Field::To
     }
 
-    fn unlock_key(&mut self, key: Option<Key>, ctrl_c: bool) -> Option<Action> {
+    fn unlock_key(&mut self, key: Option<Key>, ctrl_c: bool, tab: bool) -> Option<Action> {
         if ctrl_c || key == Some(Key::Esc) {
             self.password.zeroize();
             return Some(Action::Quit);
         }
         if self.unlocking {
             return None;
+        }
+        if tab {
+            return self.watch();
         }
         match key? {
             Key::Char(c) if self.password.len() + c.len_utf8() <= PASSWORD_BYTES => {
@@ -1113,11 +1186,15 @@ impl App {
         if key == Key::Esc {
             self.setup.discard();
             self.password.zeroize();
-            self.screen = Screen::Menu;
+            self.screen = if self.screen == Screen::WatchAddress {
+                self.address_back
+            } else {
+                Screen::Menu
+            };
             return None;
         }
         match self.screen {
-            Screen::Menu => self.menu_key(key),
+            Screen::Menu => return self.menu_key(key),
             Screen::Backup if key == Key::Enter => {
                 self.setup.asked = wallet::positions();
                 self.setup.asking = 0;
@@ -1127,11 +1204,13 @@ impl App {
             Screen::Import => self.import_key(key),
             Screen::Existing => return self.existing_key(key),
             Screen::Password => return self.password_key(key),
+            Screen::WatchAddress => return self.watch_address_key(key),
             Screen::Backup
             | Screen::Unlock
             | Screen::Waiting
             | Screen::Excited
             | Screen::Ready
+            | Screen::Watching
             | Screen::Paused
             | Screen::Review
             | Screen::Sending => {}
@@ -1139,7 +1218,43 @@ impl App {
         None
     }
 
-    fn menu_key(&mut self, key: Key) {
+    /// Leaves for watching without a wallet, wiping what was typed: the node starts if the
+    /// run watches an address, else the prompt asks for one.
+    fn watch(&mut self) -> Option<Action> {
+        self.setup.discard();
+        self.password.zeroize();
+        self.unlock_error = None;
+        self.notice = None;
+        if self.watched.is_empty() {
+            self.address_back = self.screen;
+            self.screen = Screen::WatchAddress;
+            return None;
+        }
+        self.screen = Screen::Waiting;
+        Some(Action::Watch)
+    }
+
+    fn watch_address_key(&mut self, key: Key) -> Option<Action> {
+        match key {
+            Key::Char(c) => self.setup.address.push(c),
+            Key::Backspace => {
+                self.setup.address.pop();
+            }
+            Key::Enter => match parse_watched(&self.setup.address) {
+                Ok(address) => {
+                    self.setup.discard();
+                    self.watched.push((address, Balances::default()));
+                    self.screen = Screen::Waiting;
+                    return Some(Action::Record(address));
+                }
+                Err(reason) => self.setup.error = Some(reason),
+            },
+            Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+        }
+        None
+    }
+
+    fn menu_key(&mut self, key: Key) -> Option<Action> {
         let choices = Choice::ALL;
         let at = choices
             .iter()
@@ -1157,10 +1272,12 @@ impl App {
                     }
                     Choice::Import => Screen::Import,
                     Choice::Existing => Screen::Existing,
+                    Choice::Watch => return self.watch(),
                 };
             }
             Key::Char(_) | Key::Backspace | Key::Esc | Key::Left | Key::Right => {}
         }
+        None
     }
 
     fn confirm_key(&mut self, key: Key) {
@@ -1660,9 +1777,28 @@ fn parse_recipient(text: &str) -> Result<Recipient, String> {
     if !text.starts_with("0x") {
         return EnsName::parse(text).map(Recipient::Name);
     }
+    nonzero_address(text, "refusing to send to the zero address").map(Recipient::Address)
+}
+
+/// The address typed at the watch prompt, with the reason it cannot be watched. Names are
+/// refused: nothing resolves before the node starts.
+fn parse_watched(text: &str) -> Result<Address, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("enter the address to watch".to_owned());
+    }
+    if !text.starts_with("0x") && EnsName::parse(text).is_ok() {
+        return Err("enter the address; names resolve only once the node runs".to_owned());
+    }
+    nonzero_address(text, "refusing to watch the zero address")
+}
+
+/// `text` as a checksummed or all-lowercase address other than zero, which is refused with
+/// `zero`.
+fn nonzero_address(text: &str, zero: &str) -> Result<Address, String> {
     match parse_address(text) {
-        Ok(Address::ZERO) => Err("refusing to send to the zero address".to_owned()),
-        Ok(address) => Ok(Recipient::Address(address)),
+        Ok(Address::ZERO) => Err(zero.to_owned()),
+        Ok(address) => Ok(address),
         Err(AddressError::Malformed(_)) => Err("expected 0x followed by 40 hex digits".to_owned()),
         Err(AddressError::Checksum(_)) => Err(
             "the checksum does not match; check the address, or type it all lowercase".to_owned(),
@@ -3016,7 +3152,7 @@ mod tests {
         std::fs::write(&key, "{}").unwrap();
         let missing = dir.path().join("missing.json");
         let mut app = setting_up(Some(dir.path().to_owned()));
-        press(&mut app, KeyCode::Up);
+        app.setup.choice = Choice::Existing;
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.screen, Screen::Existing);
 
@@ -3286,7 +3422,10 @@ mod tests {
         };
         assert!(app.balances_request(100, 3));
         app.refreshed(vec![(SENDER, held(Some(eth(1_000))))]);
-        assert_eq!(app.watched, [(WEIHAN, held(None)), (SENDER, held(Some(eth(1_000))))]);
+        assert_eq!(
+            app.watched,
+            [(WEIHAN, held(None)), (SENDER, held(Some(eth(1_000))))]
+        );
         assert!(app.balances_request(100, 3));
         app.refreshed(vec![
             (SENDER, held(Some(eth(1_000)))),

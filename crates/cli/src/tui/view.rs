@@ -427,6 +427,9 @@ fn header_line(app: &App) -> Line<'static> {
         Span::styled("chibi", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(" · {}", app.network)),
     ];
+    if app.watch_only() {
+        spans.push(Span::raw(" · watching"));
+    }
     if let Some(name) = &app.balances.name {
         spans.push(Span::raw(format!(" · {name}")));
     }
@@ -468,6 +471,7 @@ fn body(app: &App, now: Instant) -> Body {
         Screen::Import => plain(|lines| import(app, lines)),
         Screen::Existing => plain(|lines| existing(app, lines)),
         Screen::Password => plain(|lines| new_password(app, lines)),
+        Screen::WatchAddress => plain(|lines| watch_address(app, lines)),
         Screen::Unlock => plain(|lines| unlock(app, lines)),
         Screen::Waiting => Body::Scene {
             cat: cat(app, now, pick(&DOZING, app.frame)),
@@ -489,7 +493,11 @@ fn body(app: &App, now: Instant) -> Body {
             cat: cat(app, now, pick(&SLEEPY, app.frame)),
             lines: vec![
                 Line::raw(PAUSED),
-                Line::raw("nothing can be proven or sent until one connects; your form is kept"),
+                Line::raw(if app.watch_only() {
+                    "nothing can be proven until one connects"
+                } else {
+                    "nothing can be proven or sent until one connects; your form is kept"
+                }),
             ],
         },
         Screen::Ready => {
@@ -499,6 +507,16 @@ fn body(app: &App, now: Instant) -> Body {
             let side =
                 (app.cat() == Some(Pose::Idle) && picker.is_none()).then(|| app.cat_frame(now));
             Body::Page { rows, side, picker }
+        }
+        Screen::Watching => {
+            let mut rows = vec![Row::Text(Line::default())];
+            watched(app, &mut rows);
+            let side = (app.cat() == Some(Pose::Idle)).then(|| app.cat_frame(now));
+            Body::Page {
+                rows,
+                side,
+                picker: None,
+            }
         }
         Screen::Review => plain(|lines| review(app, lines)),
         Screen::Sending => sending(app, now),
@@ -571,6 +589,15 @@ fn existing(app: &App, lines: &mut Vec<Line<'static>>) {
     ));
     lines.push(Line::default());
     lines.push(Line::raw(format!("path  {}", app.setup.path)));
+    setup_error(app, lines);
+}
+
+fn watch_address(app: &App, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::raw(
+        "the address to watch: 0x and 40 hex digits, checksummed or all lowercase",
+    ));
+    lines.push(Line::default());
+    lines.push(Line::raw(format!("address  {}", app.setup.address)));
     setup_error(app, lines);
 }
 
@@ -692,6 +719,32 @@ fn form(app: &App, rows: &mut Vec<Row>) -> usize {
         rows.push(Row::Text(error_line(error)));
     }
     token_row
+}
+
+/// Pushes one row per watched address: the address, its name, ETH and each held token.
+fn watched(app: &App, rows: &mut Vec<Row>) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    for (address, balances) in &app.watched {
+        let mut values = vec![Span::raw(address.to_checksum(None))];
+        if let Some(name) = &balances.name {
+            values.push(Span::raw(name.clone()));
+        }
+        values.push(Span::raw(balance(balances.eth, Asset::Eth)));
+        values.extend(
+            balances
+                .tokens
+                .iter()
+                .map(|(token, amount)| Span::raw(show(*amount, Asset::Token(*token)))),
+        );
+        rows.push(Row::Form {
+            label: Span::raw("  "),
+            values,
+        });
+    }
+    if app.tokens_unproven {
+        rows.push(Row::Text(Line::default()));
+        rows.push(Row::Text(Line::styled(format!("  {TOKENS_UNPROVEN}"), dim)));
+    }
 }
 
 /// The open token list below body line `below`: the filter, then each matching asset with
@@ -916,8 +969,11 @@ fn keys(app: &App) -> &'static [&'static str] {
         Screen::Confirm => &["Enter check", "Esc back to the menu, discarding the phrase"],
         Screen::Import | Screen::Existing => &["Enter continue", "Esc back to the menu"],
         Screen::Password => &["up/down field", "Enter continue", "Esc back to the menu"],
-        Screen::Unlock => &["Enter unlock", "Esc quit"],
-        Screen::Waiting | Screen::Excited | Screen::Paused => &["l logs", "q quit"],
+        Screen::WatchAddress => &["Enter watch", "Esc back"],
+        Screen::Unlock => &["Enter unlock", "Tab watch only", "Esc quit"],
+        Screen::Waiting | Screen::Excited | Screen::Paused | Screen::Watching => {
+            &["l logs", "q quit"]
+        }
         Screen::Ready if app.typing_recipient() => &[
             "up/down field",
             "Enter or left/right token",
