@@ -2074,14 +2074,7 @@ mod tests {
 
     /// Watching WEIHAN, named and holding 3 ETH and 1.5 TKN, and SENDER holding 0.25 ETH.
     fn watching() -> App {
-        let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
-        app.watch_list(&[WEIHAN, SENDER]);
-        app.setup(None);
-        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let now = Instant::now();
-        app.startup(Startup::Serving, now);
-        app.tick(now + EXCITED_FOR);
-        app.health(100, 1);
+        let mut app = watching_only(&[WEIHAN, SENDER]);
         app.refreshed(vec![
             (
                 WEIHAN,
@@ -2100,6 +2093,19 @@ mod tests {
                 },
             ),
         ]);
+        app
+    }
+
+    /// Watching `addresses` with no balances yet, serving with a state peer.
+    fn watching_only(addresses: &[Address]) -> App {
+        let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
+        app.watch_list(addresses);
+        app.setup(None);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let now = Instant::now();
+        app.startup(Startup::Serving, now);
+        app.tick(now + EXCITED_FOR);
+        app.health(100, 1);
         app
     }
 
@@ -2138,6 +2144,73 @@ mod tests {
                 let shown = sized(&app, &logs, width, height);
                 assert_eq!(shown.lines().count(), usize::from(height));
             }
+        }
+    }
+
+    #[test]
+    fn watching_scrolls_a_list_taller_than_the_body_by_address() {
+        let addresses: Vec<Address> = (1..=12).map(Address::with_last_byte).collect();
+        let rows = |at: std::ops::Range<usize>| {
+            addresses[at]
+                .iter()
+                .map(|address| format!("  {}   ? ETH", address.to_checksum(None)))
+                .collect::<Vec<_>>()
+        };
+        let shown = |app: &App| {
+            inside(app, &[], 120, 16)
+                .lines()
+                .map(|line| line.trim_end().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let hint = format!("  {TOKENS_UNPROVEN}");
+        let hint = hint.as_str();
+        let footer = "up/down scroll · l logs · q quit";
+        let mut app = watching_only(&addresses);
+        let mut expected = vec![String::new()];
+        expected.extend(rows(0..7));
+        expected.extend(["  ↓ 5 more", "", hint, footer].map(str::to_owned));
+        assert_eq!(shown(&app), expected);
+
+        for _ in 0..3 {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let mut expected = vec!["  ↑ 3 more".to_owned()];
+        expected.extend(rows(3..10));
+        expected.extend(["  ↓ 2 more", "", hint, footer].map(str::to_owned));
+        assert_eq!(shown(&app), expected);
+
+        for _ in 0..20 {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let mut expected = vec!["  ↑ 11 more".to_owned()];
+        expected.extend(rows(11..12));
+        expected.extend(["", hint].map(str::to_owned));
+        expected.extend(vec![String::new(); 7]);
+        expected.push(footer.to_owned());
+        assert_eq!(shown(&app), expected);
+
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(shown(&app)[0], "  ↑ 10 more");
+        for (width, height) in [(1, 1), (10, 3), (30, 5), (43, 13), (44, 14)] {
+            assert_eq!(
+                sized(&app, &[], width, height).lines().count(),
+                usize::from(height)
+            );
+        }
+    }
+
+    #[test]
+    fn a_watch_list_that_fits_shows_no_scroll_marks_or_key() {
+        let twelve: Vec<Address> = (1..=12).map(Address::with_last_byte).collect();
+        for app in [watching(), watching_only(&twelve)] {
+            let shown = inside(&app, &[], 120, 24);
+            for address in &app.watched {
+                assert!(shown.contains(&address.0.to_checksum(None)), "{shown}");
+            }
+            for absent in ["↑", "↓", "up/down scroll"] {
+                assert!(!shown.contains(absent), "{absent}\n{shown}");
+            }
+            assert!(shown.contains("l logs · q quit"), "{shown}");
         }
     }
 
