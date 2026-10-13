@@ -520,6 +520,8 @@ pub struct App {
     /// The run's watched addresses in config order, with their balances at the latest
     /// snapshot.
     pub watched: Vec<(Address, Balances)>,
+    /// The index in `watched` of the first address Watching shows.
+    pub watch_first: usize,
     /// The sender's balances.
     pub balances: Balances,
     /// Whether some pinned key is not held yet, so held tokens may be missing from the
@@ -574,6 +576,7 @@ impl App {
             waiting: WaitCounts::default(),
             sender: None,
             watched: Vec::new(),
+            watch_first: 0,
             balances: Balances::default(),
             tokens_unproven: true,
             head: 0,
@@ -678,6 +681,7 @@ impl App {
                 self.watched.push((address, Balances::default()));
             }
         }
+        self.watch_first = self.watch_first.min(self.watched.len().saturating_sub(1));
     }
 
     /// Whether the session watches without a wallet: past setup and unlock with no sender.
@@ -1129,6 +1133,10 @@ impl App {
                 self.sending_key(key);
                 None
             }
+            Screen::Watching => {
+                self.watching_key(key);
+                None
+            }
             Screen::Menu
             | Screen::Backup
             | Screen::Confirm
@@ -1139,8 +1147,18 @@ impl App {
             | Screen::Unlock
             | Screen::Waiting
             | Screen::Excited
-            | Screen::Watching
             | Screen::Paused => None,
+        }
+    }
+
+    /// Scrolls Watching by one address, up to showing only the last.
+    fn watching_key(&mut self, key: Key) {
+        match key {
+            Key::Up => self.watch_first = self.watch_first.saturating_sub(1),
+            Key::Down => {
+                self.watch_first = (self.watch_first + 1).min(self.watched.len().saturating_sub(1));
+            }
+            Key::Char(_) | Key::Backspace | Key::Enter | Key::Esc | Key::Left | Key::Right => {}
         }
     }
 

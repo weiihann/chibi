@@ -114,6 +114,108 @@ enum Body {
         /// The token list, drawn over the form.
         picker: Option<Popup>,
     },
+    /// The watched addresses, scrolled by address, drawn as a page: Watching.
+    Watch {
+        /// One row per watched address.
+        addresses: Vec<Row>,
+        /// The index in `addresses` of the first shown.
+        first: usize,
+        /// The rows under the addresses.
+        after: Vec<Row>,
+        /// The idle cat's frame, drawn right of the list where it fits.
+        side: Option<u32>,
+    },
+}
+
+/// A watch list laid out for a body of a given width.
+struct WatchList {
+    /// Each address's lines and the body rows they take.
+    addresses: Vec<(Vec<Line<'static>>, usize)>,
+    /// The index in `addresses` of the first shown.
+    first: usize,
+    /// The lines under the addresses.
+    after: Vec<Line<'static>>,
+    /// The body rows `after` takes.
+    after_rows: usize,
+}
+
+impl WatchList {
+    /// `addresses` from `first` and `after` laid out for a body `width` columns wide.
+    fn new(addresses: Vec<Row>, first: usize, after: Vec<Row>, width: u16) -> Self {
+        let lay_out = |rows: Vec<Row>| {
+            let mut lines = Vec::new();
+            for row in rows {
+                row.lay_out(usize::from(width), &mut lines);
+            }
+            let height = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            (lines, height)
+        };
+        let first = first.min(addresses.len());
+        let addresses = addresses
+            .into_iter()
+            .map(|row| lay_out(vec![row]))
+            .collect();
+        let (after, after_rows) = lay_out(after);
+        Self {
+            addresses,
+            first,
+            after,
+            after_rows,
+        }
+    }
+
+    /// The end of the addresses shown in a body `height` rows tall: from the first, those
+    /// that fit between the top row and `after`, less a row for `↓ N more` when some below
+    /// do not.
+    fn end(&self, height: u16) -> usize {
+        let room = usize::from(height).saturating_sub(1 + self.after_rows);
+        let rest = &self.addresses[self.first..];
+        if rest.iter().map(|(_, rows)| rows).sum::<usize>() <= room {
+            return self.addresses.len();
+        }
+        let room = room.saturating_sub(1);
+        let mut used = 0;
+        let mut end = self.first;
+        for (_, rows) in rest {
+            if used + rows > room {
+                break;
+            }
+            used += rows;
+            end += 1;
+        }
+        end
+    }
+
+    /// Whether a body `height` rows tall hides some address.
+    fn scrolls(&self, height: u16) -> bool {
+        self.first > 0 || self.end(height) < self.addresses.len()
+    }
+
+    /// The page rows for a body `height` rows tall: a dim `↑ N more` (else a blank row), the
+    /// addresses shown, a dim `↓ N more` when some below are hidden, then `after`.
+    fn rows(mut self, height: u16) -> Vec<Row> {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let (first, end, len) = (self.first, self.end(height), self.addresses.len());
+        let top = if first > 0 {
+            Line::styled(format!("  ↑ {first} more"), dim)
+        } else {
+            Line::default()
+        };
+        let mut rows = vec![Row::Text(top)];
+        for (lines, _) in self.addresses.drain(first..end) {
+            rows.extend(lines.into_iter().map(Row::Text));
+        }
+        if end < len {
+            rows.push(Row::Text(Line::styled(
+                format!("  ↓ {} more", len - end),
+                dim,
+            )));
+        }
+        rows.extend(self.after.into_iter().map(Row::Text));
+        rows
+    }
 }
 
 /// A page row.
@@ -238,12 +340,58 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
         Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
             .wrap(Wrap { trim: false })
     });
-    let footer = Paragraph::new(footer_lines(view.keys, area.width)).wrap(Wrap { trim: false });
+    let (mut areas, mut footer) = split(area, view.keys, notice.as_ref(), pane);
+    match view.body {
+        Body::Scene { cat, lines } => scene(frame, cat, lines, areas[0]),
+        Body::Page { rows, side, picker } => page(frame, rows, side, picker, areas[0]),
+        Body::Watch {
+            addresses,
+            first,
+            after,
+            side,
+        } => {
+            let list = WatchList::new(addresses, first, after, area.width);
+            if list.scrolls(areas[0].height) {
+                (areas, footer) = split(area, WATCH_SCROLL_KEYS, notice.as_ref(), pane);
+            }
+            let rows = list.rows(areas[0].height);
+            page(frame, rows, side, None, areas[0]);
+        }
+    }
+    let [_, notice_area, footer_area, log_area] = areas;
+    if let Some(paragraph) = notice {
+        frame.render_widget(paragraph, notice_area);
+    }
+    frame.render_widget(footer, footer_area);
+    if let Some(logs) = view.logs {
+        let shown = usize::from(log_area.height.saturating_sub(2));
+        let tail = &logs[logs.len().saturating_sub(shown)..];
+        frame.render_widget(
+            Paragraph::new(
+                tail.iter()
+                    .map(|line| Line::raw(line.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .block(Block::default().borders(Borders::TOP).title(" log ")),
+            log_area,
+        );
+    }
+}
+
+/// The body, notice, footer, and log pane areas of `area`, top to bottom, for `notice`, a
+/// log pane `pane` rows tall, and a footer naming `keys`, which it returns too.
+fn split(
+    area: Rect,
+    keys: &[&'static str],
+    notice: Option<&Paragraph<'_>>,
+    pane: u16,
+) -> ([Rect; 4], Paragraph<'static>) {
+    let footer = Paragraph::new(footer_lines(keys, area.width)).wrap(Wrap { trim: false });
     let footer_rows = u16::try_from(footer.line_count(area.width))
         .unwrap_or(u16::MAX)
         .max(1);
     let free = area.height.saturating_sub(1);
-    let rows = notice.as_ref().map_or(0, |paragraph| {
+    let rows = notice.map_or(0, |paragraph| {
         u16::try_from(paragraph.line_count(area.width))
             .unwrap_or(u16::MAX)
             .min(free)
@@ -262,28 +410,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     let notice_area = take(rows);
     let footer_area = take(1 + more);
     let log_area = take(pane);
-
-    match view.body {
-        Body::Scene { cat, lines } => scene(frame, cat, lines, body),
-        Body::Page { rows, side, picker } => page(frame, rows, side, picker, body),
-    }
-    if let Some(paragraph) = notice {
-        frame.render_widget(paragraph, notice_area);
-    }
-    frame.render_widget(footer, footer_area);
-    if let Some(logs) = view.logs {
-        let shown = usize::from(log_area.height.saturating_sub(2));
-        let tail = &logs[logs.len().saturating_sub(shown)..];
-        frame.render_widget(
-            Paragraph::new(
-                tail.iter()
-                    .map(|line| Line::raw(line.as_str()))
-                    .collect::<Vec<_>>(),
-            )
-            .block(Block::default().borders(Borders::TOP).title(" log ")),
-            log_area,
-        );
-    }
+    ([body, notice_area, footer_area, log_area], footer)
 }
 
 /// Draws the cat, a blank line and `lines` under it, each centered, the whole centered in
@@ -509,13 +636,17 @@ fn body(app: &App, now: Instant) -> Body {
             Body::Page { rows, side, picker }
         }
         Screen::Watching => {
-            let mut rows = vec![Row::Text(Line::default())];
-            watched(app, &mut rows);
-            let side = (app.cat() == Some(Pose::Idle)).then(|| app.cat_frame(now));
-            Body::Page {
-                rows,
-                side,
-                picker: None,
+            let mut after = Vec::new();
+            if app.tokens_unproven {
+                let dim = Style::default().add_modifier(Modifier::DIM);
+                after.push(Row::Text(Line::default()));
+                after.push(Row::Text(Line::styled(format!("  {TOKENS_UNPROVEN}"), dim)));
+            }
+            Body::Watch {
+                addresses: watched(app),
+                first: app.watch_first,
+                after,
+                side: (app.cat() == Some(Pose::Idle)).then(|| app.cat_frame(now)),
             }
         }
         Screen::Review => plain(|lines| review(app, lines)),
@@ -721,9 +852,9 @@ fn form(app: &App, rows: &mut Vec<Row>) -> usize {
     token_row
 }
 
-/// Pushes one row per watched address: the address, its name, ETH and each held token.
-fn watched(app: &App, rows: &mut Vec<Row>) {
-    let dim = Style::default().add_modifier(Modifier::DIM);
+/// One row per watched address: the address, its name, ETH and each held token.
+fn watched(app: &App) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(app.watched.len());
     for (address, balances) in &app.watched {
         let mut values = vec![Span::raw(address.to_checksum(None))];
         if let Some(name) = &balances.name {
@@ -741,10 +872,7 @@ fn watched(app: &App, rows: &mut Vec<Row>) {
             values,
         });
     }
-    if app.tokens_unproven {
-        rows.push(Row::Text(Line::default()));
-        rows.push(Row::Text(Line::styled(format!("  {TOKENS_UNPROVEN}"), dim)));
-    }
+    rows
 }
 
 /// The open token list below body line `below`: the filter, then each matching asset with
@@ -957,6 +1085,9 @@ fn sending(app: &App, now: Instant) -> Body {
         None => plain(|page| page.append(&mut lines)),
     }
 }
+
+/// The keys the footer names on Watching when some address is hidden.
+const WATCH_SCROLL_KEYS: &[&str] = &["up/down scroll", "l logs", "q quit"];
 
 /// The keys the footer names on `app`'s screen.
 fn keys(app: &App) -> &'static [&'static str] {
