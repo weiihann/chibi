@@ -670,12 +670,14 @@ impl App {
         }
     }
 
-    /// The run's watched addresses, in config order.
+    /// The run's watched addresses, in config order, each once.
     pub fn watch_list(&mut self, addresses: &[Address]) {
-        self.watched = addresses
-            .iter()
-            .map(|address| (*address, Balances::default()))
-            .collect();
+        self.watched = Vec::with_capacity(addresses.len());
+        for &address in addresses {
+            if !self.watched.iter().any(|(at, _)| *at == address) {
+                self.watched.push((address, Balances::default()));
+            }
+        }
     }
 
     /// Whether the session watches without a wallet: past setup and unlock with no sender.
