@@ -47,6 +47,10 @@ pub enum Fault {
     LieAboutBalance(Address, U256),
     /// The census counts no state peer.
     NoStatePeers,
+    /// The next this many header requests fail as rejected.
+    RejectHeaders(u32),
+    /// Header requests fail as if the network had stopped.
+    StopHeaders,
 }
 
 /// A transaction the fixture was asked to broadcast.
@@ -96,6 +100,8 @@ struct Faults {
     withhold_bodies: bool,
     lie: Option<(B256, U256)>,
     no_state_peers: bool,
+    rejected_headers: u32,
+    stop_headers: bool,
 }
 
 #[derive(Debug)]
@@ -231,6 +237,8 @@ impl Fixture {
             Fault::WithholdBals => faults.withhold_bals = true,
             Fault::WithholdBodies => faults.withhold_bodies = true,
             Fault::NoStatePeers => faults.no_state_peers = true,
+            Fault::RejectHeaders(count) => faults.rejected_headers = count,
+            Fault::StopHeaders => faults.stop_headers = true,
             Fault::LieAboutBalance(address, balance) => {
                 faults.lie = Some((keccak256(address), balance));
             }
@@ -404,6 +412,16 @@ impl FixturePeers {
 
 impl Peers for FixturePeers {
     async fn headers(&self, start: B256, count: u64) -> Result<Reply<Vec<Header>>, NetError> {
+        {
+            let mut faults = self.inner.faults.lock();
+            if faults.stop_headers {
+                return Err(NetError::Stopped);
+            }
+            if faults.rejected_headers > 0 {
+                faults.rejected_headers -= 1;
+                return Err(NetError::Rejected);
+            }
+        }
         let world = self.inner.world.lock();
         let mut headers = Vec::new();
         let mut cursor = start;

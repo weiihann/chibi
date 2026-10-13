@@ -27,6 +27,7 @@ use crate::node::{
     BlockSel, ContractSnapshot, Follower, Held, Node, NodeError, SEED_RETRY, Stepped,
     TrackedContract, Watchlist, read_snapshot,
 };
+use crate::peers::NetError;
 
 const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
 const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
@@ -204,6 +205,41 @@ async fn start_anchors_with_the_watched_balance_and_serves_it_without_fetching()
     assert_eq!(follower.step().await.unwrap(), Stepped::Current);
     let holding = &node.status().snapshot.holdings[0];
     assert_eq!((holding.balance, holding.nonce), (Some(eth(2)), Some(0)));
+}
+
+async fn anchor(fixture: &Fixture, dir: &Path) -> Result<Node<FixturePeers>, NodeError> {
+    Node::with_parts(
+        Fixture::spec(&[]),
+        fixture.peers(),
+        fixture.heads(),
+        Disk::open(dir).unwrap(),
+        &watchlist(&[ALICE]),
+    )
+    .await
+    .map(|(node, _)| node)
+}
+
+#[tokio::test(start_paused = true)]
+async fn anchoring_retries_rejected_header_fetches_until_one_succeeds() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    fixture.fault(Fault::RejectHeaders(5));
+
+    let node = anchor(&fixture, dir.path()).await.unwrap();
+
+    assert_eq!(node.head().hash(), fixture.world(|w| w.head()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn anchoring_gives_up_when_the_network_stops() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    fixture.fault(Fault::StopHeaders);
+
+    assert!(matches!(
+        anchor(&fixture, dir.path()).await,
+        Err(NodeError::Net(NetError::Stopped))
+    ));
 }
 
 #[tokio::test]
