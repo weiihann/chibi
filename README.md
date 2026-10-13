@@ -107,6 +107,7 @@ The first time you run `chibi run --tui` without a keystore (no `--keystore`, no
 - **Create a new wallet.** chibi shows a new 12-word recovery phrase, numbered. Write it down: anyone with these words controls the wallet, and chibi will not show them again. Then type the two words it asks for, by position, to show you have them. The phrase is standard BIP-39 English and its first account (`m/44'/60'/0'/0/0`), so it also imports into MetaMask or any other wallet as the same address.
 - **Import a private key or recovery phrase.** Type or paste 64 hex digits (with or without `0x`) for a private key, or a 12 or 24 word recovery phrase, whose first account is used. The input is masked.
 - **Use an existing keystore file.** Type its path (absolute, or starting with `~/`), then its password.
+- **Just watch balances, without a wallet.** No key at all: chibi shows the balances of the addresses it watches and sends nothing. The menu starts on this choice when the run already watches an address (`addresses` in the config, or `--address`). With none, it asks for `the address to watch`: `0x` and 40 hex digits, checksummed or all lowercase, not the zero address (names are not taken here, since nothing resolves before chibi starts). That address is added to `addresses` in the config file in use, keeping everything else in it, or a config with the defaults is written if there is none, so later runs start on watching it. If the config cannot be written, chibi watches it for this run anyway and says to pass `--address` next time. Esc goes back to the menu.
 
 Creating and importing then ask for a password twice (at least 8 characters; up and down move between the two fields) and encrypt the key with it into `keystores/<address>.json` next to the config file in use: `~/.config/chibi/keystores/` by default (`$XDG_CONFIG_HOME/chibi/keystores/` when that is set), or beside the file `--config` or `CHIBI_CONFIG` names. The directory is readable only by you (0700) and the file too (0600). A keystore already there for the same address is never overwritten: chibi says so and asks for that keystore's password instead. chibi then records the keystore as `keystore` in that config file, keeping everything else in it, or writes a config with the defaults and `keystore` if there is none, so later runs go straight to the password. If the keystore is saved but the config cannot be updated, for example because it is read-only, chibi says where the keystore is and to start with `--keystore <path>` next time, and carries on. The new key stays unlocked, so the UI goes on to wait for a state peer without asking for the password again.
 
@@ -125,7 +126,9 @@ The keystore is an encrypted JSON keystore (Web3 Secret Storage, as `cast wallet
 | `--keystore PATH` | The keystore to send from, instead of the config's `keystore`. Without either, the UI opens the setup above |
 | `--logs` | Start with the log pane open |
 
-`--tui` cannot run in the background (`-b`). A keystore that is missing or unreadable stops chibi before anything starts, naming the path. A wrong password asks again.
+`--tui` cannot run in the background (`-b`). A keystore that is missing or unreadable stops chibi before anything starts, naming the path. A wrong password asks again. Tab on the password prompt leaves without unlocking and watches balances instead, as **Just watch balances** above; the typed password is wiped.
+
+Watching without a wallet shows the same waiting cats, then a list titled `chibi · <network> · watching` of every watched address in config order: its checksummed address, its primary ENS name if it has one that prints as itself, its ETH balance, and each listed token it holds, with `more tokens appear once their balances are proven` until they are. There is no form, fee estimate, name resolution, or sending; `l` opens the log pane and `q` quits. Without a state peer the sleepy cat stands in for the list until one returns.
 
 Once unlocked, your address is watched for that run, so its ETH and every listed token are proven while chibi waits for a state peer. A dozing cat shows the wait, `looking for a state peer · peers N · state peers M · 1m20s`, and perks up at `found a state peer!` for at least a second and a half. Then the transfer form opens:
 
@@ -152,7 +155,7 @@ Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (th
 | Field | Default | Meaning |
 |---|---|---|
 | `network` | `sepolia` | `sepolia` or `mainnet` |
-| `addresses` | none | Watch-only addresses, pinned with their balance of every listed token |
+| `addresses` | none | Watch-only addresses, pinned with their balance of every listed token; the TUI's watch prompt adds to it |
 | `beacon_url` | Sepolia `https://beacon.sepolia.ethpandaops.io/nimbus`, mainnet `https://ethereum-beacon-api.publicnode.com` | Beacon (consensus) API the light client reads sync-committee updates from |
 | `checkpoint` | none | Finalized beacon block root to start the light client from |
 | `rpc_host` | `127.0.0.1` | IP address or domain JSON-RPC listens on; also accepted as a `Host` header |
