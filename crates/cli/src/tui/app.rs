@@ -3441,4 +3441,22 @@ mod tests {
         assert!(!app.balances_request(100, 3));
         assert!(app.balances_request(101, 3));
     }
+
+    #[test]
+    fn a_repeated_address_is_watched_once_and_stops_refreshing_once_proven() {
+        let mut app = watching_setup(&[WEIHAN, SENDER, WEIHAN, SENDER]);
+        let held = Balances {
+            eth: Some(eth(2_000)),
+            tokens: Vec::new(),
+            name: None,
+        };
+        assert_eq!(
+            app.watched,
+            [(WEIHAN, Balances::default()), (SENDER, Balances::default())]
+        );
+        assert!(app.balances_request(100, 3));
+        app.refreshed(vec![(WEIHAN, held.clone()), (SENDER, held.clone())]);
+        assert_eq!(app.watched, [(WEIHAN, held.clone()), (SENDER, held)]);
+        assert!(!app.balances_request(100, 3));
+    }
 }
