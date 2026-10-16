@@ -1555,6 +1555,20 @@ mod tests {
         assert!(proof.await.unwrap().is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_that_passes_after_the_check_wakes_the_wait_at_once() {
+        let sessions = watch::Sender::new(Sessions::from([(A, fresh_snap1())]));
+        let mut receiver = sessions.subscribe();
+        tokio::time::advance(SNAP1_SETTLE - Duration::from_millis(1)).await;
+        let checked = Instant::now();
+        assert!(receiver.borrow()[&A].serving(checked).is_none());
+        tokio::time::advance(Duration::from_millis(2)).await;
+
+        let woke = Instant::now();
+        sessions_changed(&mut receiver, checked).await.unwrap();
+        assert_eq!(woke.elapsed(), Duration::ZERO);
+    }
+
     fn code_request() -> SnapProtocolMessage {
         SnapProtocolMessage::GetByteCodes(GetByteCodesMessage {
             request_id: 0,
