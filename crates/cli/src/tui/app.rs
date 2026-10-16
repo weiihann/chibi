@@ -1999,6 +1999,11 @@ mod tests {
                 KeyModifiers::CONTROL,
                 Some(Key::EraseAll),
             ),
+            (
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+                Some(Key::Backspace),
+            ),
             (KeyCode::Char('x'), KeyModifiers::CONTROL, None),
             (KeyCode::Char('w'), none, Some(Key::Char('w'))),
             (KeyCode::Backspace, none, Some(Key::Backspace)),
@@ -2652,6 +2657,20 @@ mod tests {
         app.form.to_error = Some("stale".to_owned());
         app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
         assert_eq!((app.form.to.as_str(), errors(&app)[1]), ("", None));
+    }
+
+    #[test]
+    fn ctrl_h_is_backspace_on_the_to_field_and_the_password() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        typed(&mut app, "pw");
+        app.key(ctrl('h'));
+        assert_eq!(app.password.as_str(), "p");
+
+        let mut app = ready(Network::Sepolia);
+        app.form.field = Field::To;
+        typed(&mut app, "ab");
+        app.key(ctrl('h'));
+        assert_eq!(app.form.to.as_str(), "a");
     }
 
     #[test]
