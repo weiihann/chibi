@@ -1709,10 +1709,10 @@ mod tests {
     use super::*;
     use alloy_primitives::B512;
 
-    use crate::devp2p::Session;
+    use crate::devp2p::{Session, Snap};
     use crate::peers::PeerKey;
 
-    fn session(snap: bool) -> Session {
+    fn session(snap: Option<Snap>) -> Session {
         Session {
             client: Arc::from("test"),
             eth: 69,
@@ -1738,7 +1738,7 @@ mod tests {
             }
         );
         sessions.send_modify(|s| {
-            s.insert(PeerKey(B512::repeat_byte(1)), session(false));
+            s.insert(PeerKey(B512::repeat_byte(1)), session(None));
         });
         seen.changed().await.unwrap();
         assert_eq!(
@@ -1759,7 +1759,7 @@ mod tests {
             }
         );
         sessions.send_modify(|s| {
-            s.insert(PeerKey(B512::repeat_byte(2)), session(true));
+            s.insert(PeerKey(B512::repeat_byte(2)), session(Some(Snap::V1)));
         });
         waiting.await.unwrap().unwrap();
         assert_eq!(*seen.borrow_and_update(), Startup::FoundStatePeer);

@@ -974,7 +974,7 @@ mod tests {
     use super::*;
     use crate::network::Network;
 
-    fn session(snap: bool) -> Session {
+    fn session(snap: Option<Snap>) -> Session {
         Session {
             client: Arc::from("test"),
             eth: 69,
@@ -985,7 +985,12 @@ mod tests {
     }
 
     fn snap_sessions(peers: &[PeerKey]) -> watch::Sender<Sessions> {
-        watch::Sender::new(peers.iter().map(|peer| (*peer, session(true))).collect())
+        watch::Sender::new(
+            peers
+                .iter()
+                .map(|peer| (*peer, session(Some(Snap::V2))))
+                .collect(),
+        )
     }
 
     fn answer() -> RequestResult<SnapResponse> {
@@ -997,45 +1002,79 @@ mod tests {
 
     type Responder = oneshot::Sender<RequestResult<SnapResponse>>;
 
-    /// Requests [`SnapLoad`] submitted, held unanswered like reth's session holds them until
-    /// the peer replies, whether or not the caller still waits.
+    /// Requests [`SnapLoad`] submitted, with the snap version each went out on, held
+    /// unanswered like a session holds them until the peer replies.
     #[derive(Clone, Debug, Default)]
-    struct Wire(Arc<Mutex<Vec<(PeerKey, Responder)>>>);
+    struct Wire(Arc<Mutex<Vec<(PeerKey, Snap, Responder)>>>);
 
     impl Wire {
+        /// A proof request, which any state peer serves.
         fn request(
             &self,
             load: &Arc<SnapLoad>,
             sessions: &watch::Sender<Sessions>,
         ) -> JoinHandle<Result<(PeerId, SnapResponse), NetError>> {
+            self.submit(Snap::V1, load, sessions)
+        }
+
+        /// A BAL request, which only snap/2 peers serve.
+        fn bal(
+            &self,
+            load: &Arc<SnapLoad>,
+            sessions: &watch::Sender<Sessions>,
+        ) -> JoinHandle<Result<(PeerId, SnapResponse), NetError>> {
+            self.submit(Snap::V2, load, sessions)
+        }
+
+        fn submit(
+            &self,
+            need: Snap,
+            load: &Arc<SnapLoad>,
+            sessions: &watch::Sender<Sessions>,
+        ) -> JoinHandle<Result<(PeerId, SnapResponse), NetError>> {
             let (load, sessions, wire) = (Arc::clone(load), sessions.subscribe(), self.clone());
             tokio::spawn(async move {
-                load.submit(sessions, |peer| {
+                load.submit(sessions, need, |peer, snap| {
                     let (response, reply) = oneshot::channel();
-                    wire.0.lock().push((PeerKey(peer), response));
+                    wire.0.lock().push((PeerKey(peer), snap, response));
                     reply
                 })
                 .await
             })
         }
 
+        /// Requests out at `peer` that someone still waits for.
         fn outstanding(&self, peer: PeerKey) -> usize {
-            self.0.lock().iter().filter(|(on, _)| *on == peer).count()
+            self.0
+                .lock()
+                .iter()
+                .filter(|(on, _, responder)| *on == peer && !responder.is_closed())
+                .count()
+        }
+
+        /// The snap versions of the requests sent to `peer`, oldest first.
+        fn versions(&self, peer: PeerKey) -> Vec<Snap> {
+            self.0
+                .lock()
+                .iter()
+                .filter(|(on, ..)| *on == peer)
+                .map(|(_, snap, _)| *snap)
+                .collect()
         }
 
         /// Answers up to `count` of the oldest requests sent to `peer`.
         fn answer(&self, peer: PeerKey, count: usize) {
             let mut sent = self.0.lock();
             for _ in 0..count {
-                if let Some(at) = sent.iter().position(|(on, _)| *on == peer) {
-                    sent.remove(at).1.send(answer()).ok();
+                if let Some(at) = sent.iter().position(|(on, ..)| *on == peer) {
+                    sent.remove(at).2.send(answer()).ok();
                 }
             }
         }
 
-        /// Drops every request sent to `peer`, as reth does when its session closes.
+        /// Drops every request sent to `peer`, as a session does when it closes.
         fn close(&self, peer: PeerKey) {
-            self.0.lock().retain(|(on, _)| *on != peer);
+            self.0.lock().retain(|(on, ..)| *on != peer);
         }
     }
 
@@ -1199,7 +1238,7 @@ mod tests {
             A,
             Session {
                 eth: 68,
-                ..session(true)
+                ..session(Some(Snap::V2))
             },
         )]));
         assert_eq!(offer(&sessions, A, 1, 105, 1), []);
@@ -1211,7 +1250,7 @@ mod tests {
         let eth = PeerKey(B512::repeat_byte(3));
         let sessions = snap_sessions(&[A, B]);
         sessions.send_modify(|sessions| {
-            sessions.insert(eth, session(false));
+            sessions.insert(eth, session(None));
         });
         let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
 
@@ -1232,12 +1271,115 @@ mod tests {
         }
         assert!(load.load.lock().is_empty());
 
-        let no_snap = watch::Sender::new(Sessions::from([(eth, session(false))]));
+        let no_snap = watch::Sender::new(Sessions::from([(eth, session(None))]));
         let no_peer = wire.request(&load, &no_snap).await.unwrap().unwrap_err();
+        assert_eq!(no_peer.to_string(), "no connected peer serves state (snap)");
+    }
+
+    #[test]
+    fn the_snap_version_is_the_highest_one_announced() {
+        let eth = Capability::new_static("eth", 69);
+        let snap1 = Capability::new_static("snap", 1);
+        let snap2 = Capability::new_static("snap", 2);
         assert_eq!(
-            no_peer.to_string(),
-            "no connected peer serves state (snap/2)"
+            Snap::announced(&[eth.clone(), snap1.clone(), snap2.clone()]),
+            Some(Snap::V2)
         );
+        assert_eq!(Snap::announced(&[snap2, eth.clone()]), Some(Snap::V2));
+        assert_eq!(Snap::announced(&[eth.clone(), snap1]), Some(Snap::V1));
+        assert_eq!(Snap::announced(&[eth]), None);
+        assert_eq!(Snap::announced(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn proofs_go_to_either_snap_version_and_bals_to_snap2_only() {
+        let sessions = watch::Sender::new(Sessions::from([
+            (A, session(Some(Snap::V1))),
+            (PeerKey(B512::repeat_byte(3)), session(None)),
+        ]));
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let proof = wire.request(&load, &sessions);
+        let no_snap2 = wire.bal(&load, &sessions).await.unwrap().unwrap_err();
+        assert_eq!(
+            no_snap2,
+            NetError::NoPeer {
+                capability: "snap/2"
+            }
+        );
+        settle().await;
+        assert_eq!(wire.versions(A), [Snap::V1]);
+
+        sessions.send_modify(|sessions| {
+            sessions.insert(B, session(Some(Snap::V2)));
+        });
+        let bals: Vec<_> = (0..4).map(|_| wire.bal(&load, &sessions)).collect();
+        settle().await;
+        let proofs: Vec<_> = (0..3).map(|_| wire.request(&load, &sessions)).collect();
+        settle().await;
+        assert_eq!(wire.versions(A), [Snap::V1; 4]);
+        assert_eq!(wire.versions(B), [Snap::V2; 4]);
+
+        wire.answer(A, 4);
+        wire.answer(B, 4);
+        for call in [proof].into_iter().chain(bals).chain(proofs) {
+            assert!(call.await.unwrap().is_ok());
+        }
+        assert!(load.load.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_snap1_request_whose_caller_gave_up_frees_its_slot() {
+        let sessions = watch::Sender::new(Sessions::from([(A, session(Some(Snap::V1)))]));
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let abandoned: Vec<_> = (0..SNAP_PER_PEER)
+            .map(|_| wire.request(&load, &sessions))
+            .collect();
+        settle().await;
+        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+        for call in abandoned {
+            call.abort();
+        }
+        settle().await;
+        assert_eq!(wire.outstanding(A), 0);
+
+        let calls: Vec<_> = (0..SNAP_PER_PEER)
+            .map(|_| wire.request(&load, &sessions))
+            .collect();
+        settle().await;
+        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+        wire.close(A);
+        for call in calls {
+            assert_eq!(call.await.unwrap().unwrap_err(), NetError::Rejected);
+        }
+    }
+
+    #[test]
+    fn the_census_counts_state_peers_of_either_snap_version() {
+        let sessions = Sessions::from([
+            (
+                A,
+                Session {
+                    dialable: Some(node(1)),
+                    ..session(Some(Snap::V1))
+                },
+            ),
+            (
+                B,
+                Session {
+                    dialable: Some(node(2)),
+                    ..session(Some(Snap::V2))
+                },
+            ),
+            (PeerKey(B512::repeat_byte(3)), session(Some(Snap::V2))),
+            (PeerKey(B512::repeat_byte(4)), session(None)),
+        ]);
+        let census = census(&sessions);
+        assert_eq!((census.peers, census.state_peers), (4, 3));
+        let mut records = census.snap_records;
+        records.sort_by_key(|record| record.id);
+        assert_eq!(records, [node(1), node(2)]);
     }
 
     const PEER: PeerId = B512::repeat_byte(7);
