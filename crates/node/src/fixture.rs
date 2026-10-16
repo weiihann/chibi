@@ -281,7 +281,7 @@ impl Fixture {
         self.inner.holding.send_replace(false);
     }
 
-    /// Serves proof requests like one snap/2 peer working on up to `at_once` of them, each
+    /// Serves proof requests like one state peer working on up to `at_once` of them, each
     /// taking `service`, in arrival order. A request already sent is served even after its
     /// caller stopped waiting.
     pub fn serve_proofs(&self, at_once: usize, service: Duration) {

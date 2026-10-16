@@ -2,7 +2,7 @@
 //!
 //! Syncs helios in a temporary directory from a community checkpoint, takes its newest attested
 //! block hash, fetches that header over devp2p and checks its hash, then fetches raw single-key
-//! snap/2 replies for the deposit contract's account and one USDC proxy slot, and the header's
+//! snap replies for the deposit contract's account and one USDC proxy slot, and the header's
 //! BAL. Proof verification is chibi-core's job; this shows the raw replies are well-formed and
 //! keyed correctly.
 //!
@@ -73,12 +73,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut sessions = net.sessions();
     let found = tokio::time::timeout(
         SNAP_PEER_WAIT,
-        sessions.wait_for(|sessions| sessions.values().any(|session| session.snap)),
+        sessions.wait_for(|sessions| sessions.values().any(|session| session.snap.is_some())),
     )
     .await
     .is_ok_and(|seen| seen.is_ok());
     if !found {
-        warn!(wait = ?SNAP_PEER_WAIT, "no state peer (snap/2) yet");
+        warn!(wait = ?SNAP_PEER_WAIT, "no state peer (snap) yet");
     }
     log_sessions(&sessions.borrow());
 
@@ -187,9 +187,12 @@ fn log_sessions(sessions: &Sessions) {
         let name = session.client.split('/').next().unwrap_or_default();
         let entry = clients.entry(name).or_default();
         entry.0 += 1;
-        entry.1 += usize::from(session.snap);
+        entry.1 += usize::from(session.snap.is_some());
     }
-    let state_peers = sessions.values().filter(|session| session.snap).count();
+    let state_peers = sessions
+        .values()
+        .filter(|session| session.snap.is_some())
+        .count();
     info!(
         peers = sessions.len(),
         state_peers,

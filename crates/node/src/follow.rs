@@ -34,7 +34,7 @@ const BODY_BATCH: usize = 64;
 /// Proofs a warm pass gathers before merging them, so requests see its progress early.
 const WARM_MERGE: usize = 64;
 
-/// Warm requests in flight at once: half of one snap/2 peer's slots, so a wallet request or a
+/// Warm requests in flight at once: half of one state peer's slots, so a wallet request or a
 /// BAL fetch always finds the other half.
 const WARM_IN_FLIGHT: usize = 8;
 

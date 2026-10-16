@@ -21,9 +21,9 @@ use tracing::debug;
 /// How long a peer may take to answer one request, counted from when it is sent.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// snap/2 requests one peer works on at once. A peer answers in about the same time with up to
-/// 32 in flight, and reth's session buffers 32 commands and drops the rest; half leaves room
-/// for reth's own traffic.
+/// snap requests one peer works on at once. A peer answers in about the same time with up to
+/// 32 in flight, and reth's snap/2 session buffers 32 commands and drops the rest; half leaves
+/// room for reth's own traffic.
 pub(crate) const SNAP_PER_PEER: usize = 16;
 
 /// Identifies the peer that sent a reply, so a failed verification can penalize it.
@@ -44,10 +44,10 @@ pub struct Reply<T> {
 pub struct Census {
     /// Connected sessions.
     pub peers: usize,
-    /// Connected sessions that negotiated snap/2: the state peers, which serve proofs.
+    /// Connected sessions that speak snap/1 or snap/2: the state peers, which serve proofs.
     pub state_peers: usize,
-    /// Addresses of the connected snap/2 peers, dialed first on the next start because
-    /// discovery takes minutes to find one.
+    /// Addresses of the connected state peers chibi dialed, dialed first on the next start
+    /// because discovery takes minutes to find one.
     pub snap_records: Vec<NodeRecord>,
 }
 
@@ -63,19 +63,19 @@ pub trait Peers: Send + Sync + 'static {
         count: u64,
     ) -> impl Future<Output = Result<Reply<Vec<Header>>, NetError>> + Send;
 
-    /// A single-key snap/2 `GetAccountRange`.
+    /// A single-key snap `GetAccountRange`.
     fn account_range(
         &self,
         request: AccountRangeRequest,
     ) -> impl Future<Output = Result<Reply<AccountReply>, NetError>> + Send;
 
-    /// A single-key snap/2 `GetStorageRanges` for one account.
+    /// A single-key snap `GetStorageRanges` for one account.
     fn storage_range(
         &self,
         request: StorageRangeRequest,
     ) -> impl Future<Output = Result<Reply<StorageReply>, NetError>> + Send;
 
-    /// Contract code by hash (snap/2 `GetByteCodes`).
+    /// Contract code by hash (snap `GetByteCodes`).
     fn byte_codes(
         &self,
         hashes: Vec<B256>,
@@ -117,18 +117,18 @@ pub trait Peers: Send + Sync + 'static {
     fn census(&self) -> Census;
 }
 
-/// [`Peers`] with a timeout on every request, and snap/2 requests paced to what the connected
-/// snap/2 peers can work on at once. reth queues a request it cannot send yet, so a timeout
+/// [`Peers`] with a timeout on every request, and snap requests paced to what the connected
+/// state peers can work on at once. reth queues a request it cannot send yet, so a timeout
 /// started at submission would count time spent behind chibi's own requests: one busy peer
 /// would time out healthy requests, and their retries would queue behind the abandoned ones,
 /// which reth still sends.
 #[derive(Debug)]
 pub(crate) struct Paced<P> {
     inner: P,
-    /// One permit per request the snap/2 peers can work on at once. Fair, so a retry cannot
+    /// One permit per request the state peers can work on at once. Fair, so a retry cannot
     /// jump ahead of a request that was already waiting, such as the follower's next BALs.
     slots: Semaphore,
-    /// Permits the semaphore stands for, followed to the snap/2 peer count.
+    /// Permits the semaphore stands for, followed to the state peer count.
     capacity: Mutex<usize>,
 }
 
@@ -145,8 +145,8 @@ impl<P: Peers> Paced<P> {
         self.inner.census().state_peers.max(1) * SNAP_PER_PEER
     }
 
-    /// Follows the connected snap/2 peers, keeping at least one slot so that reth fails a
-    /// request at once when no snap/2 peer is connected. Free slots are retired here; a slot
+    /// Follows the connected state peers, keeping at least one slot so that a request fails at
+    /// once when no state peer is connected. Free slots are retired here; a slot
     /// held while the peers shrink is retired when its holder lets go of it.
     fn resize(&self) {
         let wanted = self.wanted();
@@ -185,7 +185,7 @@ impl<P: Peers> Paced<P> {
     }
 }
 
-/// A held snap slot. On release the slots follow the snap/2 peers in both directions: the slot
+/// A held snap slot. On release the slots follow the state peers in both directions: the slot
 /// is retired if peers have dropped below the slots in use, and slots are added if peers have
 /// connected, so requests already queued use them without waiting for a new request.
 struct Slot<'a, P: Peers> {
@@ -303,7 +303,7 @@ mod tests {
 
     use super::*;
 
-    /// Answers each account request when the test says so, with a snap/2 peer count the test
+    /// Answers each account request when the test says so, with a state peer count the test
     /// sets.
     #[derive(Debug)]
     struct Stub {
@@ -464,7 +464,7 @@ mod tests {
             assert_eq!(
                 out.len(),
                 4 * SNAP_PER_PEER,
-                "requests out across four snap/2 peers"
+                "requests out across four state peers"
             );
             for answer in out {
                 answer.send(()).unwrap();

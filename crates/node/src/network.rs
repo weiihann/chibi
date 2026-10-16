@@ -125,7 +125,7 @@ pub struct NetworkSpec {
     pub default_beacon: &'static str,
     /// devp2p boot nodes.
     pub boot_nodes: Vec<NodeRecord>,
-    /// Known state peers (snap/2), dialed as static peers at start because discovery can take
+    /// Known state peers (snap), dialed as static peers at start because discovery can take
     /// minutes to find one.
     pub state_peers: Vec<NodeRecord>,
     /// Tokens chibi knows on this network. Every one is pinned for each watched address.

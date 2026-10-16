@@ -1,6 +1,6 @@
 //! The per-network data directory: its lock, the devp2p identity, and the state database.
 //!
-//! The database holds a display snapshot, the outbox of pending raw transactions, snap/2
+//! The database holds a display snapshot, the outbox of pending raw transactions, state
 //! peers worth dialing first, and the learned working-set keys, most recently used first.
 //! Pins are not saved: they follow from the config at each start. Its values are
 //! display-only: nothing read from it enters a `Store`.
@@ -61,7 +61,7 @@ CREATE TABLE keys (
 );
 ";
 
-/// Most snap/2 peers remembered across restarts.
+/// Most state peers remembered across restarts.
 const REMEMBERED_PEERS: usize = 16;
 
 /// How long lock-file readers and openers retry. [`Disk::running`] briefly holds a shared lock
@@ -129,7 +129,7 @@ impl Saved {
         self.outbox = outbox;
     }
 
-    /// Remembered snap/2 peers. Unparseable records are skipped.
+    /// Remembered state peers. Unparseable records are skipped.
     pub(crate) fn peers(&self) -> Vec<NodeRecord> {
         self.peers
             .iter()
@@ -223,7 +223,7 @@ impl Lock {
     }
 
     /// Deletes the user state saved in the directory's database: the snapshot, the outbox
-    /// and the learned keys, in one transaction. Remembered snap/2 peers, the light-client
+    /// and the learned keys, in one transaction. Remembered state peers, the light-client
     /// checkpoint and the devp2p key stay. `None` when there is no database, which is left
     /// uncreated.
     pub fn reset(&self) -> Result<Option<Reset>, NodeError> {

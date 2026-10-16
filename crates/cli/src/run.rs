@@ -353,7 +353,7 @@ fn log_status(health: &Health, previous: &BTreeSet<Key>) {
     );
     if health.state_peers == 0 {
         warn!(
-            "no state peer (snap/2) connected; the head and state requests stall until one returns"
+            "no state peer (snap) connected; the head and state requests stall until one returns"
         );
     }
     if let Some((count, named)) = persisting_unheld(previous, &health.unheld_pinned) {

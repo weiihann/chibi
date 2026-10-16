@@ -185,7 +185,7 @@ pub enum Startup {
     Waiting {
         /// Connected devp2p sessions.
         peers: usize,
-        /// Connected state peers: sessions that negotiated snap/2.
+        /// Connected state peers: sessions that speak snap/1 or snap/2.
         state_peers: usize,
         /// Time since the wait began.
         elapsed: Duration,
@@ -324,7 +324,7 @@ pub struct Status {
     pub snapshot: Snapshot,
     /// Connected devp2p sessions.
     pub peers: usize,
-    /// Connected state peers: sessions that negotiated snap/2.
+    /// Connected state peers: sessions that speak snap/1 or snap/2.
     pub state_peers: usize,
 }
 
@@ -336,7 +336,7 @@ pub struct Health {
     pub head: BlockNumHash,
     /// Connected devp2p sessions.
     pub peers: usize,
-    /// Connected state peers: sessions that negotiated snap/2.
+    /// Connected state peers: sessions that speak snap/1 or snap/2.
     pub state_peers: usize,
     /// Pinned keys, configured and seeded, the anchor's store holds.
     pub pinned: Held,
@@ -462,7 +462,7 @@ impl Node<Devp2p> {
     }
 }
 
-/// Waits until a state peer (snap/2) is connected, however long discovery takes, reporting
+/// Waits until a state peer (snap) is connected, however long discovery takes, reporting
 /// progress on `progress` and in the log.
 async fn wait_for_state_peer(
     mut sessions: watch::Receiver<Sessions>,
@@ -474,7 +474,10 @@ async fn wait_for_state_peer(
     loop {
         let (peers, state_peers) = {
             let sessions = sessions.borrow_and_update();
-            let state_peers = sessions.values().filter(|session| session.snap).count();
+            let state_peers = sessions
+                .values()
+                .filter(|session| session.snap.is_some())
+                .count();
             (sessions.len(), state_peers)
         };
         if state_peers > 0 {
@@ -489,7 +492,7 @@ async fn wait_for_state_peer(
                 state_peers,
                 dialed,
                 elapsed_s = elapsed.as_secs(),
-                "waiting for a state peer (snap/2)",
+                "waiting for a state peer (snap)",
             );
             logged = Some(tokio::time::Instant::now());
         }
@@ -1333,7 +1336,7 @@ impl<P: Peers> Shared<P> {
         }
     }
 
-    /// Writes the snapshot, the outbox, and snap/2 peers to the state database.
+    /// Writes the snapshot, the outbox, and state peers to the state database.
     pub(crate) async fn persist(self: &Arc<Self>) -> Result<(), NodeError> {
         let shared = Arc::clone(self);
         blocking(move || {

@@ -59,8 +59,9 @@ pub use reth_network::config::{SecretKey, rng_secret_key};
 
 use crate::network::{BlockClock, NetworkSpec};
 use crate::peers::{Census, NetError, PeerKey, Peers, Reply, SNAP_PER_PEER};
+use crate::snap1::Snap1;
 
-/// Soft cap on snap/2 response sizes, matching reth's own snap downloaders.
+/// Soft cap on snap response sizes, matching reth's own snap downloaders.
 const RESPONSE_BYTES: u64 = 512 * 1024;
 
 /// Most peers a transaction is sent to.
@@ -73,11 +74,12 @@ const INBOUND_CAPACITY: usize = 256;
 const ETH_69: u8 = EthVersion::Eth69 as u8;
 
 const ETH: &str = "eth";
-const SNAP: &str = "state (snap/2)";
+const SNAP: &str = "state (snap)";
 
 /// The capability named when neither BAL source is connected.
 const BAL_SOURCES: &str = "snap/2 or eth/71";
 
+pub(crate) const SNAP_1: Capability = Capability::new_static("snap", 1);
 const SNAP_2: Capability = Capability::snap_2();
 
 /// Local listening ports. Zero lets the operating system pick.
@@ -94,7 +96,7 @@ pub struct Ports {
 pub struct NetConfig {
     /// Local listening ports.
     pub ports: Ports,
-    /// Nodes always dialed and kept, besides the network's built-in snap/2 peers.
+    /// Nodes always dialed and kept, besides the network's built-in state peers.
     pub trusted_peers: Vec<NodeRecord>,
     /// Connect to `trusted_peers` only, dialing no built-in, remembered or discovered peer.
     pub trusted_only: bool,
@@ -120,7 +122,7 @@ impl NetConfig {
     }
 
     /// The peers to dial at start besides the trusted ones, which reth dials itself: the
-    /// network's built-in snap/2 peers and `remembered`, unless only trusted peers may connect.
+    /// network's built-in state peers and `remembered`, unless only trusted peers may connect.
     pub fn known_peers(&self, spec: &NetworkSpec, remembered: Vec<NodeRecord>) -> Vec<NodeRecord> {
         if self.trusted_only {
             return Vec::new();
@@ -159,6 +161,46 @@ pub enum HeadHint<'a> {
     },
 }
 
+/// The snap version a state peer serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Snap {
+    /// snap/1: proofs only, over chibi's own snap/1 sub-protocol.
+    V1,
+    /// snap/2: proofs and BALs, over reth's snap/2 session.
+    V2,
+}
+
+impl Snap {
+    /// The highest version among the `capabilities` a peer announced, which is the one RLPx
+    /// negotiates with chibi.
+    fn announced(capabilities: &[Capability]) -> Option<Self> {
+        if capabilities.contains(&SNAP_2) {
+            Some(Self::V2)
+        } else if capabilities.contains(&SNAP_1) {
+            Some(Self::V1)
+        } else {
+            None
+        }
+    }
+
+    /// What is missing when no session serves this version or a later one.
+    const fn missing(self) -> &'static str {
+        match self {
+            Self::V1 => SNAP,
+            Self::V2 => "snap/2",
+        }
+    }
+
+    /// The version for logs: `1`, `2`, or `none`.
+    const fn label(snap: Option<Self>) -> &'static str {
+        match snap {
+            Some(Self::V1) => "1",
+            Some(Self::V2) => "2",
+            None => "none",
+        }
+    }
+}
+
 /// One established peer session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session {
@@ -166,9 +208,10 @@ pub struct Session {
     pub client: Arc<str>,
     /// Negotiated eth protocol version.
     pub eth: u8,
-    /// Whether the peer announced snap/2.
-    pub snap: bool,
-    /// The record chibi dialed for a snap/2 session it opened, `None` otherwise. Only such
+    /// The snap version the session serves state over, `None` if the peer announced no snap.
+    /// A session with one is a state peer.
+    pub snap: Option<Snap>,
+    /// The record chibi dialed for a state peer session it opened, `None` otherwise. Only such
     /// records are worth remembering for the next start.
     pub dialable: Option<NodeRecord>,
     /// The publication sequence of the last block range sent to the peer.
@@ -181,7 +224,7 @@ pub type Sessions = HashMap<PeerKey, Session>;
 /// A snap reply as the session resolves it.
 pub(crate) type SnapReply = oneshot::Receiver<RequestResult<SnapResponse>>;
 
-/// chibi's snap/2 requests in flight, by session.
+/// chibi's snap requests in flight, by session.
 #[derive(Debug, Default)]
 struct SnapLoad {
     load: Mutex<HashMap<PeerKey, usize>>,
@@ -190,23 +233,34 @@ struct SnapLoad {
 }
 
 impl SnapLoad {
-    /// Hands `send` the snap/2 session in `sessions` with the fewest requests in flight and
-    /// waits for the reply it returns. The request counts against the session until reth
-    /// resolves the reply, even if the caller stops waiting first, because reth keeps the
-    /// request out at the peer until then.
+    /// Hands `send` the session in `sessions` serving `need` or a later snap version with the
+    /// fewest requests in flight, and waits for the reply it returns. A snap/2 request counts
+    /// against the session until reth resolves the reply, even if the caller stops waiting
+    /// first, because reth keeps the request out at the peer until then. A snap/1 request
+    /// stops counting when its caller stops waiting: nothing times it out, so its connection
+    /// forgets it then.
     async fn submit(
         self: &Arc<Self>,
         mut sessions: watch::Receiver<Sessions>,
-        send: impl FnOnce(PeerId) -> SnapReply,
+        need: Snap,
+        send: impl FnOnce(PeerId, Snap) -> SnapReply,
     ) -> Result<(PeerId, SnapResponse), NetError> {
-        let lease = self.lease(&mut sessions).await?;
+        let lease = self.lease(&mut sessions, need).await?;
         let peer = lease.peer.0;
-        let reply = send(peer);
-        let (forward, forwarded) = oneshot::channel();
+        let reply = send(peer, lease.snap);
+        let (mut forward, forwarded) = oneshot::channel();
         tokio::spawn(async move {
-            let reply = reply.await;
+            let reply = match lease.snap {
+                Snap::V2 => Some(reply.await),
+                Snap::V1 => tokio::select! {
+                    reply = reply => Some(reply),
+                    () = forward.closed() => None,
+                },
+            };
             drop(lease);
-            forward.send(reply).ok();
+            if let Some(reply) = reply {
+                forward.send(reply).ok();
+            }
         });
         match forwarded.await {
             Ok(Ok(Ok(response))) => Ok((peer, response)),
@@ -215,20 +269,23 @@ impl SnapLoad {
         }
     }
 
-    /// A request counted against the least loaded snap/2 session below [`SNAP_PER_PEER`],
-    /// waiting while every snap/2 session is full. Fails at once when none is connected.
+    /// A request counted against the least loaded session serving `need` or later below
+    /// [`SNAP_PER_PEER`], waiting while every such session is full. Fails at once when none is
+    /// connected.
     async fn lease(
         self: &Arc<Self>,
         sessions: &mut watch::Receiver<Sessions>,
+        need: Snap,
     ) -> Result<Lease, NetError> {
         loop {
             let released = self.released.notified();
             let mut released = std::pin::pin!(released);
             released.as_mut().enable();
-            if let Some(peer) = self.least_loaded(&sessions.borrow_and_update())? {
+            if let Some((peer, snap)) = self.least_loaded(&sessions.borrow_and_update(), need)? {
                 return Ok(Lease {
                     load: Arc::clone(self),
                     peer,
+                    snap,
                 });
             }
             tokio::select! {
@@ -238,32 +295,41 @@ impl SnapLoad {
         }
     }
 
-    fn least_loaded(&self, sessions: &Sessions) -> Result<Option<PeerKey>, NetError> {
+    fn least_loaded(
+        &self,
+        sessions: &Sessions,
+        need: Snap,
+    ) -> Result<Option<(PeerKey, Snap)>, NetError> {
         let mut load = self.load.lock();
-        let mut snap = sessions
+        let mut serving = sessions
             .iter()
-            .filter(|(_, session)| session.snap)
-            .map(|(peer, _)| (load.get(peer).copied().unwrap_or_default(), *peer))
+            .filter_map(|(peer, session)| {
+                let snap = session.snap.filter(|snap| *snap >= need)?;
+                Some((load.get(peer).copied().unwrap_or_default(), *peer, snap))
+            })
             .peekable();
-        if snap.peek().is_none() {
-            return Err(NetError::NoPeer { capability: SNAP });
+        if serving.peek().is_none() {
+            return Err(NetError::NoPeer {
+                capability: need.missing(),
+            });
         }
-        let Some((_, peer)) = snap
-            .filter(|(count, _)| *count < SNAP_PER_PEER)
-            .min_by_key(|(count, _)| *count)
+        let Some((_, peer, snap)) = serving
+            .filter(|(count, ..)| *count < SNAP_PER_PEER)
+            .min_by_key(|(count, ..)| *count)
         else {
             return Ok(None);
         };
         *load.entry(peer).or_default() += 1;
-        Ok(Some(peer))
+        Ok(Some((peer, snap)))
     }
 }
 
-/// One request counted against `peer`.
+/// One request counted against `peer`, a session serving `snap`.
 #[derive(Debug)]
 struct Lease {
     load: Arc<SnapLoad>,
     peer: PeerKey,
+    snap: Snap,
 }
 
 impl Drop for Lease {
@@ -304,6 +370,7 @@ pub struct Devp2p {
     chain: Arc<ChainSpec>,
     sessions: Arc<watch::Sender<Sessions>>,
     snap_load: Arc<SnapLoad>,
+    snap1: Snap1,
     /// The store announced last, whose held headers inbound requests are answered from, with
     /// its publication sequence.
     served: watch::Sender<Option<(u64, Arc<Store>)>>,
@@ -311,7 +378,8 @@ pub struct Devp2p {
 }
 
 impl Devp2p {
-    /// Starts discovery and sessions for `spec` as `net` says, advertising snap/2 and `head`.
+    /// Starts discovery and sessions for `spec` as `net` says, advertising snap/1, snap/2 and
+    /// `head`.
     pub async fn start(
         spec: &NetworkSpec,
         secret_key: SecretKey,
@@ -340,6 +408,7 @@ impl Devp2p {
                 }
             }
         };
+        let snap1 = Snap1::default();
         let config = NetworkConfigBuilder::eth(secret_key, runtime)
             .boot_nodes(net.boot_nodes(spec).iter().copied())
             .listener_port(net.ports.rlpx)
@@ -348,6 +417,7 @@ impl Devp2p {
             .disable_discovery_if(net.disable_discovery)
             .set_head(head)
             .with_snap(true)
+            .add_rlpx_sub_protocol(snap1.clone())
             .disable_tx_gossip(true)
             .build_with_noop_provider(Arc::clone(&spec.chain));
 
@@ -385,6 +455,7 @@ impl Devp2p {
             chain: Arc::clone(&spec.chain),
             sessions,
             snap_load: Arc::default(),
+            snap1,
             served,
             tasks,
         })
@@ -395,7 +466,7 @@ impl Devp2p {
         self.sessions.subscribe()
     }
 
-    /// Asks the network to dial `records` as static peers, such as snap/2 peers pinned in the
+    /// Asks the network to dial `records` as static peers, such as state peers pinned in the
     /// registry or remembered from an earlier run.
     pub fn add_peers(&self, records: &[NodeRecord]) {
         for record in records {
@@ -422,15 +493,23 @@ impl Devp2p {
         NetError::Rejected
     }
 
-    /// Sends `request` to the connected snap/2 session with the fewest chibi requests in
-    /// flight. reth's fetcher would hold each peer to one request at a time.
-    async fn snap(&self, request: SnapProtocolMessage) -> Result<(PeerId, SnapResponse), NetError> {
+    /// Sends `request` to the connected session serving `need` or a later snap version with
+    /// the fewest chibi requests in flight: through reth's snap/2 session, or chibi's snap/1
+    /// connection. reth's fetcher would hold each peer to one request at a time.
+    async fn snap(
+        &self,
+        need: Snap,
+        request: SnapProtocolMessage,
+    ) -> Result<(PeerId, SnapResponse), NetError> {
         self.snap_load
-            .submit(self.sessions.subscribe(), |peer| {
-                let (response, reply) = oneshot::channel();
-                self.handle
-                    .send_request(peer, PeerRequest::GetSnap { request, response });
-                reply
+            .submit(self.sessions.subscribe(), need, |peer, snap| match snap {
+                Snap::V1 => self.snap1.send(peer, request),
+                Snap::V2 => {
+                    let (response, reply) = oneshot::channel();
+                    self.handle
+                        .send_request(peer, PeerRequest::GetSnap { request, response });
+                    reply
+                }
             })
             .await
     }
@@ -446,7 +525,7 @@ impl Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .snap(SnapProtocolMessage::GetBlockAccessLists(message))
+            .snap(Snap::V2, SnapProtocolMessage::GetBlockAccessLists(message))
             .await?;
         match response {
             SnapResponse::BlockAccessLists(message) => {
@@ -508,7 +587,7 @@ impl Peers for Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .snap(SnapProtocolMessage::GetAccountRange(message))
+            .snap(Snap::V1, SnapProtocolMessage::GetAccountRange(message))
             .await?;
         match response {
             SnapResponse::AccountRange(range) => Ok(Self::reply(
@@ -541,7 +620,7 @@ impl Peers for Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .snap(SnapProtocolMessage::GetStorageRanges(message))
+            .snap(Snap::V1, SnapProtocolMessage::GetStorageRanges(message))
             .await?;
         let ranges = match response {
             SnapResponse::StorageRanges(ranges) => ranges,
@@ -575,7 +654,7 @@ impl Peers for Devp2p {
             response_bytes: RESPONSE_BYTES,
         };
         let (peer, response) = self
-            .snap(SnapProtocolMessage::GetByteCodes(message))
+            .snap(Snap::V1, SnapProtocolMessage::GetByteCodes(message))
             .await?;
         match response {
             SnapResponse::ByteCodes(codes) => Ok(Self::reply(peer, codes.codes)),
@@ -669,15 +748,23 @@ impl Peers for Devp2p {
     }
 
     fn census(&self) -> Census {
-        let sessions = self.sessions.borrow();
-        Census {
-            peers: sessions.len(),
-            state_peers: sessions.values().filter(|session| session.snap).count(),
-            snap_records: sessions
-                .values()
-                .filter_map(|session| session.dialable)
-                .collect(),
-        }
+        census(&self.sessions.borrow())
+    }
+}
+
+/// The session counts in `sessions`: every session with a snap version is a state peer, and
+/// only state peer sessions have a dialable record.
+fn census(sessions: &Sessions) -> Census {
+    Census {
+        peers: sessions.len(),
+        state_peers: sessions
+            .values()
+            .filter(|session| session.snap.is_some())
+            .count(),
+        snap_records: sessions
+            .values()
+            .filter_map(|session| session.dialable)
+            .collect(),
     }
 }
 
@@ -787,12 +874,13 @@ async fn track_sessions(
             NetworkEvent::ActivePeerSession { info, .. }
             | NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
                 let (peer, mut session) = session(&info);
-                if session.snap {
+                if session.snap.is_some() {
                     session.dialable = dialable(&handle, peer).await;
                 }
                 debug!(
                     target: "chibi::devp2p",
-                    %peer, client = %session.client, eth = session.eth, snap = session.snap,
+                    %peer, client = %session.client, eth = session.eth,
+                    snap = Snap::label(session.snap),
                     dialable = session.dialable.is_some(),
                     "session established",
                 );
@@ -826,7 +914,7 @@ fn session(info: &SessionInfo) -> (PeerId, Session) {
     let session = Session {
         client: Arc::clone(&info.client_version),
         eth: info.version as u8,
-        snap: info.capabilities.capabilities().contains(&SNAP_2),
+        snap: Snap::announced(info.capabilities.capabilities()),
         dialable: None,
         range_sent: None,
     };

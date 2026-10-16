@@ -22,7 +22,6 @@ use parking_lot::Mutex;
 use reth_eth_wire::capability::SharedCapabilities;
 use reth_eth_wire::multiplex::ProtocolConnection;
 use reth_eth_wire::protocol::Protocol;
-use reth_eth_wire_types::Capability;
 use reth_eth_wire_types::snap::{
     AccountRangeMessage, ByteCodesMessage, SnapProtocolMessage, StorageRangesMessage,
 };
@@ -33,7 +32,7 @@ use reth_network_p2p::snap::client::SnapResponse;
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
-use crate::devp2p::SnapReply;
+use crate::devp2p::{SNAP_1, SnapReply};
 
 const GET_ACCOUNT_RANGE: u8 = 0x00;
 const ACCOUNT_RANGE: u8 = 0x01;
@@ -45,7 +44,7 @@ const GET_TRIE_NODES: u8 = 0x06;
 const TRIE_NODES: u8 = 0x07;
 
 /// snap/1 with its eight message ids, 0x00 to 0x07.
-const PROTOCOL: Protocol = Protocol::new(Capability::new_static("snap", 1), 8);
+const PROTOCOL: Protocol = Protocol::new(SNAP_1, 8);
 
 type Responder = oneshot::Sender<RequestResult<SnapResponse>>;
 
