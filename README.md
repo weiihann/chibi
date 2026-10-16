@@ -1,6 +1,6 @@
 # chibi
 
-chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. Point MetaMask or Rabby at it, and the balances, call results, and gas estimates the wallet shows come from state chibi proved itself, not from an RPC provider. Over JSON-RPC chibi holds no keys. The wallet signs, and chibi simulates, broadcasts, and confirms. The one exception is the optional terminal UI, [`chibi run --tui`](#send-from-the-terminal-chibi-run---tui), which unlocks your keystore, or helps you create or import one, and sends from it.
+chibi is a local Ethereum JSON-RPC endpoint for a browser wallet. Point MetaMask or Rabby at it, and the balances, call results, and gas estimates the wallet shows come from state chibi proved itself, not from an RPC provider. Over JSON-RPC chibi holds no keys. The wallet signs, and chibi simulates, broadcasts, and confirms. The one exception is the optional terminal UI, [`chibi wallet`](#send-from-the-terminal-chibi-wallet), which unlocks your keystore, or helps you create or import one, and sends from it.
 
 chibi is early software. It targets Sepolia first. Mainnet support exists in the code but is untested.
 
@@ -47,10 +47,10 @@ A key is held when it is proven at the current head. The status line counts each
    ```
 
 2. `chibi init` asks for the network (Sepolia by default), the watch-only addresses to track (paste as many as you like and press Enter on an empty line to finish; none is fine), and the RPC host (an IP address or a domain your wallet uses to reach chibi, `127.0.0.1` by default) and port (`8545` by default), then writes the config. Every question has a default, so pressing Enter through them is fine.
-3. `chibi run` starts chibi in the foreground (`chibi run -b` in the background).
+3. `chibi node` starts chibi in the foreground (`chibi node -b` in the background).
 4. When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id.
 
-`chibi run` also works with no config: it uses Sepolia, JSON-RPC on `127.0.0.1:8545`, no pinned keys, and the default data directory, and learns the accounts and storage slots your wallet reads (see [What chibi keeps](#what-chibi-keeps)). `chibi run -b`, `status`, and `stop` work without one too; `chibi run` logs that it found no config and where `chibi init` would write one.
+`chibi node` also works with no config: it uses Sepolia, JSON-RPC on `127.0.0.1:8545`, no pinned keys, and the default data directory, and learns the accounts and storage slots your wallet reads (see [What chibi keeps](#what-chibi-keeps)). `chibi node -b`, `status`, and `stop` work without one too; `chibi node` logs that it found no config and where `chibi init` would write one.
 
 `chibi init` writes `config.toml` to `$XDG_CONFIG_HOME/chibi/` when `XDG_CONFIG_HOME` is set to an absolute path, otherwise to `~/.config/chibi/`, on macOS and Linux alike. In a terminal the questions are menus; elsewhere they are plain prompts. Flags skip the questions:
 
@@ -62,29 +62,29 @@ chibi init --network sepolia --address 0xYourAddress --rpc-host 127.0.0.1 --rpc-
 
 Writing a config resets the chosen network's saved state, since the old snapshot, pending transactions, and learned keys belong to the old config: once the config is written, `chibi init` deletes them from that network's `chibi.db` and prints what it deleted. If the config cannot be written, nothing is deleted. It keeps the remembered state peers, so the next start finds one fast, along with the light-client checkpoint and the devp2p key. It refuses, writing nothing, while a chibi runs on that data directory; stop it first. While init writes, it holds that data directory, so a chibi started meanwhile refuses to start. Without a database there is nothing to reset and it says nothing.
 
-A config file that exists must parse: `chibi run` refuses a malformed one rather than falling back to the defaults. A config with a `tokens` line, from before every token was kept for watched addresses, fails with that reason; delete the line or rerun `chibi init`.
+A config file that exists must parse: `chibi node` refuses a malformed one rather than falling back to the defaults. A config with a `tokens` line, from before every token was kept for watched addresses, fails with that reason; delete the line or rerun `chibi init`.
 
 Every command takes `--config PATH`, before or after the subcommand, to use another config file. The `CHIBI_CONFIG` environment variable does the same when the flag is absent; an empty `CHIBI_CONFIG` counts as unset. A config named either way must exist: every command but `chibi init` fails, naming the path, rather than falling back to the defaults:
 
 ```sh
 chibi --config ~/chibi-test.toml init
-CHIBI_CONFIG=~/chibi-test.toml chibi run -b
+CHIBI_CONFIG=~/chibi-test.toml chibi node -b
 chibi status --config ~/chibi-test.toml
 ```
 
 ## Run
 
 ```sh
-chibi run        # in the foreground; Ctrl-C stops it
-chibi run -b     # in the background; logs go to the data directory
-chibi run --tui  # with a terminal UI that sends from your keystore, see below
+chibi node       # in the foreground; Ctrl-C stops it
+chibi node -b    # in the background; logs go to the data directory
+chibi wallet     # with a terminal UI that sends from your keystore, see below
 chibi status     # whether it runs, and the balances saved at the last verified head
 chibi stop       # stops a background chibi
 ```
 
 On first start chibi needs a weak-subjectivity checkpoint for the light client. Without one in the config, it takes the newest checkpoint from public checkpoint services and logs a warning. Later starts reuse the checkpoint the light client saved.
 
-chibi then waits for a state peer (snap/2), logging `waiting for a state peer (snap/2)` with the peer and state peer counts every 30 seconds. On Sepolia this has taken from a few seconds to several minutes, because few peers serve snap/2 (on 2026-10-05 only Nethermind nodes did). chibi dials a short list of known state peers and the outbound state peers it reached on earlier runs first. When the first one connects, chibi prints a small cat and `found a state peer` to standard output (with `run -b`, into `chibi.log`). The JSON-RPC server opens only after the first verified head.
+chibi then waits for a state peer (snap/2), logging `waiting for a state peer (snap/2)` with the peer and state peer counts every 30 seconds. On Sepolia this has taken from a few seconds to several minutes, because few peers serve snap/2 (on 2026-10-05 only Nethermind nodes did). chibi dials a short list of known state peers and the outbound state peers it reached on earlier runs first. When the first one connects, chibi prints a small cat and `found a state peer` to standard output (with `node -b`, into `chibi.log`). The JSON-RPC server opens only after the first verified head.
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id (with a config, the URL uses its `rpc_host` and `rpc_port`).
 
@@ -98,11 +98,11 @@ The ENS name comes from the chain's ENS UniversalResolver, run by chibi itself o
 
 The token list is the 15 ERC-20s with the most transfers on mainnet in the 30 days to 2026-10-07. Mainnet has all 15: USDT, USDC, WETH, WBTC, UNI, LINK, QNT, DAI, PYUSD, ONDO, AAVE, PEPE, SHIB, 1INCH, and CRV. Sepolia has the 9 with a Sepolia deployment: USDT, USDC, WETH, WBTC, UNI, LINK, DAI, PYUSD, and AAVE. Sepolia's USDC, PYUSD, and LINK are their issuers' own deployments. Sepolia's USDT, DAI, WBTC, and AAVE are test tokens from Aave's Sepolia faucet, not tokens issued by Tether, Maker, BitGo, or Aave; anyone can mint them, so their balances carry no value.
 
-## Send from the terminal (`chibi run --tui`)
+## Send from the terminal (`chibi wallet`)
 
-`chibi run --tui` runs chibi in a terminal UI that sends ETH or a token from the [token list](#token-list) from your own keystore, while JSON-RPC keeps serving your wallet as `chibi run` does. It is the only mode in which chibi holds a key: the keystore is decrypted into memory when you type its password, and the key is never logged, and never written except encrypted into a keystore by the setup below.
+`chibi wallet` runs chibi in a terminal UI that sends ETH or a token from the [token list](#token-list) from your own keystore, while JSON-RPC keeps serving your wallet as `chibi node` does. It is the only mode in which chibi holds a key: the keystore is decrypted into memory when you type its password, and the key is never logged, and never written except encrypted into a keystore by the setup below.
 
-The first time you run `chibi run --tui` without a keystore (no `--keystore`, no `keystore` in the config), it walks you through setting one up. Up and Down choose, Enter selects, Esc goes back, and Esc on the menu quits:
+The first time you run `chibi wallet` without a keystore (no `--keystore`, no `keystore` in the config), it walks you through setting one up. Up and Down choose, Enter selects, Esc goes back, and Esc on the menu quits:
 
 - **Create a new wallet.** chibi shows a new 12-word recovery phrase, numbered. Write it down: anyone with these words controls the wallet, and chibi will not show them again. Then type the two words it asks for, by position, to show you have them. The phrase is standard BIP-39 English and its first account (`m/44'/60'/0'/0/0`), so it also imports into MetaMask or any other wallet as the same address.
 - **Import a private key or recovery phrase.** Type or paste 64 hex digits (with or without `0x`) for a private key, or a 12 or 24 word recovery phrase, whose first account is used. The input is masked.
@@ -115,18 +115,18 @@ You can also bring a keystore made elsewhere, for example with Foundry's `cast`,
 
 ```sh
 cast wallet import chibi --interactive          # writes ~/.foundry/keystores/chibi
-chibi init --keystore ~/.foundry/keystores/chibi   # or pass --keystore to chibi run
-chibi run --tui
+chibi init --keystore ~/.foundry/keystores/chibi   # or pass --keystore to chibi wallet
+chibi wallet
 ```
 
-The keystore is an encrypted JSON keystore (Web3 Secret Storage, as `cast wallet import` or geth writes it). `--tui` takes every `chibi run` flag (`--config`, `--network`, `--data-dir`, `--rpc-host`, `--rpc-port`, the peer flags), plus:
+The keystore is an encrypted JSON keystore (Web3 Secret Storage, as `cast wallet import` or geth writes it). `chibi wallet` takes every `chibi node` flag but `-b` (`--config`, `--network`, `--data-dir`, `--rpc-host`, `--rpc-port`, the peer flags), plus:
 
 | Flag | Meaning |
 |---|---|
 | `--keystore PATH` | The keystore to send from, instead of the config's `keystore`. Without either, the UI opens the setup above |
 | `--logs` | Start with the log pane open |
 
-`--tui` cannot run in the background (`-b`). A keystore that is missing or unreadable stops chibi before anything starts, naming the path. A wrong password asks again. Tab on the password prompt leaves without unlocking and watches balances instead, as **Just watch balances** above; the typed password is wiped.
+`chibi wallet` cannot run in the background: it has no `-b`. A keystore that is missing or unreadable stops chibi before anything starts, naming the path. A wrong password asks again. Tab on the password prompt leaves without unlocking and watches balances instead, as **Just watch balances** above; the typed password is wiped.
 
 Watching without a wallet shows the same waiting cats, then a list titled `chibi · <network> · watching` of every watched address in config order: its checksummed address, its primary ENS name if it has one that prints as itself, its ETH balance, and each listed token it holds, with `more tokens appear once their balances are proven` until they are. There is no form, fee estimate, name resolution, or sending. A list taller than the box scrolls one address at a time with up and down, with `↑ N more` and `↓ N more` counting the addresses out of view and `up/down scroll` among the keys; `l` opens the log pane and `q` quits. Without a state peer the sleepy cat stands in for the list until one returns.
 
@@ -146,7 +146,7 @@ The cats are pixel art drawn with half blocks in 24-bit colour, animated four ti
 
 The UI sits in the middle of the terminal as a rounded box titled `chibi · <network> · <address>`, or `chibi · <network> · <name> · <address>` once your address's primary ENS name is proven, which grows with the terminal up to 120 columns by 36 rows (12 rows more with the log pane open) and keeps at least two blank columns and one blank row around it. On a terminal smaller than 44 columns by 14 rows it fills the screen without a border instead. The text stays the terminal's font size, which a program cannot change portably, but the cats grow: the waiting, found, paused, and receipt screens center their cat and lines in the box, and the pixel cat doubles once the box has room for twice its size (a 120x40 terminal does, 80x24 does not). A form row too wide for the box, such as `from` with an 18-decimal balance at 80x24, continues on the next line under its values without splitting an address, a balance, or a hint, and the keys at the bottom take as many rows as they need.
 
-Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (the last lines of chibi's log, which goes there instead of the terminal), `q` or Ctrl-C quits and stops chibi as Ctrl-C does in `chibi run` (on the `to` row and in the token list `q` and `l` type, so only Ctrl-C quits there). Quitting with a transfer still pending warns first; the transfer stays in chibi's outbox, which broadcasts it again on the next run. Passwords are at most 256 bytes, and a pasted secret at most 256; their buffers are wiped once used and when you quit.
+Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (the last lines of chibi's log, which goes there instead of the terminal), `q` or Ctrl-C quits and stops chibi as Ctrl-C does in `chibi node` (on the `to` row and in the token list `q` and `l` type, so only Ctrl-C quits there). Quitting with a transfer still pending warns first; the transfer stays in chibi's outbox, which broadcasts it again on the next run. Passwords are at most 256 bytes, and a pasted secret at most 256; their buffers are wiped once used and when you quit.
 
 ## Configuration
 
@@ -164,18 +164,18 @@ Keys: arrows (or Tab) move between fields, `l` opens and closes the log pane (th
 | `allowed_hosts` | `localhost`, `127.0.0.1`, `[::1]` | Accepted `Host` headers, which blocks DNS rebinding |
 | `p2p_port` | `0` (OS picks) | devp2p listen port |
 | `data_dir` | XDG data directory | Absolute directory that holds the per-network data directories |
-| `keystore` | none | Absolute path of the encrypted JSON keystore `chibi run --tui` sends from; the TUI's setup writes it |
+| `keystore` | none | Absolute path of the encrypted JSON keystore `chibi wallet` sends from; the TUI's setup writes it |
 | `contracts` | none | Contract accounts and storage slots to pin, see below |
 
 The peer keys are under [Peers](#peers).
 
-`chibi run --beacon-url URL --data-dir PATH` overrides those keys for one run, as `--network`, `--rpc-host`, `--rpc-port`, and the peer flags do; `chibi init` writes the same flags into the config. A relative `--data-dir` is taken from the working directory. `chibi status` and `chibi stop` take `--data-dir` too, to find a chibi started with it.
+`chibi node --beacon-url URL --data-dir PATH` overrides those keys for one run, as `--network`, `--rpc-host`, `--rpc-port`, and the peer flags do (`chibi wallet` takes them too); `chibi init` writes the same flags into the config. A relative `--data-dir` is taken from the working directory. `chibi status` and `chibi stop` take `--data-dir` too, to find a chibi started with it.
 
-Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, remembered state peers, and learned keys, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi run` and then deleted. One `chibi run` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi run -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config` and `--data-dir`.
+Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, pending transactions, remembered state peers, and learned keys, and `chibi.log` for a background chibi) lives in `<data root>/<network>/`. The data root is `data_dir` when set, else `$XDG_DATA_HOME/chibi` when `XDG_DATA_HOME` is set to an absolute path, else `~/.local/share/chibi`. A `state.json` left by an earlier chibi is imported into `chibi.db` on the next `chibi node` or `chibi wallet` and then deleted. One `chibi node` or `chibi wallet` owns a network's data directory at a time, and `chibi.lock` holds its process id, so two configs on the same network need different `data_dir`s to run side by side. `chibi node -b`, `stop`, and `status` all find the directory through the config, so pass them the same `--config` and `--data-dir`.
 
 ### Peers
 
-chibi reads state from state peers: devp2p peers that speak snap/2 and so can serve proofs. By default it finds peers through discovery, starting from the network's boot nodes, and also dials the network's built-in state peers (Sepolia has four; mainnet has none) and the state peers it reached on earlier runs. These keys change that. Each has a flag: `chibi init` writes it into the config, and `chibi run` uses it for that run only.
+chibi reads state from state peers: devp2p peers that speak snap/2 and so can serve proofs. By default it finds peers through discovery, starting from the network's boot nodes, and also dials the network's built-in state peers (Sepolia has four; mainnet has none) and the state peers it reached on earlier runs. These keys change that. Each has a flag: `chibi init` writes it into the config, and `chibi node` and `chibi wallet` use it for that run only.
 
 | Field | Flag | Default | Meaning |
 |---|---|---|---|

@@ -25,6 +25,6 @@ echo
 if ! command -v chibi >/dev/null 2>&1; then
     echo "Add $bin to your PATH to use the commands below."
 fi
-echo "Start chibi:      chibi run      (foreground; Ctrl-C stops it)"
-echo "              or  chibi run -b   (background; \`chibi stop\` stops it)"
+echo "Start chibi:      chibi node      (foreground; Ctrl-C stops it)"
+echo "              or  chibi node -b   (background; \`chibi stop\` stops it)"
 echo "Check on chibi:   chibi status"

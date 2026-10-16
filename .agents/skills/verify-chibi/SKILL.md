@@ -5,7 +5,7 @@ description: Drive the real chibi node on Sepolia through its local JSON-RPC (th
 
 # Verify chibi
 
-chibi's user is a browser wallet pointed at `http://127.0.0.1:<port>`, plus a person running `chibi init`, `chibi run`, and `chibi status`. Verify through those surfaces only. Unit tests (`cargo test --workspace --all-features`) are not proof of behaviour.
+chibi's user is a browser wallet pointed at `http://127.0.0.1:<port>`, plus a person running `chibi init`, `chibi node`, `chibi wallet`, and `chibi status`. Verify through those surfaces only. Unit tests (`cargo test --workspace --all-features`) are not proof of behaviour.
 
 Helpers live in `scripts/` next to this file. Paths below are relative to the repo root. Feature recipes are in [`features/README.md`](features/README.md); read the index, then the feature you are proving.
 
@@ -19,7 +19,7 @@ Before 2026-10-06 13:53:36 UTC, Sepolia has no block access lists, so every head
 RUN_DIR=$(.agents/skills/verify-chibi/scripts/launch.sh --port 8645 0x3d767bf85779e2b550ab5fcd7e3be39fb77a5ce6 0xe1f0ba7cf9175f61ad1fe29ee4f30249871bfc29 | tail -1)
 ```
 
-- Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config with `chibi init` (every registry token, USDC included, is pinned for each watched address) and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi run --rpc-host 127.0.0.1 --rpc-port <port>` in the foreground of a background shell job, so `$RUN_DIR/chibi.pid` is chibi's own pid.
+- Builds `target/release/chibi`, copies it into `$RUN_DIR/bin`, writes a config with `chibi init` (every registry token, USDC included, is pinned for each watched address) and data dir under `$RUN_DIR/home` (HOME and XDG overridden), and starts `chibi node --rpc-host 127.0.0.1 --rpc-port <port>` in the foreground of a background shell job, so `$RUN_DIR/chibi.pid` is chibi's own pid.
 - Ready when `$RUN_DIR/chibi.log` contains `JSON-RPC on http://127.0.0.1:<port>`. The script waits up to `--timeout` seconds (default 900). Most of that is waiting for a state peer (a peer that speaks snap/2); the log prints `waiting for a state peer (snap/2)` with `peers=` and `state_peers=` every 30 s.
 - `--network mainnet` is accepted but untested and has no known state peers.
 - The addresses above are active Sepolia USDC holders. Use any address; at least one is required.

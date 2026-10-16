@@ -58,7 +58,7 @@ done
 
 # env and nohup exec in place, so $! is chibi's own pid.
 env RUST_LOG="${CHIBI_VERIFY_LOG:-info,chibi::devp2p=debug}" \
-    nohup "$run_dir/bin/chibi" run --rpc-host 127.0.0.1 --rpc-port "$port" >"$run_dir/chibi.log" 2>&1 &
+    nohup "$run_dir/bin/chibi" node --rpc-host 127.0.0.1 --rpc-port "$port" >"$run_dir/chibi.log" 2>&1 &
 echo $! >"$run_dir/chibi.pid"
 
 waited=0

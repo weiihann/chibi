@@ -35,6 +35,6 @@ Each feature file has an H1 title and one paragraph describing the user-visible 
 - [Verified state reads](./state-reads.md) covers balances, nonces, token balances, code, storage, `eth_call`, and gas estimates against the oracle. Runs before the fork.
 - [Head following](./head-following.md) covers reanchoring every block before the fork, applying block access lists after it, staleness, and `chibi status`.
 - [Send and confirm](./send-and-confirm.md) covers sending a signed transaction through chibi and getting a verified receipt. Needs a funded Sepolia key.
-- [Onboarding](./onboarding.md) covers `install.sh`, interactive and flag-driven `chibi init`, and the first `chibi run`.
+- [Onboarding](./onboarding.md) covers `install.sh`, interactive and flag-driven `chibi init`, and the first `chibi node`.
 - [RPC exposure](./rpc-exposure.md) covers the Host filter, the CORS allowlist, unsupported methods, and block responses.
-- [Terminal UI](./tui.md) covers `chibi run --tui`: keystore unlock, the state-peer wait and its cat, the transfer form and its validation, sending and tracking to a verified receipt, the state-peer pause, and the Sepolia-only rule. Driven in tmux on a scratch port with a scratch keystore; sending needs a funded Sepolia key.
+- [Terminal UI](./tui.md) covers `chibi wallet`: keystore unlock, the state-peer wait and its cat, the transfer form and its validation, sending and tracking to a verified receipt, the state-peer pause, and the Sepolia-only rule. Driven in tmux on a scratch port with a scratch keystore; sending needs a funded Sepolia key.
