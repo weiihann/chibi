@@ -369,6 +369,21 @@ mod tests {
     }
 
     #[test]
+    fn explorer_pages_a_transaction_by_its_lowercase_hash() {
+        let hash = alloy_primitives::b256!(
+            "0xB7F9B94255DE07145C869C658B4A1B7F6FCFE3E155C56B031E7A2254C5F286E5"
+        );
+        assert_eq!(
+            Network::Sepolia.spec().explorer.tx_url(hash),
+            "https://sepolia.etherscan.io/tx/0xb7f9b94255de07145c869c658b4a1b7f6fcfe3e155c56b031e7a2254c5f286e5"
+        );
+        assert_eq!(
+            Network::Mainnet.spec().explorer.tx_url(hash),
+            "https://etherscan.io/tx/0xb7f9b94255de07145c869c658b4a1b7f6fcfe3e155c56b031e7a2254c5f286e5"
+        );
+    }
+
+    #[test]
     fn specs_agree_with_helios_and_parse() {
         for network in Network::ALL {
             let spec = network.spec();

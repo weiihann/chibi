@@ -2104,6 +2104,50 @@ mod tests {
         );
     }
 
+    const EXPLORER_TX: &str = "https://sepolia.etherscan.io/tx/0xb7f9b94255de07145c869c658b4a1b7f6fcfe3e155c56b031e7a2254c5f286e5";
+
+    fn sent(state: SendState) -> String {
+        let mut app = ready();
+        app.screen = Screen::Sending;
+        app.sending = Some(Sending {
+            draft: Draft {
+                asset: Asset::Eth,
+                to: SENDER,
+                amount: U256::from(1_000_000_000u64),
+            },
+            hash: Some(alloy_primitives::b256!(
+                "0xb7f9b94255de07145c869c658b4a1b7f6fcfe3e155c56b031e7a2254c5f286e5"
+            )),
+            state,
+            pending_heads: 0,
+        });
+        sized(&app, &[], 120, 40)
+    }
+
+    #[test]
+    fn a_verified_send_links_its_explorer_page_on_one_line() {
+        for state in [SendState::Succeeded, SendState::Failed] {
+            let shown = sent(state);
+            assert!(
+                shown.lines().any(|row| row.contains(EXPLORER_TX)),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_or_unsent_transfer_has_no_explorer_link() {
+        for state in [
+            SendState::Included,
+            SendState::Signing,
+            SendState::Rejected("nonce too low".to_owned()),
+            SendState::Dropped,
+        ] {
+            let shown = sent(state);
+            assert!(!shown.contains("etherscan"), "{shown}");
+        }
+    }
+
     #[test]
     fn elapsed_time_reads_like_1m20s() {
         assert_eq!(elapsed(Duration::from_secs(45)), "45s");
