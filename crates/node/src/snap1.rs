@@ -1,5 +1,325 @@
 //! snap/1 as an RLPx sub-protocol beside reth's native snap/2, so peers whose highest snap
 //! version is snap/1 serve proofs too.
+//!
+//! RLPx keeps the highest version of a protocol both sides announce, so a peer announcing
+//! snap/2 runs on reth's snap/2 session and this handler connects only to the others. Messages
+//! 0x00 to 0x05 encode the same in both versions, so reth's snap message types frame the
+//! requests and decode the replies. reth numbers snap/2 requests itself; chibi numbers snap/1
+//! requests here, per connection. Inbound requests get an empty reply keeping their request id,
+//! because peers drop sessions whose requests go unanswered.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+
+use alloy_primitives::bytes::{BufMut, BytesMut};
+use alloy_rlp::{Decodable, EMPTY_LIST_CODE, Encodable, Header};
+use futures::{Stream, StreamExt};
+use parking_lot::Mutex;
+use reth_eth_wire::capability::SharedCapabilities;
+use reth_eth_wire::multiplex::ProtocolConnection;
+use reth_eth_wire::protocol::Protocol;
+use reth_eth_wire_types::Capability;
+use reth_eth_wire_types::snap::{
+    AccountRangeMessage, ByteCodesMessage, SnapProtocolMessage, StorageRangesMessage,
+};
+use reth_network::protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler};
+use reth_network_api::{Direction, PeerId};
+use reth_network_p2p::error::{RequestError, RequestResult};
+use reth_network_p2p::snap::client::SnapResponse;
+use tokio::sync::{mpsc, oneshot};
+use tracing::debug;
+
+use crate::devp2p::SnapReply;
+
+const GET_ACCOUNT_RANGE: u8 = 0x00;
+const ACCOUNT_RANGE: u8 = 0x01;
+const GET_STORAGE_RANGES: u8 = 0x02;
+const STORAGE_RANGES: u8 = 0x03;
+const GET_BYTE_CODES: u8 = 0x04;
+const BYTE_CODES: u8 = 0x05;
+const GET_TRIE_NODES: u8 = 0x06;
+const TRIE_NODES: u8 = 0x07;
+
+/// snap/1 with its eight message ids, 0x00 to 0x07.
+const PROTOCOL: Protocol = Protocol::new(Capability::new_static("snap", 1), 8);
+
+type Responder = oneshot::Sender<RequestResult<SnapResponse>>;
+
+/// A request for a snap/1 connection and where its reply goes.
+#[derive(Debug)]
+struct Command {
+    request: SnapProtocolMessage,
+    reply: Responder,
+}
+
+/// The open snap/1 connections by peer, and the handler reth opens them through.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Snap1 {
+    connections: Arc<Mutex<HashMap<PeerId, Registered>>>,
+    opened: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+struct Registered {
+    /// Which connection to the peer this is, so that a closing connection cannot unregister
+    /// its successor.
+    serial: u64,
+    commands: mpsc::UnboundedSender<Command>,
+}
+
+impl Snap1 {
+    /// Sends `request` on `peer`'s snap/1 connection. The reply fails when `peer` has none or
+    /// it closes before the peer answers, and for a request snap/1 lacks.
+    pub(crate) fn send(&self, peer: PeerId, request: SnapProtocolMessage) -> SnapReply {
+        let (reply, replied) = oneshot::channel();
+        if let Some(registered) = self.connections.lock().get(&peer) {
+            // A closed connection drops the command, which fails the reply.
+            registered.commands.send(Command { request, reply }).ok();
+        }
+        replied
+    }
+
+    fn open<S>(&self, peer: PeerId, inbound: S) -> Connection<S> {
+        let (commands_tx, commands) = mpsc::unbounded_channel();
+        let serial = self.opened.fetch_add(1, Ordering::Relaxed);
+        self.connections.lock().insert(
+            peer,
+            Registered {
+                serial,
+                commands: commands_tx,
+            },
+        );
+        Connection {
+            inbound,
+            commands,
+            pending: HashMap::new(),
+            replies: VecDeque::new(),
+            next_request: 0,
+            peer,
+            serial,
+            registry: self.clone(),
+        }
+    }
+}
+
+impl ProtocolHandler for Snap1 {
+    type ConnectionHandler = Self;
+
+    fn on_incoming(&self, _: SocketAddr) -> Option<Self> {
+        Some(self.clone())
+    }
+
+    fn on_outgoing(&self, _: SocketAddr, _: PeerId) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+impl ConnectionHandler for Snap1 {
+    type Connection = Connection<ProtocolConnection>;
+
+    fn protocol(&self) -> Protocol {
+        PROTOCOL
+    }
+
+    /// Keeps the session: a peer without snap/1 may speak snap/2, or serve eth only.
+    fn on_unsupported_by_peer(
+        self,
+        _: &SharedCapabilities,
+        _: Direction,
+        _: PeerId,
+    ) -> OnNotSupported {
+        OnNotSupported::KeepAlive
+    }
+
+    fn into_connection(
+        self,
+        _: Direction,
+        peer: PeerId,
+        conn: ProtocolConnection,
+    ) -> Self::Connection {
+        debug!(target: "chibi::devp2p", %peer, "snap/1 connection opened");
+        self.open(peer, conn)
+    }
+}
+
+/// One peer's snap/1 connection: a stream of the frames to send, fed by `inbound`, the frames
+/// the peer sent, and by the commands [`Snap1::send`] queues. reth closes the connection when
+/// the stream ends, and the stream ends when `inbound` does.
+#[derive(Debug)]
+pub(crate) struct Connection<S> {
+    inbound: S,
+    commands: mpsc::UnboundedReceiver<Command>,
+    /// Callers waiting for a reply, by the request id chibi gave their request.
+    pending: HashMap<u64, Responder>,
+    /// Empty replies to the peer's requests, not yet sent.
+    replies: VecDeque<BytesMut>,
+    next_request: u64,
+    peer: PeerId,
+    serial: u64,
+    registry: Snap1,
+}
+
+impl<S> Connection<S> {
+    /// Handles a frame from the peer: queues the empty reply to a request, hands a response to
+    /// the caller waiting for its request id, and drops anything else.
+    fn receive(&mut self, frame: &[u8]) {
+        let Some((&id, body)) = frame.split_first() else {
+            return;
+        };
+        let (reply, lists) = match id {
+            GET_ACCOUNT_RANGE => (ACCOUNT_RANGE, 2),
+            GET_STORAGE_RANGES => (STORAGE_RANGES, 2),
+            GET_BYTE_CODES => (BYTE_CODES, 1),
+            GET_TRIE_NODES => (TRIE_NODES, 1),
+            _ => {
+                if let Some((request_id, response)) = response(id, body)
+                    && let Some(waiting) = self.pending.remove(&request_id)
+                {
+                    waiting.send(Ok(response)).ok();
+                }
+                return;
+            }
+        };
+        if let Some(request_id) = request_id(body) {
+            self.replies
+                .push_back(empty_reply(reply, request_id, lists));
+        }
+    }
+
+    /// Frames `command`'s request under the next request id and keeps its caller waiting.
+    fn request(&mut self, command: Command) -> Option<BytesMut> {
+        let Command { mut request, reply } = command;
+        let request_id = self.next_request;
+        let frame = match &mut request {
+            SnapProtocolMessage::GetAccountRange(message) => {
+                message.request_id = request_id;
+                frame(GET_ACCOUNT_RANGE, message)
+            }
+            SnapProtocolMessage::GetStorageRanges(message) => {
+                message.request_id = request_id;
+                frame(GET_STORAGE_RANGES, message)
+            }
+            SnapProtocolMessage::GetByteCodes(message) => {
+                message.request_id = request_id;
+                frame(GET_BYTE_CODES, message)
+            }
+            SnapProtocolMessage::GetBlockAccessLists(_)
+            | SnapProtocolMessage::AccountRange(_)
+            | SnapProtocolMessage::StorageRanges(_)
+            | SnapProtocolMessage::ByteCodes(_)
+            | SnapProtocolMessage::BlockAccessLists(_) => {
+                reply.send(Err(RequestError::UnsupportedCapability)).ok();
+                return None;
+            }
+        };
+        self.next_request = request_id.wrapping_add(1);
+        self.pending.insert(request_id, reply);
+        Some(frame)
+    }
+}
+
+impl<S: Stream<Item = BytesMut> + Unpin> Stream for Connection<S> {
+    type Item = BytesMut;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<BytesMut>> {
+        let this = self.get_mut();
+        loop {
+            match this.inbound.poll_next_unpin(cx) {
+                Poll::Ready(Some(frame)) => this.receive(&frame),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => break,
+            }
+        }
+        if let Some(reply) = this.replies.pop_front() {
+            return Poll::Ready(Some(reply));
+        }
+        this.pending
+            .retain(|_, waiting| waiting.poll_closed(cx).is_pending());
+        while let Poll::Ready(Some(command)) = this.commands.poll_recv(cx) {
+            if let Some(frame) = this.request(command) {
+                return Poll::Ready(Some(frame));
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl<S> Drop for Connection<S> {
+    fn drop(&mut self) {
+        let mut connections = self.registry.connections.lock();
+        if connections
+            .get(&self.peer)
+            .is_some_and(|registered| registered.serial == self.serial)
+        {
+            connections.remove(&self.peer);
+        }
+        drop(connections);
+        self.commands.close();
+        while let Ok(command) = self.commands.try_recv() {
+            command
+                .reply
+                .send(Err(RequestError::ConnectionDropped))
+                .ok();
+        }
+        for (_, waiting) in self.pending.drain() {
+            waiting.send(Err(RequestError::ConnectionDropped)).ok();
+        }
+    }
+}
+
+fn frame(id: u8, message: &impl Encodable) -> BytesMut {
+    let mut frame = BytesMut::with_capacity(1 + message.length());
+    frame.put_u8(id);
+    message.encode(&mut frame);
+    frame
+}
+
+/// The response a frame with message id `id` carries, with its request id, if it is a
+/// well-formed snap/1 response.
+fn response(id: u8, mut body: &[u8]) -> Option<(u64, SnapResponse)> {
+    match id {
+        ACCOUNT_RANGE => {
+            let message = AccountRangeMessage::decode(&mut body).ok()?;
+            Some((message.request_id, SnapResponse::AccountRange(message)))
+        }
+        STORAGE_RANGES => {
+            let message = StorageRangesMessage::decode(&mut body).ok()?;
+            Some((message.request_id, SnapResponse::StorageRanges(message)))
+        }
+        BYTE_CODES => {
+            let message = ByteCodesMessage::decode(&mut body).ok()?;
+            Some((message.request_id, SnapResponse::ByteCodes(message)))
+        }
+        _ => None,
+    }
+}
+
+/// The request id every snap request body starts with.
+fn request_id(mut body: &[u8]) -> Option<u64> {
+    Header::decode(&mut body)
+        .ok()
+        .filter(|header| header.list)?;
+    u64::decode(&mut body).ok()
+}
+
+/// The reply `id` to request `request_id` holding nothing: its request id and `lists` empty
+/// lists.
+fn empty_reply(id: u8, request_id: u64, lists: usize) -> BytesMut {
+    let header = Header {
+        list: true,
+        payload_length: request_id.length() + lists,
+    };
+    let mut frame = BytesMut::with_capacity(1 + header.length_with_payload());
+    frame.put_u8(id);
+    header.encode(&mut frame);
+    request_id.encode(&mut frame);
+    frame.put_bytes(EMPTY_LIST_CODE, lists);
+    frame
+}
 
 #[cfg(test)]
 mod tests {
@@ -98,7 +418,10 @@ mod tests {
         let _replies = [
             snap1.send(PEER, account_request()),
             snap1.send(PEER, account_request()),
-            snap1.send(PEER, SnapProtocolMessage::GetStorageRanges(storage_message(99))),
+            snap1.send(
+                PEER,
+                SnapProtocolMessage::GetStorageRanges(storage_message(99)),
+            ),
             snap1.send(PEER, SnapProtocolMessage::GetByteCodes(code_message(99))),
         ];
         let account_range = |request_id: u8| {
@@ -208,11 +531,24 @@ mod tests {
     fn every_inbound_request_gets_an_empty_reply_keeping_its_id() {
         let snap1 = Snap1::default();
         let (to_chibi, mut connection) = connect(&snap1);
-        let trie_nodes = [&[0x06, 0xe7, 0x0a, 0xa0][..], &[0x11; 32], &[0xc0, 0x83, 0x08, 0x00, 0x00]]
-            .concat();
-        receive(&to_chibi, &[&[0x00][..], &alloy_rlp::encode(account_message(7))].concat());
-        receive(&to_chibi, &[&[0x02][..], &alloy_rlp::encode(storage_message(8))].concat());
-        receive(&to_chibi, &[&[0x04][..], &alloy_rlp::encode(code_message(0x0102))].concat());
+        let trie_nodes = [
+            &[0x06, 0xe7, 0x0a, 0xa0][..],
+            &[0x11; 32],
+            &[0xc0, 0x83, 0x08, 0x00, 0x00],
+        ]
+        .concat();
+        receive(
+            &to_chibi,
+            &[&[0x00][..], &alloy_rlp::encode(account_message(7))].concat(),
+        );
+        receive(
+            &to_chibi,
+            &[&[0x02][..], &alloy_rlp::encode(storage_message(8))].concat(),
+        );
+        receive(
+            &to_chibi,
+            &[&[0x04][..], &alloy_rlp::encode(code_message(0x0102))].concat(),
+        );
         receive(&to_chibi, &trie_nodes);
 
         let replies = [
@@ -224,20 +560,29 @@ mod tests {
         assert_eq!(drain(&mut connection), replies);
         assert_eq!(
             [
-                frame(ACCOUNT_RANGE, &AccountRangeMessage {
-                    request_id: 7,
-                    accounts: Vec::new(),
-                    proof: Vec::new(),
-                }),
-                frame(STORAGE_RANGES, &StorageRangesMessage {
-                    request_id: 8,
-                    slots: Vec::new(),
-                    proof: Vec::new(),
-                }),
-                frame(BYTE_CODES, &ByteCodesMessage {
-                    request_id: 0x0102,
-                    codes: Vec::new(),
-                }),
+                frame(
+                    ACCOUNT_RANGE,
+                    &AccountRangeMessage {
+                        request_id: 7,
+                        accounts: Vec::new(),
+                        proof: Vec::new(),
+                    }
+                ),
+                frame(
+                    STORAGE_RANGES,
+                    &StorageRangesMessage {
+                        request_id: 8,
+                        slots: Vec::new(),
+                        proof: Vec::new(),
+                    }
+                ),
+                frame(
+                    BYTE_CODES,
+                    &ByteCodesMessage {
+                        request_id: 0x0102,
+                        codes: Vec::new(),
+                    }
+                ),
             ]
             .map(|frame| frame.to_vec()),
             replies[..3],

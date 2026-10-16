@@ -178,8 +178,8 @@ pub struct Session {
 /// Established sessions by peer.
 pub type Sessions = HashMap<PeerKey, Session>;
 
-/// A snap/2 reply as reth's session resolves it.
-type SnapReply = oneshot::Receiver<RequestResult<SnapResponse>>;
+/// A snap reply as the session resolves it.
+pub(crate) type SnapReply = oneshot::Receiver<RequestResult<SnapResponse>>;
 
 /// chibi's snap/2 requests in flight, by session.
 #[derive(Debug, Default)]

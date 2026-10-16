@@ -27,6 +27,7 @@ helios-core.workspace = true
 helios-consensus-core.workspace = true
 
 reth-chainspec.workspace = true
+reth-eth-wire.workspace = true
 reth-eth-wire-types.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-network.workspace = true

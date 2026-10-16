@@ -35,6 +35,7 @@ helios-core = { git = "https://github.com/a16z/helios", rev = "68e3d07c7ca7a7313
 helios-consensus-core = { git = "https://github.com/a16z/helios", rev = "68e3d07c7ca7a731334004e461a87b695b451e16" }
 
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "7a5c817ab841b8b5ceea6dccb4f100a4d973b9e0" }
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", rev = "7a5c817ab841b8b5ceea6dccb4f100a4d973b9e0" }
 reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", rev = "7a5c817ab841b8b5ceea6dccb4f100a4d973b9e0" }
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "7a5c817ab841b8b5ceea6dccb4f100a4d973b9e0" }
 reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "7a5c817ab841b8b5ceea6dccb4f100a4d973b9e0" }
