@@ -239,18 +239,20 @@ impl Session {
 /// Established sessions by peer.
 pub type Sessions = HashMap<PeerKey, Session>;
 
-/// Waits until `sessions` changes or one of its snap/1 sessions settles, which changes what
-/// [`Session::serving`] returns without changing the sessions. Fails once the sender is gone.
+/// Waits until `sessions` changes or one of its snap/1 sessions unsettled at `checked`, the
+/// instant [`Session::serving`] was last asked, settles, which changes what that returns
+/// without changing the sessions. Returns at once when such a session settled since
+/// `checked`. Fails once the sender is gone.
 pub async fn sessions_changed(
     sessions: &mut watch::Receiver<Sessions>,
+    checked: Instant,
 ) -> Result<(), watch::error::RecvError> {
-    let now = Instant::now();
     let settles = sessions
         .borrow()
         .values()
         .filter(|session| session.snap == Some(Snap::V1))
         .map(|session| session.since + SNAP1_SETTLE)
-        .filter(|at| *at > now)
+        .filter(|at| *at > checked)
         .min();
     match settles {
         Some(at) => tokio::select! {
@@ -336,7 +338,7 @@ impl SnapLoad {
             }
             tokio::select! {
                 () = released => {}
-                changed = sessions_changed(sessions) => changed.map_err(|_| NetError::Stopped)?,
+                changed = sessions_changed(sessions, now) => changed.map_err(|_| NetError::Stopped)?,
             }
         }
     }

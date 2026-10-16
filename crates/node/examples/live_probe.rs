@@ -74,8 +74,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     let mut sessions = net.sessions();
     let found = tokio::time::timeout(SNAP_PEER_WAIT, async {
-        while state_peers(&sessions.borrow_and_update()) == 0 {
-            sessions_changed(&mut sessions).await?;
+        loop {
+            let now = Instant::now();
+            if state_peers(&sessions.borrow_and_update(), now) > 0 {
+                break;
+            }
+            sessions_changed(&mut sessions, now).await?;
         }
         Ok::<_, RecvError>(())
     })
@@ -185,9 +189,8 @@ async fn fetch_header(
     Err("no peer served the attested header".into())
 }
 
-/// The sessions serving a snap version now.
-fn state_peers(sessions: &Sessions) -> usize {
-    let now = Instant::now();
+/// The sessions serving a snap version at `now`.
+fn state_peers(sessions: &Sessions, now: Instant) -> usize {
     sessions
         .values()
         .filter(|session| session.serving(now).is_some())
@@ -205,7 +208,7 @@ fn log_sessions(sessions: &Sessions) {
     }
     info!(
         peers = sessions.len(),
-        state_peers = state_peers(sessions),
+        state_peers = state_peers(sessions, now),
         ?clients,
         "sessions (client: (peers, state peers))"
     );

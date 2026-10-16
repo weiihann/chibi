@@ -475,8 +475,8 @@ async fn wait_for_state_peer(
     let started = tokio::time::Instant::now();
     let mut logged: Option<tokio::time::Instant> = None;
     loop {
+        let now = tokio::time::Instant::now();
         let (peers, state_peers) = {
-            let now = tokio::time::Instant::now();
             let sessions = sessions.borrow_and_update();
             let state_peers = sessions
                 .values()
@@ -506,7 +506,7 @@ async fn wait_for_state_peer(
             elapsed,
         });
         if let Ok(Err(_)) =
-            tokio::time::timeout(STATE_PEER_PROGRESS, sessions_changed(&mut sessions)).await
+            tokio::time::timeout(STATE_PEER_PROGRESS, sessions_changed(&mut sessions, now)).await
         {
             return Err(NodeError::Net(NetError::Stopped));
         }
