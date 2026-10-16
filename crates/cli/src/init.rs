@@ -516,7 +516,7 @@ fn write_next_steps<W: Write>(
     writeln!(output, "Next steps:")?;
     writeln!(
         output,
-        "  1. Start chibi with `chibi run{flag}` (foreground) or `chibi run -b{flag}` (background)."
+        "  1. Start chibi with `chibi node{flag}` (foreground) or `chibi node -b{flag}` (background)."
     )?;
     writeln!(
         output,
@@ -1046,7 +1046,7 @@ mod tests {
                  kept 1 [[contracts]] entry from the existing config\n\
                  \n\
                  Next steps:\n\
-                 \x20 1. Start chibi with `chibi run` (foreground) or `chibi run -b` (background).\n\
+                 \x20 1. Start chibi with `chibi node` (foreground) or `chibi node -b` (background).\n\
                  \x20 2. In your wallet, add a custom network with RPC URL http://127.0.0.1:8545 and chain id 11155111.\n\
                  \x20 3. Check on it with `chibi status`; stop it with `chibi stop`.\n",
                 path.display(),
@@ -1092,7 +1092,7 @@ mod tests {
             "wrote /cfg/config.toml (sepolia, 1 address)\n\
              \n\
              Next steps:\n\
-             \x20 1. Start chibi with `chibi run` (foreground) or `chibi run -b` (background).\n\
+             \x20 1. Start chibi with `chibi node` (foreground) or `chibi node -b` (background).\n\
              \x20 2. In your wallet, add a custom network with RPC URL http://chibi.local:8745 and chain id 11155111.\n\
              \x20 3. Check on it with `chibi status`; stop it with `chibi stop`.\n"
         );
@@ -1117,7 +1117,7 @@ mod tests {
             "wrote /tmp/c.toml (mainnet, 2 addresses)\n\
              \n\
              Next steps:\n\
-             \x20 1. Start chibi with `chibi run --config /tmp/c.toml` (foreground) or `chibi run -b --config /tmp/c.toml` (background).\n\
+             \x20 1. Start chibi with `chibi node --config /tmp/c.toml` (foreground) or `chibi node -b --config /tmp/c.toml` (background).\n\
              \x20 2. In your wallet, add a custom network with RPC URL http://127.0.0.1:8545 and chain id 1.\n\
              \x20 3. Check on it with `chibi status --config /tmp/c.toml`; stop it with `chibi stop --config /tmp/c.toml`.\n"
         );

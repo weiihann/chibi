@@ -1,4 +1,4 @@
-//! `chibi run --tui`: the node runs in-process, JSON-RPC keeps serving the wallet, and a
+//! `chibi wallet`: the node runs in-process, JSON-RPC keeps serving the wallet, and a
 //! terminal UI sends ETH or a registry token from the user's keystore while a state peer is
 //! connected.
 
@@ -53,7 +53,7 @@ const RESTORE_WAIT: Duration = Duration::from_millis(500);
 /// How often [`join_within`] checks whether its thread has ended.
 const JOIN_POLL: Duration = Duration::from_millis(10);
 
-/// The last [`LOG_LINES`] log lines. Under `--tui` the tracing subscriber writes here
+/// The last [`LOG_LINES`] log lines. Under `chibi wallet` the tracing subscriber writes here
 /// instead of stdout, which the UI owns.
 #[derive(Clone, Debug, Default)]
 pub struct LogBuffer(Arc<Mutex<VecDeque<String>>>);

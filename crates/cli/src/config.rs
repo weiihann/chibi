@@ -89,13 +89,13 @@ pub struct Config {
         serialize_with = "serialize_contracts"
     )]
     pub contracts: Vec<TrackedContract>,
-    /// Absolute path of the encrypted keystore `chibi run --tui` sends from.
+    /// Absolute path of the encrypted keystore `chibi wallet` sends from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keystore: Option<PathBuf>,
 }
 
 /// Config keys given on the command line: `chibi init` writes them into the config, and
-/// `chibi run` overrides the config with them for that run.
+/// `chibi node` and `chibi wallet` override the config with them for that run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Args)]
 pub struct ConfigArgs {
     /// Beacon (consensus) API the light client reads sync-committee updates from, instead of
@@ -127,7 +127,7 @@ pub struct ConfigArgs {
     /// Run no peer discovery; dial only the trusted and built-in peers.
     #[arg(long)]
     pub disable_discovery: bool,
-    /// Encrypted JSON keystore `chibi run --tui` sends from.
+    /// Encrypted JSON keystore `chibi wallet` sends from.
     #[arg(long, value_name = "PATH", value_parser = absolute_path)]
     pub keystore: Option<PathBuf>,
 }
@@ -460,7 +460,7 @@ impl Config {
 }
 
 impl Default for Config {
-    /// Sepolia on 127.0.0.1:8545 with nothing pinned: what `chibi run` uses without a file.
+    /// Sepolia on 127.0.0.1:8545 with nothing pinned: what `chibi node` uses without a file.
     fn default() -> Self {
         Self::new(Network::default(), Vec::new())
     }

@@ -1,4 +1,4 @@
-//! `chibi run` in the foreground or background, and `chibi stop`.
+//! `chibi node` in the foreground or background, `chibi wallet`, and `chibi stop`.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -33,7 +33,7 @@ use crate::tui::{self, LogBuffer, Wallet, transfer};
 /// The background chibi's log, in its data directory.
 pub const LOG_FILE: &str = "chibi.log";
 
-/// How long `run -b` watches the child for an early exit before reporting it started.
+/// How long `node -b` watches the child for an early exit before reporting it started.
 const START_GRACE: Duration = Duration::from_secs(2);
 /// How long `stop` waits for the data directory's lock to be released.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -63,9 +63,9 @@ pub const STARTING: Startup = Startup::Waiting {
     elapsed: Duration::ZERO,
 };
 
-/// `chibi run` flags.
+/// The config overrides `chibi node` and `chibi wallet` take, for that run only.
 #[derive(Debug, Default, Args)]
-pub struct RunArgs {
+pub struct Overrides {
     /// Network to follow instead of the configured one.
     #[arg(long)]
     pub network: Option<Network>,
@@ -77,18 +77,28 @@ pub struct RunArgs {
     pub rpc_port: Option<NonZeroU16>,
     #[command(flatten)]
     pub keys: ConfigArgs,
+}
+
+/// `chibi node` flags.
+#[derive(Debug, Default, Args)]
+pub struct NodeArgs {
+    #[command(flatten)]
+    pub overrides: Overrides,
     /// Run in the background, logging to chibi.log in the data directory.
     #[arg(short = 'b', long)]
     pub background: bool,
     /// Set on the child that `--background` starts.
     #[arg(long, hide = true, conflicts_with = "background")]
     pub detached: bool,
-    /// Open the terminal UI: send ETH or a registry token from your keystore while JSON-RPC
-    /// keeps serving the wallet.
-    #[arg(long, conflicts_with_all = ["background", "detached"])]
-    pub tui: bool,
-    /// Start the terminal UI with the log pane open.
-    #[arg(long, requires = "tui")]
+}
+
+/// `chibi wallet` flags.
+#[derive(Debug, Default, Args)]
+pub struct WalletArgs {
+    #[command(flatten)]
+    pub overrides: Overrides,
+    /// Start with the log pane open.
+    #[arg(long)]
     pub logs: bool,
 }
 
@@ -109,7 +119,7 @@ pub fn config(path: &Path, named: bool) -> eyre::Result<Config> {
 }
 
 /// [`config`] with the command-line overrides applied.
-pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
+pub fn load(path: &Path, named: bool, args: &Overrides) -> eyre::Result<Config> {
     let mut config = config(path, named)?;
     if let Some(network) = args.network {
         config.network = network;
@@ -125,7 +135,7 @@ pub fn load(path: &Path, named: bool, args: &RunArgs) -> eyre::Result<Config> {
     Ok(config)
 }
 
-/// Where `--tui` gets its key: the keystore the flag or the config names, which must be
+/// Where `chibi wallet` gets its key: the keystore the flag or the config names, which must be
 /// readable, else a wallet set up in the UI.
 pub fn tui_wallet(config: &Config) -> eyre::Result<Wallet> {
     match &config.keystore {
@@ -137,68 +147,73 @@ pub fn tui_wallet(config: &Config) -> eyre::Result<Wallet> {
     }
 }
 
-/// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`,
-/// or runs it under the terminal UI with `--tui`. `path` is absolute; `config_flag` is the
-/// config the user named, which must exist, repeated in hints and passed to the background
-/// child.
-pub fn run(args: &RunArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
-    let logs = args.tui.then(LogBuffer::default);
+/// Runs chibi until Ctrl-C or SIGTERM, or starts it in the background with `--background`.
+/// `path` is absolute; `config_flag` is the config the user named, which must exist, repeated
+/// in hints and passed to the background child.
+pub fn node(args: &NodeArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
     if !args.background {
-        let subscriber = tracing_subscriber::fmt().with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        );
-        match &logs {
-            Some(buffer) => subscriber
-                .with_ansi(false)
-                .with_writer(buffer.clone())
-                .init(),
-            None => subscriber.with_ansi(!args.detached).init(),
-        }
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .with_ansi(!args.detached)
+            .init();
     }
-    let config = load(path, config_flag.is_some(), args)?;
+    let config = load(path, config_flag.is_some(), &args.overrides)?;
     let data_dir = config.network_dir(config.network, process_env)?;
     if args.background {
-        return start_background(args, &config, &data_dir, config_flag);
+        return start_background(&args.overrides, &config, &data_dir, config_flag);
     }
-    let wallet = match &logs {
-        Some(_) => Some(tui_wallet(&config)?),
-        None => None,
-    };
-    let rpc_config = config.rpc()?;
-    let listener = rpc::bind(rpc_config.addr)?;
-    let served = Served {
-        rpc: rpc_config,
-        listener,
-        url: config.rpc_url(),
-    };
+    let served = Served::bind(&config)?;
     let node_config = config.node_config(data_dir);
     let runtime = tokio::runtime::Runtime::new()?;
-    let result = match (wallet, logs) {
-        (Some(wallet), Some(logs)) => tui::run(
-            &runtime,
+    let result = runtime.block_on(async {
+        let progress = watch::Sender::new(STARTING);
+        tokio::spawn(greet_state_peer(progress.subscribe()));
+        serve(
             node_config,
             served,
-            wallet,
-            path,
-            &logs,
-            args.logs,
-        ),
-        _ => runtime.block_on(async {
-            let progress = watch::Sender::new(STARTING);
-            tokio::spawn(greet_state_peer(progress.subscribe()));
-            serve(
-                node_config,
-                served,
-                args.detached,
-                progress,
-                shutdown_signal(),
-                |_| {},
-            )
-            .await
-        }),
-    };
+            args.detached,
+            progress,
+            shutdown_signal(),
+            |_| {},
+        )
+        .await
+    });
     runtime.shutdown_timeout(SHUTDOWN_GRACE);
     result
+}
+
+/// Runs chibi under the terminal UI, which owns the terminal, so the log goes to the UI's log
+/// pane. `path` is absolute, the config a new keystore or watched address is recorded in;
+/// `config_flag` is the config the user named, which must exist.
+pub fn wallet(args: &WalletArgs, path: &Path, config_flag: Option<&Path>) -> eyre::Result<()> {
+    let logs = LogBuffer::default();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .init();
+    let config = load(path, config_flag.is_some(), &args.overrides)?;
+    let data_dir = config.network_dir(config.network, process_env)?;
+    let wallet = tui_wallet(&config)?;
+    let served = Served::bind(&config)?;
+    let node_config = config.node_config(data_dir);
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = tui::run(
+        &runtime,
+        node_config,
+        served,
+        wallet,
+        path,
+        &logs,
+        args.logs,
+    );
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    result
+}
+
+/// `RUST_LOG`, else `info`.
+fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
 /// The JSON-RPC side of a run: its settings, its already bound socket, and the URL wallets use.
@@ -206,6 +221,19 @@ pub struct Served {
     rpc: RpcConfig,
     listener: TcpListener,
     url: String,
+}
+
+impl Served {
+    /// Binds the JSON-RPC socket `config` names.
+    fn bind(config: &Config) -> eyre::Result<Self> {
+        let rpc = config.rpc()?;
+        let listener = rpc::bind(rpc.addr)?;
+        Ok(Self {
+            rpc,
+            listener,
+            url: config.rpc_url(),
+        })
+    }
 }
 
 /// Starts the node, reporting on `progress`, and serves JSON-RPC until `shutdown` resolves
@@ -353,15 +381,15 @@ pub async fn shutdown_signal() -> io::Result<&'static str> {
 }
 
 /// The arguments for the detached child: the config the user named, as an absolute path so the
-/// child reads the same file whatever its working directory, and the same `run` flags plus
-/// `--detached`. Without a named config the child resolves the default path from the
+/// child reads the same file whatever its working directory, then `node --detached` and the
+/// same overrides. Without a named config the child resolves the default path from the
 /// environment it inherits.
-pub fn detached_args(args: &RunArgs, config_flag: Option<&Path>) -> Vec<OsString> {
+pub fn detached_args(args: &Overrides, config_flag: Option<&Path>) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     if let Some(path) = config_flag {
         argv.extend(["--config".into(), path.as_os_str().to_owned()]);
     }
-    argv.extend(["run".into(), "--detached".into()]);
+    argv.extend(["node".into(), "--detached".into()]);
     if let Some(network) = args.network {
         argv.extend(["--network".into(), network.name().into()]);
     }
@@ -375,9 +403,9 @@ pub fn detached_args(args: &RunArgs, config_flag: Option<&Path>) -> Vec<OsString
     argv
 }
 
-/// The `--config`, `--network` and `--data-dir` a `run` was given, for the `status` and `stop`
-/// it suggests.
-fn hint_flags(args: &RunArgs, config_flag: Option<&Path>) -> String {
+/// The `--config`, `--network` and `--data-dir` a `node` was given, for the `status` and
+/// `stop` it suggests.
+fn hint_flags(args: &Overrides, config_flag: Option<&Path>) -> String {
     let mut flags = String::new();
     if let Some(path) = config_flag {
         flags.push_str(&format!(" --config {}", path.display()));
@@ -392,7 +420,7 @@ fn hint_flags(args: &RunArgs, config_flag: Option<&Path>) -> String {
 }
 
 fn start_background(
-    args: &RunArgs,
+    args: &Overrides,
     config: &Config,
     data_dir: &Path,
     config_flag: Option<&Path>,
@@ -511,34 +539,26 @@ mod tests {
     }
 
     #[test]
-    fn detached_child_gets_the_named_config_and_repeats_the_run_flags() {
+    fn detached_child_gets_the_named_config_and_repeats_the_overrides() {
         let path = Path::new("/cfg/chibi.toml");
-        let background = RunArgs {
-            background: true,
-            ..RunArgs::default()
-        };
+        let plain = Overrides::default();
+        assert_eq!(strings(detached_args(&plain, None)), ["node", "--detached"]);
         assert_eq!(
-            strings(detached_args(&background, None)),
-            ["run", "--detached"]
+            strings(detached_args(&plain, Some(path))),
+            ["--config", "/cfg/chibi.toml", "node", "--detached"]
         );
-        assert_eq!(
-            strings(detached_args(&background, Some(path))),
-            ["--config", "/cfg/chibi.toml", "run", "--detached"]
-        );
-        let args = RunArgs {
+        let args = Overrides {
             network: Some(Network::Mainnet),
             rpc_host: Some("chibi.local".parse().unwrap()),
             rpc_port: NonZeroU16::new(8745),
             keys: keys("http://127.0.0.1:5052/", "/srv/chibi"),
-            background: true,
-            ..RunArgs::default()
         };
         assert_eq!(
             strings(detached_args(&args, Some(path))),
             [
                 "--config",
                 "/cfg/chibi.toml",
-                "run",
+                "node",
                 "--detached",
                 "--network",
                 "mainnet",
@@ -555,26 +575,25 @@ mod tests {
     }
 
     #[test]
-    fn detached_args_parse_back_to_the_same_run() {
+    fn detached_args_parse_back_to_the_same_node() {
         use clap::Parser;
 
-        let args = RunArgs {
+        let args = Overrides {
             network: Some(Network::Sepolia),
             rpc_host: Some("::1".parse().unwrap()),
             rpc_port: NonZeroU16::new(9545),
             keys: keys("https://beacon.example/", "/srv/chibi"),
-            background: true,
-            ..RunArgs::default()
         };
         let path = Path::new("/cfg/chibi.toml");
         for named in [Some(path), None] {
             let argv = std::iter::once(OsString::from("chibi")).chain(detached_args(&args, named));
             let cli = crate::Cli::try_parse_from(argv).unwrap();
             assert_eq!(cli.config.as_deref(), named);
-            let crate::Command::Run(parsed) = cli.command else {
-                panic!("detached args parse to a command other than run");
+            let crate::Command::Node(parsed) = cli.command else {
+                panic!("detached args parse to a command other than node");
             };
             assert!(parsed.detached && !parsed.background);
+            let parsed = parsed.overrides;
             assert_eq!(parsed.network, args.network);
             assert_eq!(parsed.rpc_host, args.rpc_host);
             assert_eq!(parsed.rpc_port, args.rpc_port);
@@ -590,16 +609,16 @@ mod tests {
     }
 
     #[test]
-    fn run_flags_override_the_config_for_that_run_only() {
+    fn overrides_change_the_config_for_that_run_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let text = "rpc_port = 9545\nbeacon_url = \"https://a.example/\"\ndata_dir = \"/srv/a\"\n";
         fs::write(&path, text).unwrap();
-        let args = RunArgs {
+        let args = Overrides {
             network: Some(Network::Mainnet),
             rpc_port: NonZeroU16::new(8745),
             keys: keys("http://127.0.0.1:5052/", "/srv/b"),
-            ..RunArgs::default()
+            ..Overrides::default()
         };
         let config = load(&path, true, &args).unwrap();
         assert_eq!(config.network, Network::Mainnet);
@@ -614,7 +633,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
 
-        let config = load(&path, true, &RunArgs::default()).unwrap();
+        let config = load(&path, true, &Overrides::default()).unwrap();
         assert_eq!(
             config.beacon_url.as_ref().map(Url::as_str),
             Some("https://a.example/")
@@ -633,12 +652,22 @@ mod tests {
         )
     }
 
-    fn run_args(argv: &[&str]) -> RunArgs {
+    fn node_overrides(argv: &[&str]) -> Overrides {
         use clap::Parser;
 
-        let argv = ["chibi", "run"].iter().chain(argv);
-        let crate::Command::Run(args) = crate::Cli::try_parse_from(argv).unwrap().command else {
-            panic!("run parsed to another command");
+        let argv = ["chibi", "node"].iter().chain(argv);
+        let crate::Command::Node(args) = crate::Cli::try_parse_from(argv).unwrap().command else {
+            panic!("node parsed to another command");
+        };
+        args.overrides
+    }
+
+    fn wallet_args(argv: &[&str]) -> WalletArgs {
+        use clap::Parser;
+
+        let argv = ["chibi", "wallet"].iter().chain(argv);
+        let crate::Command::Wallet(args) = crate::Cli::try_parse_from(argv).unwrap().command else {
+            panic!("wallet parsed to another command");
         };
         args
     }
@@ -655,7 +684,7 @@ mod tests {
         );
         fs::write(&path, text).unwrap();
         let record = |byte| enode(byte).parse().unwrap();
-        let args = run_args(&[
+        let args = node_overrides(&[
             "--trusted-peer",
             &enode(2),
             "--trusted-peer",
@@ -684,9 +713,9 @@ mod tests {
             .map(|arg| arg.into_string().unwrap())
             .collect::<Vec<_>>();
         let child: Vec<&str> = child.iter().skip(4).map(String::as_str).collect();
-        assert_eq!(run_args(&child).keys, args.keys);
+        assert_eq!(node_overrides(&child).keys, args.keys);
 
-        let plain = load(&path, true, &RunArgs::default()).unwrap();
+        let plain = load(&path, true, &Overrides::default()).unwrap();
         assert_eq!(plain.trusted_peers, vec![record(1)]);
         assert_eq!(plain.max_inbound_peers, Some(9));
         assert!(!plain.trusted_only && !plain.disable_discovery);
@@ -694,7 +723,7 @@ mod tests {
         fs::write(&path, "").unwrap();
         let error = format!(
             "{:#}",
-            load(&path, true, &run_args(&["--trusted-only"])).unwrap_err()
+            load(&path, true, &node_overrides(&["--trusted-only"])).unwrap_err()
         );
         assert!(error.contains("trusted_only = true needs"), "{error}");
         let error = format!(
@@ -702,7 +731,7 @@ mod tests {
             load(
                 &path,
                 true,
-                &run_args(&["--network", "mainnet", "--disable-discovery"])
+                &node_overrides(&["--network", "mainnet", "--disable-discovery"])
             )
             .unwrap_err()
         );
@@ -710,67 +739,61 @@ mod tests {
     }
 
     #[test]
-    fn the_keystore_comes_from_the_flag_or_the_config_and_without_one_the_tui_sets_one_up() {
+    fn the_keystore_comes_from_the_flag_or_the_config_and_without_one_the_wallet_sets_one_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let keystore = dir.path().join("a.json");
         fs::write(&keystore, "{}").unwrap();
         fs::write(&path, format!("keystore = {keystore:?}\n")).unwrap();
-        let config = load(&path, true, &run_args(&["--tui"])).unwrap();
+        let config = load(&path, true, &wallet_args(&[]).overrides).unwrap();
         assert_eq!(config.keystore, Some(keystore.clone()));
         assert_eq!(tui_wallet(&config).unwrap(), Wallet::Keystore(keystore));
 
-        let args = run_args(&["--tui", "--logs", "--keystore", "b.json"]);
-        assert!(args.tui && args.logs);
-        let config = load(&path, true, &args).unwrap();
+        let args = wallet_args(&["--logs", "--keystore", "b.json"]);
+        assert!(args.logs);
+        let config = load(&path, true, &args.overrides).unwrap();
         let flagged = config.keystore.clone().unwrap();
         assert!(flagged.is_absolute() && flagged.ends_with("b.json"));
         let error = tui_wallet(&config).unwrap_err().to_string();
         assert!(error.starts_with("cannot read the keystore"), "{error}");
 
         fs::write(&path, "").unwrap();
-        let config = load(&path, true, &run_args(&["--tui"])).unwrap();
+        let config = load(&path, true, &wallet_args(&[]).overrides).unwrap();
         assert_eq!(tui_wallet(&config).unwrap(), Wallet::Setup);
 
         fs::write(&path, "keystore = \"a.json\"\n").unwrap();
-        let error = format!("{:#}", load(&path, true, &RunArgs::default()).unwrap_err());
+        let error = format!(
+            "{:#}",
+            load(&path, true, &Overrides::default()).unwrap_err()
+        );
         assert!(
             error.contains("keystore a.json is not an absolute path"),
             "{error}"
         );
-
-        use clap::Parser;
-        for argv in [
-            &["chibi", "run", "--tui", "-b"][..],
-            &["chibi", "run", "--tui", "--background"],
-            &["chibi", "run", "--logs"],
-        ] {
-            assert!(crate::Cli::try_parse_from(argv).is_err(), "{argv:?}");
-        }
     }
 
     #[test]
     fn run_without_a_config_at_the_default_path_uses_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let config = load(&path, false, &RunArgs::default()).unwrap();
+        let config = load(&path, false, &Overrides::default()).unwrap();
         assert_eq!(config, Config::new(Network::Sepolia, Vec::new()));
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8545");
         assert!(config.contracts.is_empty());
         assert_eq!(config.data_dir, None);
         assert!(!path.exists());
 
-        let args = RunArgs {
+        let args = Overrides {
             network: Some(Network::Mainnet),
             rpc_port: NonZeroU16::new(8745),
-            ..RunArgs::default()
+            ..Overrides::default()
         };
         let config = load(&path, false, &args).unwrap();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.rpc_url(), "http://127.0.0.1:8745");
 
         fs::write(&path, "network = \"goerli\"\n").unwrap();
-        let error = load(&path, false, &RunArgs::default())
+        let error = load(&path, false, &Overrides::default())
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("invalid config "), "{error}");
@@ -780,7 +803,7 @@ mod tests {
     fn a_named_config_that_does_not_exist_is_an_error_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("typo.toml");
-        let error = load(&path, true, &RunArgs::default())
+        let error = load(&path, true, &Overrides::default())
             .unwrap_err()
             .to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
@@ -843,12 +866,11 @@ mod tests {
 
     #[test]
     fn hints_repeat_the_config_network_and_data_dir_flags() {
-        assert_eq!(hint_flags(&RunArgs::default(), None), "");
-        let args = RunArgs {
+        assert_eq!(hint_flags(&Overrides::default(), None), "");
+        let args = Overrides {
             network: Some(Network::Mainnet),
             keys: keys("http://127.0.0.1:5052/", "/srv/chibi"),
-            background: true,
-            ..RunArgs::default()
+            ..Overrides::default()
         };
         assert_eq!(
             hint_flags(&args, Some(Path::new("/cfg/chibi.toml"))),

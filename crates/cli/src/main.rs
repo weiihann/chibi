@@ -1,4 +1,4 @@
-//! The `chibi` binary: `init`, `run`, `stop`, and `status`.
+//! The `chibi` binary: `init`, `node`, `wallet`, `stop`, and `status`.
 
 #![allow(
     clippy::print_stdout,
@@ -28,7 +28,7 @@ use eyre::WrapErr;
 use crate::config::{absolute_path, default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::names::printable;
-use crate::run::RunArgs;
+use crate::run::{NodeArgs, WalletArgs};
 
 /// Decimal places of one ether.
 const ETH_DECIMALS: u8 = 18;
@@ -52,8 +52,10 @@ struct Cli {
 enum Command {
     /// Write the config file, asking for whatever the flags leave out.
     Init(InitArgs),
-    /// Follow the chain and serve JSON-RPC to the wallet.
-    Run(RunArgs),
+    /// Follow the chain and serve JSON-RPC to your browser wallet.
+    Node(NodeArgs),
+    /// Run the node under a terminal UI that sends ETH or tokens from your keystore.
+    Wallet(WalletArgs),
     /// Stop the chibi running in the background.
     Stop(Target),
     /// Show whether chibi runs and the balances saved at the last verified head.
@@ -76,7 +78,8 @@ fn main() -> eyre::Result<()> {
     let (path, named) = config_paths(cli.config, process_env)?;
     match cli.command {
         Command::Init(answers) => init::init(answers, &path, named.as_deref()),
-        Command::Run(args) => run::run(&args, &path, named.as_deref()),
+        Command::Node(args) => run::node(&args, &path, named.as_deref()),
+        Command::Wallet(args) => run::wallet(&args, &path, named.as_deref()),
         Command::Stop(target) => {
             let (network, dir) = target_dir(&target, &path, named.is_some())?;
             run::stop(network, &dir)
@@ -148,7 +151,7 @@ fn write_full_status<W: Write>(
         Some(snapshot) => write_status(output, snapshot, network.spec().tokens, unix_now()),
         None => writeln!(
             output,
-            "no snapshot for {network} yet; it is saved once `chibi run` verifies its first head"
+            "no snapshot for {network} yet; it is saved once `chibi node` or `chibi wallet` verifies its first head"
         ),
     }
 }
@@ -475,8 +478,8 @@ mod tests {
     #[test]
     fn config_is_accepted_before_or_after_the_subcommand() {
         for argv in [
-            ["chibi", "--config", "/c.toml", "run"],
-            ["chibi", "run", "--config", "/c.toml"],
+            ["chibi", "--config", "/c.toml", "node"],
+            ["chibi", "wallet", "--config", "/c.toml"],
             ["chibi", "status", "--config", "/c.toml"],
             ["chibi", "--config", "/c.toml", "init"],
         ] {
@@ -549,7 +552,7 @@ mod tests {
 
     #[test]
     fn peer_flags_are_checked_like_the_config() {
-        for command in ["init", "run"] {
+        for command in ["init", "node", "wallet"] {
             for (flag, value) in [
                 ("--trusted-peer", "enode://bad@10.0.0.1:30303"),
                 ("--boot-node", "10.0.0.1:30303"),
@@ -567,7 +570,7 @@ mod tests {
 
     #[test]
     fn beacon_url_and_data_dir_flags_are_checked_like_the_config() {
-        for command in ["init", "run"] {
+        for command in ["init", "node", "wallet"] {
             let cli = Cli::try_parse_from([
                 "chibi",
                 command,
@@ -579,7 +582,8 @@ mod tests {
             .unwrap();
             let keys = match cli.command {
                 Command::Init(args) => args.keys,
-                Command::Run(args) => args.keys,
+                Command::Node(args) => args.overrides.keys,
+                Command::Wallet(args) => args.overrides.keys,
                 Command::Stop(_) | Command::Status(_) => {
                     panic!("{command} parsed to another command")
                 }
