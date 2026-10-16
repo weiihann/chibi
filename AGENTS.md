@@ -48,7 +48,7 @@ Do not break these. A change that needs to is a design change: say so first.
 - Exactly one `Follower` exists, and only it advances or reanchors the store.
 - JSON-RPC opens only after `Node::start` anchors at a verified head.
 - Proof requests go to state peers: snap/2 sessions at once, snap/1 sessions once connected 3 s (`SNAP1_SETTLE`). BAL requests go only to snap/2, then eth/71, never snap/1.
-- chibi never contacts a third-party RPC, gateway or service at runtime. A public RPC is only a test oracle. chibi never follows CCIP-read.
+- chibi never contacts a third-party RPC or gateway and never follows CCIP-read. It has two outside dependencies: the beacon API (`beacon_url`, a public default) for sync-committee data and, on the first run without `checkpoint`, a public checkpoint service. A public RPC is only a test oracle.
 - The TUI's `View` never holds a password or a typed secret: they are masked before the view is built. The only secret it carries is a new recovery phrase on the Backup screen.
 - Sepolia first. Mainnet is untested, and sending on mainnet stays disabled.
 

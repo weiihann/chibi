@@ -56,9 +56,11 @@ unsupported() {
 
 download() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https,file' --tlsv1.2 -fsSL -o "$2" "$1"
+        curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$2" "$1"
+    elif [ "$scheme" = file ]; then
+        err "file:// URLs need curl, which is not installed"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1"
+        wget -q --https-only --max-redirect=5 -O "$2" "$1"
     else
         err "this script needs curl or wget"
     fi
@@ -81,11 +83,17 @@ elif [ -n "${CHIBI_VERSION:-}" ]; then
 else
     base_url="$repo_url/releases/latest/download"
 fi
+case "$base_url" in
+https://*) scheme="https" ;;
+file://*) scheme="file" ;;
+*) err "release URL must start with https:// (or file:// for testing): $base_url" ;;
+esac
 install_dir=${CHIBI_INSTALL_DIR:-$HOME/.local/bin}
 asset="chibi-$target.tar.gz"
 
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t chibi)
-trap 'rm -rf "$tmp"' EXIT
+stage=
+trap 'rm -rf "$tmp"; [ -z "$stage" ] || rm -f "$stage"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -94,7 +102,16 @@ download "$base_url/$asset" "$tmp/$asset" || err "could not download $base_url/$
 download "$base_url/$asset.sha256" "$tmp/$asset.sha256" ||
     err "could not download $base_url/$asset.sha256"
 
-expected=$(cut -d ' ' -f 1 <"$tmp/$asset.sha256")
+malformed() { err "checksum file for $asset is malformed"; }
+[ "$(wc -l <"$tmp/$asset.sha256")" -le 1 ] || malformed
+record=$(cat "$tmp/$asset.sha256")
+expected=${record%% *}
+case "${record#"$expected"}" in
+"  $asset" | " *$asset") ;;
+*) malformed ;;
+esac
+[ "${#expected}" -eq 64 ] || malformed
+case "$expected" in *[!0-9a-f]*) malformed ;; esac
 actual=$(sha256 "$tmp/$asset")
 if [ "$expected" != "$actual" ]; then
     {
@@ -112,10 +129,12 @@ tar -xzf "$tmp/$asset" -C "$tmp/unpack"
 [ -f "$tmp/unpack/chibi" ] || err "$asset does not contain chibi"
 
 mkdir -p "$install_dir"
-# Copy then rename, so a running chibi is never overwritten in place.
-cp "$tmp/unpack/chibi" "$install_dir/.chibi.new"
-chmod 0755 "$install_dir/.chibi.new"
-mv -f "$install_dir/.chibi.new" "$install_dir/chibi"
+# Stage then rename, so a running chibi is never overwritten in place.
+stage=$(mktemp "$install_dir/.chibi.XXXXXX")
+cp "$tmp/unpack/chibi" "$stage"
+chmod 0755 "$stage"
+mv -f "$stage" "$install_dir/chibi"
+stage=
 
 echo
 echo "Installed $("$install_dir/chibi" --version) to $install_dir/chibi"
