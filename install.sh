@@ -1,30 +1,136 @@
 #!/bin/sh
-# Installs chibi from this checkout and writes its config. It does not start chibi.
+# Installs the chibi binary from a GitHub release. It does not run chibi.
+#
+#   curl -fsSL https://raw.githubusercontent.com/weiihann/chibi/main/install.sh | sh
+#
+# CHIBI_VERSION      release tag to install, such as v0.1.0 (default: the latest release)
+# CHIBI_INSTALL_DIR  where to put chibi (default: $HOME/.local/bin)
+# CHIBI_RELEASE_URL  where to download the release files from; accepts file:// URLs
 set -eu
 
-repo=$(cd "$(dirname "$0")" && pwd)
+repo_url="https://github.com/weiihann/chibi"
+from_source="cargo install --locked --git $repo_url chibi"
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "cargo not found. Install Rust first:" >&2
-    echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+err() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+detect_target() {
+    os=$(uname -s)
+    arch=$(uname -m)
+    case "$os" in
+        Linux)
+            case "$arch" in
+                x86_64 | amd64) echo x86_64-unknown-linux-gnu ;;
+                aarch64 | arm64) echo aarch64-unknown-linux-gnu ;;
+                *) unsupported ;;
+            esac
+            ;;
+        Darwin)
+            case "$arch" in
+                x86_64)
+                    # A shell under Rosetta reports x86_64 on Apple silicon.
+                    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+                        echo aarch64-apple-darwin
+                    else
+                        echo x86_64-apple-darwin
+                    fi
+                    ;;
+                arm64 | aarch64) echo aarch64-apple-darwin ;;
+                *) unsupported ;;
+            esac
+            ;;
+        *) unsupported ;;
+    esac
+}
+
+unsupported() {
+    {
+        echo "error: there is no prebuilt chibi for $os $arch."
+        echo "Build it from source instead (needs Rust, https://rustup.rs):"
+        echo "  $from_source"
+    } >&2
+    exit 1
+}
+
+download() {
+    if command -v curl >/dev/null 2>&1; then
+        curl --proto '=https,file' --tlsv1.2 -fsSL -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        err "this script needs curl or wget"
+    fi
+}
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+else
+    err "this script needs sha256sum or shasum to check the download"
+fi
+
+target=$(detect_target)
+
+if [ -n "${CHIBI_RELEASE_URL:-}" ]; then
+    base_url=${CHIBI_RELEASE_URL%/}
+elif [ -n "${CHIBI_VERSION:-}" ]; then
+    base_url="$repo_url/releases/download/$CHIBI_VERSION"
+else
+    base_url="$repo_url/releases/latest/download"
+fi
+install_dir=${CHIBI_INSTALL_DIR:-$HOME/.local/bin}
+asset="chibi-$target.tar.gz"
+
+tmp=$(mktemp -d 2>/dev/null || mktemp -d -t chibi)
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "Downloading $base_url/$asset"
+download "$base_url/$asset" "$tmp/$asset" || err "could not download $base_url/$asset"
+download "$base_url/$asset.sha256" "$tmp/$asset.sha256" ||
+    err "could not download $base_url/$asset.sha256"
+
+expected=$(cut -d ' ' -f 1 <"$tmp/$asset.sha256")
+actual=$(sha256 "$tmp/$asset")
+if [ "$expected" != "$actual" ]; then
+    {
+        echo "error: checksum mismatch for $asset"
+        echo "  expected $expected"
+        echo "  got      $actual"
+        echo "Nothing was installed."
+    } >&2
     exit 1
 fi
+echo "Checksum OK ($actual)"
 
-cargo install --locked --path "$repo/crates/cli"
-# cargo's bin directory may not be on PATH yet right after a fresh rustup install.
-bin="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+mkdir -p "$tmp/unpack"
+tar -xzf "$tmp/$asset" -C "$tmp/unpack"
+[ -f "$tmp/unpack/chibi" ] || err "$asset does not contain chibi"
+
+mkdir -p "$install_dir"
+# Copy then rename, so a running chibi is never overwritten in place.
+cp "$tmp/unpack/chibi" "$install_dir/.chibi.new"
+chmod 0755 "$install_dir/.chibi.new"
+mv -f "$install_dir/.chibi.new" "$install_dir/chibi"
 
 echo
-if [ -t 0 ]; then
-    "$bin/chibi" init
-else
-    echo "Input is not a terminal, so \`chibi init\` was not run. chibi runs on the defaults without a config; run \`chibi init\` to choose others."
-fi
+echo "Installed $("$install_dir/chibi" --version) to $install_dir/chibi"
+
+case ":${PATH:-}:" in
+    *":$install_dir:"*) ;;
+    *)
+        echo
+        echo "$install_dir is not on your PATH. Add it, for example:"
+        echo "  export PATH=\"$install_dir:\$PATH\""
+        ;;
+esac
 
 echo
-if ! command -v chibi >/dev/null 2>&1; then
-    echo "Add $bin to your PATH to use the commands below."
-fi
-echo "Start chibi:      chibi node      (foreground; Ctrl-C stops it)"
-echo "              or  chibi node -b   (background; \`chibi stop\` stops it)"
-echo "Check on chibi:   chibi status"
+echo "Next steps:"
+echo "  chibi init      write the config (optional; chibi runs on the defaults without one)"
+echo "  chibi node      follow the chain and serve JSON-RPC to your browser wallet"
+echo "  chibi wallet    run the node under a terminal UI that sends from your keystore"

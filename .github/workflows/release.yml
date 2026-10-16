@@ -1,0 +1,139 @@
+# A pushed v* tag builds every target and publishes a GitHub release.
+# A manual run builds every target and keeps the archives as workflow artifacts only.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            builder: cargo
+            smoke: run
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            builder: cross
+            smoke: file
+            arch: "ARM aarch64"
+          - target: aarch64-apple-darwin
+            os: macos-14
+            builder: cargo
+            smoke: run
+          - target: x86_64-apple-darwin
+            os: macos-14
+            builder: cargo
+            smoke: file
+            arch: "Mach-O 64-bit executable x86_64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --target "${{ matrix.target }}"
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build
+        run: ${{ matrix.builder }} build --release --locked -p chibi --target "${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          name="chibi-$TARGET"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage" dist
+          cp "target/$TARGET/release/chibi" LICENSE-MIT LICENSE-APACHE "$stage/"
+          tar -czf "dist/$name.tar.gz" -C "$stage" chibi LICENSE-MIT LICENSE-APACHE
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          cat "$name.tar.gz.sha256"
+
+      - name: Smoke test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SMOKE: ${{ matrix.smoke }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          check="$RUNNER_TEMP/check"
+          mkdir -p "$check"
+          tar -xzf "dist/chibi-$TARGET.tar.gz" -C "$check"
+          cd "$check"
+          ls -l
+          if [ "$SMOKE" = run ]; then
+            ./chibi --version
+            ./chibi --help
+          else
+            file chibi
+            file chibi | grep -F "$ARCH"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chibi-${{ matrix.target }}
+          path: |
+            dist/chibi-${{ matrix.target }}.tar.gz
+            dist/chibi-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chibi-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          test "$(ls dist/*.tar.gz | wc -l)" -eq 4
+          test "$(ls dist/*.tar.gz.sha256 | wc -l)" -eq 4
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            dist/*.tar.gz dist/*.tar.gz.sha256
