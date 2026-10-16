@@ -1,62 +1,76 @@
-# chibi
+<h1 align="center">chibi</h1>
 
-chibi is a light Ethereum node that runs on your machine and serves your browser wallet's JSON-RPC. Every balance, call result and receipt it serves is proven against block headers a light client verified, using proofs from ordinary Ethereum peers, so you need no RPC provider and do not have to trust one. It also comes with a terminal wallet.
+<p align="center"><b>A partial stateful Ethereum node.</b><br>
+Sync the state you use in minutes. Transact through your own local RPC. Trust no provider.</p>
 
-## Install
+<p align="center">
+  <a href="https://github.com/weiihann/chibi/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/weiihann/chibi"></a>
+  <img alt="platforms" src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-blue">
+  <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green"></a>
+</p>
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/weiihann/chibi/main/install.sh | sh
+chibi node
 ```
 
-The script installs a prebuilt `chibi` for Linux (x86_64, arm64) or macOS (Intel, Apple silicon) into `~/.local/bin`. Set `CHIBI_INSTALL_DIR` to install somewhere else.
+Point your wallet at `http://127.0.0.1:8545`, chain id `11155111`. That's it.
 
-To build from source instead, install Rust with [rustup](https://rustup.rs) and run:
+## Why chibi
 
-```sh
-git clone https://github.com/weiihann/chibi
-cd chibi
-cargo install --locked --path crates/cli
-```
+A full node holds all of Ethereum's state and takes days to sync. An RPC provider answers at once, but you have to trust its answers. chibi holds only the accounts and storage your wallet uses, proves every value, and keeps it current block by block.
 
-## Quick start
+| | Full node | RPC provider | chibi |
+|---|---|---|---|
+| Ready to serve | days | instantly | **in minutes** |
+| State on disk | the whole chain | none | **kilobytes** |
+| Checks the answers | yes, by re-executing | no | **yes, every value by proof** |
 
-```sh
-chibi init     # choose the network, the addresses to watch, and the RPC host and port
-chibi node     # start chibi; Ctrl-C stops it
-```
+From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs. A chibi that had run for days kept 36 KB in its data directory.
 
-When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network to your wallet with RPC URL `http://127.0.0.1:8545` and chain id `11155111` (Sepolia). The first start can take a few minutes while chibi finds a peer that serves state.
+## What you get
 
-To send from the terminal instead, run `chibi wallet`. The first time, it helps you create a wallet, import one, or use an existing keystore. JSON-RPC keeps serving while it runs.
+- **A local RPC for any wallet.** Balances, `eth_call`, gas estimates, sends and receipts, served from proven state.
+- **Every value proven.** Account and storage proofs from Ethereum peers, checked against headers a light client verified.
+- **Current every block.** Block access lists (EIP-7928) update the state you hold without re-executing anything.
+- **Direct sends.** Signed transactions go straight to Ethereum peers, and their receipts are proven too.
+- **A terminal wallet.** `chibi wallet` sends ETH and tokens, resolves ENS names, watches balances read-only, and has cats.
 
 ## Commands
 
-| Command | What it does |
+| Command | |
 |---|---|
-| `chibi init` | Write the config, asking for whatever the flags leave out |
-| `chibi node` | Follow the chain and serve JSON-RPC to your wallet; `-b` runs it in the background |
-| `chibi wallet` | Run the node under a terminal UI that sends ETH or tokens from your keystore |
-| `chibi status` | Show whether chibi runs and the balances saved at the last verified head |
-| `chibi stop` | Stop the chibi running in the background |
+| `chibi init` | Choose the network, the addresses to watch, and the RPC host and port (optional) |
+| `chibi node` | Sync and serve JSON-RPC; `-b` runs it in the background |
+| `chibi wallet` | The same node under a terminal wallet |
+| `chibi status` | Whether chibi runs, and the last proven balances |
+| `chibi stop` | Stop a background chibi |
 
-Run `chibi <command> --help` for every option.
+`chibi <command> --help` lists every option. The config lives in `~/.config/chibi/`, the data in `~/.local/share/chibi/<network>/`.
 
-## Files
+<details>
+<summary>Other ways to install</summary>
 
-- Config: `~/.config/chibi/config.toml`, or `$XDG_CONFIG_HOME/chibi/config.toml` when that is set. `--config PATH` or `CHIBI_CONFIG` picks another file.
-- Data: `~/.local/share/chibi/<network>/`, or `$XDG_DATA_HOME/chibi/<network>/` when that is set, or under `data_dir` from the config. It holds the light-client checkpoint, the devp2p key, `chibi.db`, and `chibi.log` for a background chibi.
-- Keystores that `chibi wallet` creates go in `keystores/` next to the config file.
+The script installs a prebuilt binary for Linux (x86_64, arm64) or macOS (Intel, Apple silicon) into `~/.local/bin`. `CHIBI_INSTALL_DIR` picks another directory and `CHIBI_VERSION` (such as `v0.1.0`) a release.
+
+From source, with [Rust](https://rustup.rs):
+
+```sh
+cargo install --locked --git https://github.com/weiihann/chibi chibi
+```
+
+</details>
 
 ## Trust model
 
-- **Proven:** every account, balance, nonce, code, storage value and receipt chibi serves is checked against a header whose hash the light client verified. A lying peer can stall chibi but cannot make it serve a wrong value.
-- **Trusted:** the Ethereum sync committee, read through a beacon API (`beacon_url`, with a public default per network). On the first run a public checkpoint service picks the light client's starting checkpoint, unless you set `checkpoint` in the config.
-- **Seen by peers:** the peers that serve proofs see which accounts and contracts you query, and the network sees the transactions you send. To keep queries to your own node, list it in `trusted_peers` and set `trusted_only = true`.
+- **Proven:** every account, balance, nonce, code, storage value and receipt is checked against a header whose hash the light client verified. A lying peer can stall chibi but cannot make it serve a wrong value.
+- **Trusted:** the Ethereum sync committee, read through a beacon API (`beacon_url`, with a public default). On the first run a public checkpoint service picks the starting checkpoint unless you set `checkpoint`.
+- **Seen by peers:** the peers that serve proofs see which accounts you query, and the network sees what you send. Add your own node to `trusted_peers` with `trusted_only = true` to keep queries private.
 
 ## Status
 
-chibi is early software. It targets Sepolia first. Mainnet support is in the code but untested, and `chibi wallet` does not send on mainnet.
+Early software, Sepolia first. Mainnet support is in the code but untested, and `chibi wallet` does not send on mainnet.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
