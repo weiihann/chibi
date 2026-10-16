@@ -1101,7 +1101,7 @@ impl App {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         let tab = key.code == KeyCode::Tab;
-        let key = Key::of(key.code);
+        let key = Key::of(key);
         if self.screen == Screen::Unlock {
             return self.unlock_key(key, ctrl_c, tab);
         }
@@ -1158,7 +1158,14 @@ impl App {
             Key::Down => {
                 self.watch_first = (self.watch_first + 1).min(self.watched.len().saturating_sub(1));
             }
-            Key::Char(_) | Key::Backspace | Key::Enter | Key::Esc | Key::Left | Key::Right => {}
+            Key::Char(_)
+            | Key::Backspace
+            | Key::EraseWord
+            | Key::EraseAll
+            | Key::Enter
+            | Key::Esc
+            | Key::Left
+            | Key::Right => {}
         }
     }
 
@@ -1178,19 +1185,16 @@ impl App {
         if tab {
             return self.watch();
         }
-        match key? {
-            Key::Char(c) if self.password.len() + c.len_utf8() <= PASSWORD_BYTES => {
-                self.password.push(c);
-            }
-            Key::Backspace => erase_last(&mut self.password),
-            Key::Enter if !self.password.is_empty() => {
-                self.unlocking = true;
-                return Some(Action::Unlock);
-            }
-            Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {
-            }
+        let key = key?;
+        if key != Key::Enter {
+            edit(&mut self.password, key, |_| true, PASSWORD_BYTES);
+            return None;
         }
-        None
+        if self.password.is_empty() {
+            return None;
+        }
+        self.unlocking = true;
+        Some(Action::Unlock)
     }
 
     fn setup_key(&mut self, key: Option<Key>, ctrl_c: bool) -> Option<Action> {
@@ -1255,23 +1259,22 @@ impl App {
     }
 
     fn watch_address_key(&mut self, key: Key) -> Option<Action> {
-        match key {
-            Key::Char(c) => self.setup.address.push(c),
-            Key::Backspace => {
-                self.setup.address.pop();
-            }
-            Key::Enter => match parse_watched(&self.setup.address) {
-                Ok(address) => {
-                    self.setup.discard();
-                    self.watched.push((address, Balances::default()));
-                    self.screen = Screen::Waiting;
-                    return Some(Action::Record(address));
-                }
-                Err(reason) => self.setup.error = Some(reason),
-            },
-            Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+        if key != Key::Enter {
+            edit(&mut self.setup.address, key, |_| true, usize::MAX);
+            return None;
         }
-        None
+        match parse_watched(&self.setup.address) {
+            Ok(address) => {
+                self.setup.discard();
+                self.watched.push((address, Balances::default()));
+                self.screen = Screen::Waiting;
+                Some(Action::Record(address))
+            }
+            Err(reason) => {
+                self.setup.error = Some(reason);
+                None
+            }
+        }
     }
 
     fn menu_key(&mut self, key: Key) -> Option<Action> {
@@ -1295,14 +1298,20 @@ impl App {
                     Choice::Watch => return self.watch(),
                 };
             }
-            Key::Char(_) | Key::Backspace | Key::Esc | Key::Left | Key::Right => {}
+            Key::Char(_)
+            | Key::Backspace
+            | Key::EraseWord
+            | Key::EraseAll
+            | Key::Esc
+            | Key::Left
+            | Key::Right => {}
         }
         None
     }
 
     fn confirm_key(&mut self, key: Key) {
         if key != Key::Enter {
-            type_into(&mut self.setup.input, key, SECRET_BYTES);
+            edit(&mut self.setup.input, key, |_| true, SECRET_BYTES);
             return;
         }
         let at = self.setup.asked[self.setup.asking];
@@ -1331,7 +1340,7 @@ impl App {
 
     fn import_key(&mut self, key: Key) {
         if key != Key::Enter {
-            type_into(&mut self.setup.input, key, SECRET_BYTES);
+            edit(&mut self.setup.input, key, |_| true, SECRET_BYTES);
             return;
         }
         let parsed = wallet::parse(&self.setup.input);
@@ -1346,22 +1355,21 @@ impl App {
     }
 
     fn existing_key(&mut self, key: Key) -> Option<Action> {
-        match key {
-            Key::Char(c) => self.setup.path.push(c),
-            Key::Backspace => {
-                self.setup.path.pop();
-            }
-            Key::Enter => match self.keystore_path() {
-                Ok(path) => {
-                    self.setup.discard();
-                    self.screen = Screen::Unlock;
-                    return Some(Action::Open(path));
-                }
-                Err(reason) => self.setup.error = Some(reason),
-            },
-            Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
+        if key != Key::Enter {
+            edit(&mut self.setup.path, key, |_| true, usize::MAX);
+            return None;
         }
-        None
+        match self.keystore_path() {
+            Ok(path) => {
+                self.setup.discard();
+                self.screen = Screen::Unlock;
+                Some(Action::Open(path))
+            }
+            Err(reason) => {
+                self.setup.error = Some(reason);
+                None
+            }
+        }
     }
 
     /// The typed keystore path, absolute or under `~/`, if a file is there.
@@ -1403,7 +1411,7 @@ impl App {
                     Entry::First => &mut self.password,
                     Entry::Again => &mut self.setup.again,
                 };
-                type_into(field, key, PASSWORD_BYTES);
+                edit(field, key, |_| true, PASSWORD_BYTES);
                 return None;
             }
         }
@@ -1484,28 +1492,23 @@ impl App {
                 };
                 self.form.choose(assets[(at + step) % assets.len()]);
             }
-            Key::Char(c) => match self.form.field {
-                Field::Amount if c.is_ascii_digit() || matches!(c, '.' | 'm' | 'a' | 'x') => {
-                    self.form.amount.push(c);
-                    self.form.amount_error = None;
+            Key::Char(_) | Key::Backspace | Key::EraseWord | Key::EraseAll => {
+                match self.form.field {
+                    Field::Amount => {
+                        let amount =
+                            |c: char| c.is_ascii_digit() || matches!(c, '.' | 'm' | 'a' | 'x');
+                        if edit(&mut self.form.amount, key, amount, usize::MAX) {
+                            self.form.amount_error = None;
+                        }
+                    }
+                    Field::To => {
+                        if edit(&mut self.form.to, key, |c| !c.is_control(), usize::MAX) {
+                            self.form.to_error = None;
+                        }
+                    }
+                    Field::Token => {}
                 }
-                Field::To if !c.is_control() => {
-                    self.form.to.push(c);
-                    self.form.to_error = None;
-                }
-                Field::Token | Field::Amount | Field::To => {}
-            },
-            Key::Backspace => match self.form.field {
-                Field::Amount => {
-                    self.form.amount.pop();
-                    self.form.amount_error = None;
-                }
-                Field::To => {
-                    self.form.to.pop();
-                    self.form.to_error = None;
-                }
-                Field::Token => {}
-            },
+            }
             Key::Enter if self.form.field == Field::Token => {
                 self.form.picker = Some(Picker {
                     filter: String::new(),
@@ -1533,13 +1536,10 @@ impl App {
                     picker.highlighted = asset;
                 }
             }
-            Key::Char(_) | Key::Backspace => {
-                if let Key::Char(c) = key {
-                    picker.filter.push(c);
-                } else {
-                    picker.filter.pop();
-                }
-                if let Some(&first) = picker.matches(&assets).first() {
+            Key::Char(_) | Key::Backspace | Key::EraseWord | Key::EraseAll => {
+                if edit(&mut picker.filter, key, |_| true, usize::MAX)
+                    && let Some(&first) = picker.matches(&assets).first()
+                {
                     picker.highlighted = first;
                 }
             }
@@ -1576,6 +1576,8 @@ impl App {
             }
             Key::Char(_)
             | Key::Backspace
+            | Key::EraseWord
+            | Key::EraseAll
             | Key::Enter
             | Key::Up
             | Key::Down
@@ -1723,6 +1725,8 @@ impl App {
 enum Key {
     Char(char),
     Backspace,
+    EraseWord,
+    EraseAll,
     Enter,
     Esc,
     Up,
@@ -1732,15 +1736,23 @@ enum Key {
 }
 
 impl Key {
-    /// The key a terminal key code means here; Tab moves like Down. `None` for keys the TUI
-    /// ignores.
+    /// The key a terminal key event means here: Tab moves like Down; Ctrl+W, Alt+Backspace
+    /// and Ctrl+Backspace erase a word and Ctrl+U the whole field. `None` for keys the TUI
+    /// ignores, among them every other character typed with Ctrl but not Alt (Ctrl+Alt is
+    /// how AltGr characters arrive, so those type).
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "crossterm has many keys the TUI ignores"
     )]
-    const fn of(code: KeyCode) -> Option<Self> {
-        Some(match code {
+    const fn of(event: KeyEvent) -> Option<Self> {
+        let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = event.modifiers.contains(KeyModifiers::ALT);
+        Some(match event.code {
+            KeyCode::Char('w') if ctrl && !alt => Self::EraseWord,
+            KeyCode::Char('u') if ctrl && !alt => Self::EraseAll,
+            KeyCode::Char(_) if ctrl && !alt => return None,
             KeyCode::Char(c) => Self::Char(c),
+            KeyCode::Backspace if ctrl || alt => Self::EraseWord,
             KeyCode::Backspace => Self::Backspace,
             KeyCode::Enter => Self::Enter,
             KeyCode::Esc => Self::Esc,
@@ -1769,23 +1781,33 @@ pub fn show(amount: U256, asset: Asset) -> String {
     )
 }
 
-/// Types `key` into `buffer`, refusing characters that would grow it past `capacity`.
-fn type_into(buffer: &mut String, key: Key, capacity: usize) {
-    match key {
-        Key::Char(c) if buffer.len() + c.len_utf8() <= capacity => buffer.push(c),
-        Key::Backspace => erase_last(buffer),
-        Key::Char(_) | Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => {}
-    }
-}
-
-/// Removes the last character and overwrites its bytes, which would otherwise stay in the
-/// buffer's spare capacity. Writes within the capacity, so it never reallocates.
-fn erase_last(password: &mut String) {
-    if let Some(c) = password.pop() {
-        let len = password.len();
-        password.extend(std::iter::repeat_n('\0', c.len_utf8()));
-        password.truncate(len);
-    }
+/// Edits the text field `buffer` with `key`, saying whether its text changed: types a
+/// character `accepts` while the text stays within `capacity` bytes, or erases the last
+/// character, the last word (trailing spaces, then the characters back to the space before
+/// them), or everything. Erased bytes are overwritten, since they would otherwise stay in
+/// the buffer's spare capacity; that writes within the capacity, so it never reallocates.
+fn edit(buffer: &mut String, key: Key, accepts: impl Fn(char) -> bool, capacity: usize) -> bool {
+    let len = buffer.len();
+    let keep = match key {
+        Key::Char(c) => {
+            let typed = accepts(c) && len + c.len_utf8() <= capacity;
+            if typed {
+                buffer.push(c);
+            }
+            return typed;
+        }
+        Key::Backspace => buffer.char_indices().next_back().map_or(0, |(at, _)| at),
+        Key::EraseWord => buffer
+            .trim_end()
+            .trim_end_matches(|c: char| !c.is_whitespace())
+            .len(),
+        Key::EraseAll => 0,
+        Key::Enter | Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => len,
+    };
+    buffer.truncate(keep);
+    buffer.extend(std::iter::repeat_n('\0', len - keep));
+    buffer.truncate(keep);
+    keep < len
 }
 
 /// The recipient field as an address or a name, with the reason it cannot be sent to.
@@ -1958,10 +1980,22 @@ mod tests {
         let alt = KeyModifiers::ALT;
         let none = KeyModifiers::NONE;
         for (code, modifiers, key) in [
-            (KeyCode::Char('w'), KeyModifiers::CONTROL, Some(Key::EraseWord)),
+            (
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+                Some(Key::EraseWord),
+            ),
             (KeyCode::Backspace, alt, Some(Key::EraseWord)),
-            (KeyCode::Backspace, KeyModifiers::CONTROL, Some(Key::EraseWord)),
-            (KeyCode::Char('u'), KeyModifiers::CONTROL, Some(Key::EraseAll)),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL,
+                Some(Key::EraseWord),
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                Some(Key::EraseAll),
+            ),
             (KeyCode::Char('x'), KeyModifiers::CONTROL, None),
             (KeyCode::Char('w'), none, Some(Key::Char('w'))),
             (KeyCode::Backspace, none, Some(Key::Backspace)),
@@ -2018,7 +2052,11 @@ mod tests {
         assert_eq!(app.password.as_str(), "correct ");
         assert_eq!(app.key(ctrl('w')), None);
         assert_eq!(
-            (app.password.as_str(), app.password.as_ptr(), app.password.capacity()),
+            (
+                app.password.as_str(),
+                app.password.as_ptr(),
+                app.password.capacity()
+            ),
             ("", at, capacity)
         );
         typed(&mut app, "hunter2");

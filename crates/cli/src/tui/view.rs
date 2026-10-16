@@ -1120,11 +1120,22 @@ fn keys(app: &App) -> &'static [&'static str] {
             "Enter I wrote them down",
             "Esc back to the menu, discarding them",
         ],
-        Screen::Confirm => &["Enter check", "Esc back to the menu, discarding the phrase"],
-        Screen::Import | Screen::Existing => &["Enter continue", "Esc back to the menu"],
-        Screen::Password => &["up/down field", "Enter continue", "Esc back to the menu"],
-        Screen::WatchAddress => &["Enter watch", "Esc back"],
-        Screen::Unlock => &["Enter unlock", "Tab watch only", "Esc quit"],
+        Screen::Confirm => &[
+            "Enter check",
+            "ctrl+u clear",
+            "Esc back to the menu, discarding the phrase",
+        ],
+        Screen::Import | Screen::Existing => {
+            &["Enter continue", "ctrl+u clear", "Esc back to the menu"]
+        }
+        Screen::Password => &[
+            "up/down field",
+            "Enter continue",
+            "ctrl+u clear",
+            "Esc back to the menu",
+        ],
+        Screen::WatchAddress => &["Enter watch", "ctrl+u clear", "Esc back"],
+        Screen::Unlock => &["Enter unlock", "ctrl+u clear", "Tab watch only", "Esc quit"],
         Screen::Waiting | Screen::Excited | Screen::Paused | Screen::Watching => {
             &["l logs", "q quit"]
         }
@@ -1132,8 +1143,18 @@ fn keys(app: &App) -> &'static [&'static str] {
             "up/down field",
             "Enter or left/right token",
             "type amount (or max) and to",
+            "ctrl+u clear",
             "Enter review",
             "Ctrl-C quit",
+        ],
+        Screen::Ready if app.form.field == Field::Amount => &[
+            "up/down field",
+            "Enter or left/right token",
+            "type amount (or max) and to",
+            "ctrl+u clear",
+            "Enter review",
+            "l logs",
+            "q quit",
         ],
         Screen::Ready => &[
             "up/down field",
@@ -1567,13 +1588,6 @@ mod tests {
             app.form.field = field;
             assert_eq!(clears(&app), expected, "{field:?}");
         }
-        app.form.field = Field::Token;
-        app.form.picker = Some(Picker {
-            filter: String::new(),
-            highlighted: Asset::Eth,
-        });
-        assert!(clears(&app));
-        app.form.picker = None;
         for (screen, expected) in [
             (Screen::Unlock, true),
             (Screen::Menu, false),
@@ -1878,22 +1892,23 @@ mod tests {
             [
                 "",
                 "up/down field · Enter or left/right token · type amount (or max) and to",
-                "Enter review · l logs · q quit",
+                "ctrl+u clear · Enter review · l logs · q quit",
             ]
         );
         assert_eq!(
             last(inside_rows(&app, 104, 24), 3),
             [
                 "",
-                "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · l logs",
-                "q quit",
+                "up/down field · Enter or left/right token · type amount (or max) and to · ctrl+u clear",
+                "Enter review · l logs · q quit",
             ]
         );
         assert_eq!(
-            last(inside_rows(&app, 120, 40), 2),
+            last(inside_rows(&app, 120, 40), 3),
             [
                 "",
-                "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · l logs · q quit",
+                "up/down field · Enter or left/right token · type amount (or max) and to · ctrl+u clear · Enter review · l logs",
+                "q quit",
             ]
         );
         let borderless = sized(&app, &[], 43, 30)
@@ -1905,8 +1920,8 @@ mod tests {
             [
                 "",
                 "up/down field · Enter or left/right token",
-                "type amount (or max) and to · Enter review",
-                "l logs · q quit",
+                "type amount (or max) and to · ctrl+u clear",
+                "Enter review · l logs · q quit",
             ]
         );
     }
@@ -2263,7 +2278,7 @@ mod tests {
         let rows: Vec<&str> = shown.lines().collect();
         assert_eq!(rows[0], tall[0], "{shown}");
         assert_eq!(squeezed(&rows[1..3].concat()), squeezed(notice), "{shown}");
-        assert_eq!(rows[3], tall[26], "{shown}");
+        assert_eq!(rows[3], tall[25], "{shown}");
     }
 
     /// Watching WEIHAN, named and holding 3 ETH and 1.5 TKN, and SENDER holding 0.25 ETH.
@@ -2455,7 +2470,7 @@ mod tests {
     fn the_address_prompt_and_unlock_name_their_keys() {
         let mut app = App::new(Network::Sepolia, 11_155_111, REGISTRY, false);
         assert!(
-            screen(&app, &[]).contains("Enter unlock · Tab watch only · Esc quit"),
+            screen(&app, &[]).contains("Enter unlock · ctrl+u clear · Tab watch only · Esc quit"),
             "{}",
             screen(&app, &[])
         );
@@ -2469,7 +2484,7 @@ mod tests {
             "the address to watch",
             "address  0x12",
             "expected 0x followed by 40 hex digits",
-            "Enter watch · Esc back",
+            "Enter watch · ctrl+u clear · Esc back",
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");
         }
