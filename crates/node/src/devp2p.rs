@@ -1052,6 +1052,7 @@ fn empty_snap(request: &SnapProtocolMessage) -> SnapResponse {
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::bytes::BytesMut;
     use alloy_primitives::{B128, B512, BlockNumber, b256};
     use chibi_core::testing::{BlockWrites, GENESIS_NUMBER, World};
     use reth_eth_wire_types::{
@@ -1061,6 +1062,7 @@ mod tests {
 
     use super::*;
     use crate::network::Network;
+    use crate::peers::REQUEST_TIMEOUT;
 
     fn session(snap: Option<Snap>) -> Session {
         Session {
@@ -1416,31 +1418,87 @@ mod tests {
         assert!(load.load.lock().is_empty());
     }
 
-    #[tokio::test]
-    async fn a_snap1_request_whose_caller_gave_up_frees_its_slot() {
+    fn code_request() -> SnapProtocolMessage {
+        SnapProtocolMessage::GetByteCodes(GetByteCodesMessage {
+            request_id: 0,
+            hashes: vec![B256::repeat_byte(0x44)],
+            response_bytes: 1024,
+        })
+    }
+
+    fn snap1_submit(
+        load: &Arc<SnapLoad>,
+        sessions: &watch::Sender<Sessions>,
+        snap1: &Snap1,
+    ) -> JoinHandle<Result<(PeerId, SnapResponse), NetError>> {
+        let (load, sessions, snap1) = (Arc::clone(load), sessions.subscribe(), snap1.clone());
+        tokio::spawn(async move {
+            load.submit(sessions, Snap::V1, |peer, _| {
+                snap1.send(peer, code_request())
+            })
+            .await
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_snap1_peer_holds_its_share_until_the_requests_time_out() {
         let sessions = watch::Sender::new(Sessions::from([(A, session(Some(Snap::V1)))]));
-        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+        let (load, snap1) = (Arc::new(SnapLoad::default()), Snap1::default());
+        let (_to_chibi, inbound) = futures::channel::mpsc::unbounded::<BytesMut>();
+        let mut connection = snap1.open(A.0, inbound);
+        let sent = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&sent);
+        tokio::spawn(async move {
+            while connection.next().await.is_some() {
+                *counted.lock() += 1;
+            }
+        });
 
         let abandoned: Vec<_> = (0..SNAP_PER_PEER)
-            .map(|_| wire.request(&load, &sessions))
+            .map(|_| snap1_submit(&load, &sessions, &snap1))
             .collect();
         settle().await;
-        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
+        assert_eq!(*sent.lock(), SNAP_PER_PEER);
         for call in abandoned {
             call.abort();
         }
         settle().await;
-        assert_eq!(wire.outstanding(A), 0);
 
         let calls: Vec<_> = (0..SNAP_PER_PEER)
-            .map(|_| wire.request(&load, &sessions))
+            .map(|_| snap1_submit(&load, &sessions, &snap1))
             .collect();
         settle().await;
-        assert_eq!(wire.outstanding(A), SNAP_PER_PEER);
-        wire.close(A);
+        assert_eq!(*sent.lock(), SNAP_PER_PEER);
+
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        settle().await;
+        assert_eq!(*sent.lock(), 2 * SNAP_PER_PEER);
+
+        tokio::time::advance(REQUEST_TIMEOUT).await;
         for call in calls {
-            assert_eq!(call.await.unwrap().unwrap_err(), NetError::Rejected);
+            assert_eq!(call.await.unwrap().unwrap_err(), NetError::Timeout);
         }
+        assert!(load.load.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_snap1_request_given_up_before_it_is_sent_is_never_sent() {
+        let sessions = watch::Sender::new(Sessions::from([(A, session(Some(Snap::V1)))]));
+        let (load, snap1) = (Arc::new(SnapLoad::default()), Snap1::default());
+        let (_to_chibi, inbound) = futures::channel::mpsc::unbounded::<BytesMut>();
+        let mut connection = snap1.open(A.0, inbound);
+
+        let call = snap1_submit(&load, &sessions, &snap1);
+        settle().await;
+        call.abort();
+        settle().await;
+        assert!(
+            connection
+                .poll_next_unpin(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        settle().await;
+        assert!(load.load.lock().is_empty());
     }
 
     #[test]

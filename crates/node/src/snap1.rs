@@ -82,7 +82,7 @@ impl Snap1 {
         replied
     }
 
-    fn open<S>(&self, peer: PeerId, inbound: S) -> Connection<S> {
+    pub(crate) fn open<S>(&self, peer: PeerId, inbound: S) -> Connection<S> {
         let (commands_tx, commands) = mpsc::unbounded_channel();
         let serial = self.opened.fetch_add(1, Ordering::Relaxed);
         self.connections.lock().insert(
@@ -325,6 +325,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::task::{Wake, Waker};
+    use std::time::Duration;
 
     use alloy_primitives::{B256, B512};
     use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -335,6 +336,7 @@ mod tests {
     use tokio::sync::oneshot::error::TryRecvError;
 
     use super::*;
+    use crate::peers::REQUEST_TIMEOUT;
 
     const PEER: PeerId = B512::repeat_byte(7);
     const RESPONSE_BYTES: u64 = 512 * 1024;
@@ -642,5 +644,45 @@ mod tests {
         drop(old);
         let _reply = snap1.send(PEER, account_request());
         assert_eq!(drain(&mut new).len(), 1);
+    }
+
+    #[test]
+    fn a_second_connection_closing_keeps_the_first_one_registered() {
+        let snap1 = Snap1::default();
+        let (_first_wire, mut first) = connect(&snap1);
+        let (_second_wire, second) = connect(&snap1);
+        drop(second);
+        let _reply = snap1.send(PEER, account_request());
+        assert_eq!(drain(&mut first).len(), 1);
+    }
+
+    #[test]
+    fn a_command_whose_caller_gave_up_before_it_was_sent_is_dropped() {
+        let snap1 = Snap1::default();
+        let (_to_chibi, mut connection) = connect(&snap1);
+        drop(snap1.send(PEER, account_request()));
+        let _kept = snap1.send(PEER, account_request());
+        assert_eq!(
+            drain(&mut connection),
+            [[&[0x00][..], &alloy_rlp::encode(account_message(0))].concat()]
+        );
+        assert_eq!(connection.pending.keys().copied().collect::<Vec<_>>(), [0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_the_peer_leaves_unanswered_fails_at_the_timeout() {
+        let snap1 = Snap1::default();
+        let (_to_chibi, mut connection) = connect(&snap1);
+        let mut reply = snap1.send(PEER, account_request());
+        drain(&mut connection);
+
+        tokio::time::advance(REQUEST_TIMEOUT - Duration::from_millis(1)).await;
+        drain(&mut connection);
+        assert_eq!(reply.try_recv(), Err(TryRecvError::Empty));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        drain(&mut connection);
+        assert_eq!(reply.try_recv(), Ok(Err(RequestError::Timeout)));
+        assert!(connection.pending.is_empty());
     }
 }
