@@ -1949,6 +1949,84 @@ mod tests {
         assert!(app.password.is_empty());
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_w_and_alt_or_ctrl_backspace_erase_a_word_ctrl_u_all_and_other_ctrl_letters_nothing() {
+        let alt = KeyModifiers::ALT;
+        let none = KeyModifiers::NONE;
+        for (code, modifiers, key) in [
+            (KeyCode::Char('w'), KeyModifiers::CONTROL, Some(Key::EraseWord)),
+            (KeyCode::Backspace, alt, Some(Key::EraseWord)),
+            (KeyCode::Backspace, KeyModifiers::CONTROL, Some(Key::EraseWord)),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL, Some(Key::EraseAll)),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL, None),
+            (KeyCode::Char('w'), none, Some(Key::Char('w'))),
+            (KeyCode::Backspace, none, Some(Key::Backspace)),
+            (
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | alt,
+                Some(Key::Char('@')),
+            ),
+        ] {
+            assert_eq!(
+                Key::of(KeyEvent::new(code, modifiers)),
+                key,
+                "{code:?} {modifiers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn erasing_a_word_takes_trailing_spaces_and_the_word_before_them() {
+        let edited = |text: &str, key| {
+            let mut buffer = text.to_owned();
+            let changed = edit(&mut buffer, key, |_| true, usize::MAX);
+            (buffer, changed)
+        };
+        let erased = |text: &str| (text.to_owned(), true);
+        assert_eq!(
+            edited("word1 word2 word3", Key::EraseWord),
+            erased("word1 word2 ")
+        );
+        assert_eq!(edited("abc  ", Key::EraseWord), erased(""));
+        assert_eq!(
+            edited("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7", Key::EraseWord),
+            erased("")
+        );
+        assert_eq!(edited("word1 word2", Key::EraseAll), erased(""));
+        assert_eq!(edited("wé", Key::Backspace), erased("w"));
+        for key in [Key::Backspace, Key::EraseWord, Key::EraseAll, Key::Enter] {
+            assert_eq!(edited("", key), (String::new(), false));
+        }
+
+        let mut buffer = "ab".to_owned();
+        assert!(!edit(&mut buffer, Key::Char('c'), |c| c != 'c', usize::MAX));
+        assert!(!edit(&mut buffer, Key::Char('d'), |_| true, 2));
+        assert!(edit(&mut buffer, Key::Char('d'), |c| c != 'c', 3));
+        assert_eq!(buffer, "abd");
+    }
+
+    #[test]
+    fn ctrl_w_on_unlock_erases_the_password_within_its_buffer() {
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        let (at, capacity) = (app.password.as_ptr(), app.password.capacity());
+        typed(&mut app, "correct horse");
+        assert_eq!(app.key(ctrl('w')), None);
+        assert_eq!(app.password.as_str(), "correct ");
+        assert_eq!(app.key(ctrl('w')), None);
+        assert_eq!(
+            (app.password.as_str(), app.password.as_ptr(), app.password.capacity()),
+            ("", at, capacity)
+        );
+        typed(&mut app, "hunter2");
+        assert_eq!(app.key(ctrl('u')), None);
+        assert_eq!(app.password.as_str(), "");
+        assert_eq!(app.key(ctrl('c')), Some(Action::Quit));
+    }
+
     #[test]
     fn unlock_then_wait_then_perk_up_then_serve() {
         let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
@@ -2512,6 +2590,30 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_w_on_the_to_field_clears_the_name_its_error_and_its_resolution() {
+        let mut app = ready(Network::Sepolia);
+        app.form.field = Field::To;
+        typed(&mut app, "nobody.eth");
+        let (_, id) = app.resolve_request().unwrap();
+        app.resolved(id, Err("nobody.eth is not registered".to_owned()));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(errors(&app)[1], Some("nobody.eth is not registered"));
+        assert_eq!(app.key(ctrl('w')), None);
+        assert_eq!(
+            (app.form.to.as_str(), errors(&app)[1], app.resolution()),
+            ("", None, None)
+        );
+        assert_eq!(app.resolve_request(), None);
+        assert_eq!(app.form.resolution, None);
+
+        typed(&mut app, BOB);
+        press(&mut app, KeyCode::Enter);
+        app.form.to_error = Some("stale".to_owned());
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!((app.form.to.as_str(), errors(&app)[1]), ("", None));
+    }
+
+    #[test]
     fn a_reverting_or_unknown_fee_blocks_review() {
         let mut app = ready(Network::Sepolia);
         app.form.asset = Asset::Token(TKN);
@@ -2696,6 +2798,71 @@ mod tests {
             (Asset::Token(WETH), Field::Token, None, Screen::Ready)
         );
         assert_eq!(press(&mut app, KeyCode::Char('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn ctrl_u_empties_the_filter_and_highlights_the_first_of_every_asset() {
+        let mut app = picking();
+        typed(&mut app, "us");
+        assert_eq!(picker(&app), Some(("us", 0)));
+        assert_eq!(app.key(ctrl('u')), None);
+        let assets = app.assets();
+        let picker = app.form.picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "");
+        assert_eq!(picker.matches(&assets), assets);
+        assert_eq!(picker.highlighted, Asset::Eth);
+    }
+
+    #[test]
+    fn ctrl_letters_type_nothing_in_any_text_field() {
+        let keys = |app: &mut App| {
+            for c in ['w', 'u', 'x'] {
+                assert_eq!(app.key(ctrl(c)), None);
+            }
+        };
+        let mut app = App::new(Network::Sepolia, SEPOLIA_ID, REGISTRY, false);
+        keys(&mut app);
+        assert_eq!((app.screen, app.password.as_str()), (Screen::Unlock, ""));
+
+        let mut app = setting_up(None);
+        for screen in [
+            Screen::Confirm,
+            Screen::Import,
+            Screen::Existing,
+            Screen::Password,
+            Screen::WatchAddress,
+        ] {
+            app.screen = screen;
+            keys(&mut app);
+            assert_eq!(app.screen, screen);
+        }
+        app.setup.entry = Entry::Again;
+        app.screen = Screen::Password;
+        keys(&mut app);
+        let setup = &app.setup;
+        assert_eq!(
+            [
+                setup.input.as_str(),
+                setup.path.as_str(),
+                setup.address.as_str(),
+                setup.again.as_str(),
+                app.password.as_str(),
+            ],
+            [""; 5]
+        );
+
+        let mut app = ready(Network::Sepolia);
+        for field in [Field::Token, Field::Amount, Field::To] {
+            app.form.field = field;
+            keys(&mut app);
+        }
+        assert_eq!((app.form.amount.as_str(), app.form.to.as_str()), ("", ""));
+        assert!(!app.logs);
+
+        let mut app = picking();
+        keys(&mut app);
+        assert_eq!((picker(&app), app.logs), (Some(("", 2)), false));
+        assert_eq!(app.key(ctrl('c')), Some(Action::Quit));
     }
 
     #[test]

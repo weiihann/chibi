@@ -1542,15 +1542,55 @@ mod tests {
     }
 
     #[test]
-    fn on_the_to_field_the_footer_quits_with_ctrl_c_and_drops_the_log_key() {
+    fn on_the_to_field_the_footer_clears_with_ctrl_u_quits_with_ctrl_c_and_drops_the_log_key() {
         let mut app = ready();
         app.form.field = Field::To;
+        let rows = inside_rows(&app, 120, 40);
         assert_eq!(
-            inside_rows(&app, 120, 40).last().map(String::as_str),
-            Some(
-                "up/down field · Enter or left/right token · type amount (or max) and to · Enter review · Ctrl-C quit"
-            )
+            rows[rows.len() - 2..],
+            [
+                "up/down field · Enter or left/right token · type amount (or max) and to · ctrl+u clear · Enter review",
+                "Ctrl-C quit",
+            ]
         );
+    }
+
+    #[test]
+    fn text_fields_and_screens_name_ctrl_u_in_the_footer() {
+        let clears = |app: &App| keys(app).contains(&"ctrl+u clear");
+        let mut app = ready();
+        for (field, expected) in [
+            (Field::Token, false),
+            (Field::Amount, true),
+            (Field::To, true),
+        ] {
+            app.form.field = field;
+            assert_eq!(clears(&app), expected, "{field:?}");
+        }
+        app.form.field = Field::Token;
+        app.form.picker = Some(Picker {
+            filter: String::new(),
+            highlighted: Asset::Eth,
+        });
+        assert!(clears(&app));
+        app.form.picker = None;
+        for (screen, expected) in [
+            (Screen::Unlock, true),
+            (Screen::Menu, false),
+            (Screen::Backup, false),
+            (Screen::Confirm, true),
+            (Screen::Import, true),
+            (Screen::Existing, true),
+            (Screen::Password, true),
+            (Screen::WatchAddress, true),
+            (Screen::Waiting, false),
+            (Screen::Watching, false),
+            (Screen::Review, false),
+            (Screen::Sending, false),
+        ] {
+            app.screen = screen;
+            assert_eq!(clears(&app), expected, "{screen:?}");
+        }
     }
 
     #[test]
