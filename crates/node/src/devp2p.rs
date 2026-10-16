@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
@@ -53,6 +53,7 @@ use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, info, trace};
 
 pub use reth_network::config::{SecretKey, rng_secret_key};
@@ -81,6 +82,10 @@ const BAL_SOURCES: &str = "snap/2 or eth/71";
 
 pub(crate) const SNAP_1: Capability = Capability::new_static("snap", 1);
 const SNAP_2: Capability = Capability::snap_2();
+
+/// How long a snap/1 session stays connected before it counts as a state peer. Network
+/// crawlers announce snap/1 and disconnect within a millisecond.
+pub const SNAP1_SETTLE: Duration = Duration::from_secs(3);
 
 /// Local listening ports. Zero lets the operating system pick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -216,6 +221,8 @@ pub struct Session {
     pub dialable: Option<NodeRecord>,
     /// The publication sequence of the last block range sent to the peer.
     pub range_sent: Option<u64>,
+    /// When the session was established.
+    pub since: Instant,
 }
 
 /// Established sessions by peer.
@@ -923,6 +930,7 @@ fn session(info: &SessionInfo) -> (PeerId, Session) {
         snap: Snap::announced(info.capabilities.capabilities()),
         dialable: None,
         range_sent: None,
+        since: Instant::now(),
     };
     (info.peer_id, session)
 }
@@ -1070,6 +1078,7 @@ mod tests {
     use crate::network::Network;
     use crate::peers::REQUEST_TIMEOUT;
 
+    /// A session established [`SNAP1_SETTLE`] ago, which serves whatever snap version it has.
     fn session(snap: Option<Snap>) -> Session {
         Session {
             client: Arc::from("test"),
@@ -1077,6 +1086,15 @@ mod tests {
             snap,
             dialable: None,
             range_sent: None,
+            since: Instant::now() - SNAP1_SETTLE,
+        }
+    }
+
+    /// A snap/1 session established just now, as a crawler's is.
+    fn fresh_snap1() -> Session {
+        Session {
+            since: Instant::now(),
+            ..session(Some(Snap::V1))
         }
     }
 
@@ -1424,6 +1442,81 @@ mod tests {
         assert!(load.load.lock().is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_snap1_session_gets_proofs_by_load_only_once_settled() {
+        let sessions = snap_sessions(&[B]);
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+        let mut calls: Vec<_> = (0..3).map(|_| wire.request(&load, &sessions)).collect();
+        settle().await;
+
+        sessions.send_modify(|sessions| {
+            sessions.insert(A, fresh_snap1());
+        });
+        calls.push(wire.request(&load, &sessions));
+        settle().await;
+        assert_eq!((wire.outstanding(A), wire.outstanding(B)), (0, 4));
+
+        tokio::time::advance(SNAP1_SETTLE).await;
+        calls.extend((0..4).map(|_| wire.request(&load, &sessions)));
+        settle().await;
+        assert_eq!((wire.outstanding(A), wire.outstanding(B)), (4, 4));
+
+        wire.answer(A, 4);
+        wire.answer(B, 4);
+        for call in calls {
+            assert!(call.await.unwrap().is_ok());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_snap1_session_that_closes_within_a_second_never_gets_a_request() {
+        let sessions = watch::Sender::new(Sessions::from([(A, fresh_snap1())]));
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let call = wire.request(&load, &sessions);
+        settle().await;
+        tokio::time::advance(Duration::from_millis(999)).await;
+        settle().await;
+        assert_eq!(wire.versions(A), []);
+
+        sessions.send_modify(|sessions| {
+            sessions.remove(&A);
+        });
+        assert_eq!(
+            call.await.unwrap().unwrap_err(),
+            NetError::NoPeer {
+                capability: "state (snap)"
+            }
+        );
+        assert_eq!(wire.versions(A), []);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_only_a_fresh_snap1_session_a_proof_waits_for_it_to_settle_and_a_bal_has_no_peer()
+    {
+        let sessions = watch::Sender::new(Sessions::from([(A, fresh_snap1())]));
+        let (load, wire) = (Arc::new(SnapLoad::default()), Wire::default());
+
+        let no_snap2 = wire.bal(&load, &sessions).await.unwrap().unwrap_err();
+        assert_eq!(
+            no_snap2,
+            NetError::NoPeer {
+                capability: "snap/2"
+            }
+        );
+        let proof = wire.request(&load, &sessions);
+        settle().await;
+        tokio::time::advance(SNAP1_SETTLE / 2).await;
+        settle().await;
+        assert_eq!(wire.versions(A), []);
+
+        tokio::time::advance(SNAP1_SETTLE / 2 + Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(wire.versions(A), [Snap::V1]);
+        wire.answer(A, 1);
+        assert!(proof.await.unwrap().is_ok());
+    }
+
     fn code_request() -> SnapProtocolMessage {
         SnapProtocolMessage::GetByteCodes(GetByteCodesMessage {
             request_id: 0,
@@ -1533,6 +1626,30 @@ mod tests {
         let mut records = census.snap_records;
         records.sort_by_key(|record| record.id);
         assert_eq!(records, [node(1), node(2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_census_neither_counts_nor_remembers_a_fresh_snap1_session() {
+        let sessions = Sessions::from([
+            (
+                A,
+                Session {
+                    dialable: Some(node(1)),
+                    ..fresh_snap1()
+                },
+            ),
+            (
+                B,
+                Session {
+                    dialable: Some(node(2)),
+                    since: Instant::now(),
+                    ..session(Some(Snap::V2))
+                },
+            ),
+        ]);
+        let census = census(&sessions);
+        assert_eq!((census.peers, census.state_peers), (2, 1));
+        assert_eq!(census.snap_records, [node(2)]);
     }
 
     const PEER: PeerId = B512::repeat_byte(7);

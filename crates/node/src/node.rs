@@ -1712,9 +1712,10 @@ mod tests {
     use super::*;
     use alloy_primitives::B512;
 
-    use crate::devp2p::{Session, Snap};
+    use crate::devp2p::{SNAP1_SETTLE, Session, Snap};
     use crate::peers::PeerKey;
 
+    /// A session established [`SNAP1_SETTLE`] ago, which serves whatever snap version it has.
     fn session(snap: Option<Snap>) -> Session {
         Session {
             client: Arc::from("test"),
@@ -1722,6 +1723,15 @@ mod tests {
             snap,
             dialable: None,
             range_sent: None,
+            since: tokio::time::Instant::now() - SNAP1_SETTLE,
+        }
+    }
+
+    /// A snap/1 session established just now, as a crawler's is.
+    fn fresh_snap1() -> Session {
+        Session {
+            since: tokio::time::Instant::now(),
+            ..session(Some(Snap::V1))
         }
     }
 
@@ -1766,6 +1776,33 @@ mod tests {
         });
         waiting.await.unwrap().unwrap();
         assert_eq!(*seen.borrow_and_update(), Startup::FoundStatePeer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_snap1_session_ends_the_state_peer_wait_only_once_it_stays_connected() {
+        let (sessions, watched) = watch::channel(Sessions::new());
+        let (progress, _seen) = watch::channel(Startup::Serving);
+        let waiting = tokio::spawn(async move { wait_for_state_peer(watched, 0, &progress).await });
+        let crawler = PeerKey(B512::repeat_byte(1));
+
+        sessions.send_modify(|s| {
+            s.insert(crawler, fresh_snap1());
+        });
+        tokio::time::advance(Duration::from_millis(999)).await;
+        sessions.send_modify(|s| {
+            s.remove(&crawler);
+        });
+        tokio::time::sleep(SNAP1_SETTLE * 10).await;
+        assert!(!waiting.is_finished());
+
+        let inserted = tokio::time::Instant::now();
+        sessions.send_modify(|s| {
+            s.insert(PeerKey(B512::repeat_byte(2)), fresh_snap1());
+        });
+        tokio::time::sleep(SNAP1_SETTLE / 2).await;
+        assert!(!waiting.is_finished());
+        waiting.await.unwrap().unwrap();
+        assert_eq!(inserted.elapsed(), SNAP1_SETTLE);
     }
 
     fn sample(tips: &[u128]) -> FeeSample {
