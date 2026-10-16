@@ -498,6 +498,34 @@ mod tests {
     }
 
     #[test]
+    fn node_and_wallet_replace_run_and_its_tui_flag() {
+        use clap::error::ErrorKind;
+
+        for argv in [
+            &["chibi", "node"][..],
+            &["chibi", "node", "-b"],
+            &["chibi", "node", "--background", "--rpc-port", "8745"],
+            &["chibi", "wallet"],
+            &["chibi", "wallet", "--logs", "--keystore", "/k.json"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        let error = Cli::try_parse_from(["chibi", "run"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+        for argv in [
+            &["chibi", "node", "--tui"][..],
+            &["chibi", "node", "--logs"],
+            &["chibi", "wallet", "--tui"],
+            &["chibi", "wallet", "-b"],
+            &["chibi", "wallet", "--background"],
+            &["chibi", "wallet", "--detached"],
+        ] {
+            let error = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{argv:?}");
+        }
+    }
+
+    #[test]
     fn status_and_stop_find_the_instance_a_data_dir_flag_names() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

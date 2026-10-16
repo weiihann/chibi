@@ -88,7 +88,14 @@ fn a_named_config_that_does_not_exist_fails_every_command_but_init() {
     let home = tempfile::tempdir().unwrap();
     let missing = home.path().join("typo.toml");
     let shown = missing.display().to_string();
-    for args in [&["run"][..], &["run", "-b"], &["status"], &["stop"]] {
+    let commands = [
+        &["node"][..],
+        &["node", "-b"],
+        &["wallet"],
+        &["status"],
+        &["stop"],
+    ];
+    for args in commands {
         for (chibi_config, flag) in [(Some(missing.as_path()), None), (None, Some(&shown))] {
             let mut argv: Vec<&str> = args.to_vec();
             if let Some(flag) = flag {
