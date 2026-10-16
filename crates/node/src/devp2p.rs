@@ -213,8 +213,8 @@ pub struct Session {
     pub client: Arc<str>,
     /// Negotiated eth protocol version.
     pub eth: u8,
-    /// The snap version the session serves state over, `None` if the peer announced no snap.
-    /// A session with one is a state peer.
+    /// The snap version the peer announced, `None` if it announced no snap. The session serves
+    /// state over it as [`Session::serving`] says.
     pub snap: Option<Snap>,
     /// The record chibi dialed for a state peer session it opened, `None` otherwise. Only such
     /// records are worth remembering for the next start.
@@ -225,8 +225,41 @@ pub struct Session {
     pub since: Instant,
 }
 
+impl Session {
+    /// The snap version the session serves state over at `now`, which makes it a state peer:
+    /// snap/2 at once, and snap/1 once the session has stayed connected [`SNAP1_SETTLE`].
+    pub fn serving(&self, now: Instant) -> Option<Snap> {
+        match self.snap? {
+            Snap::V2 => Some(Snap::V2),
+            Snap::V1 => (now >= self.since + SNAP1_SETTLE).then_some(Snap::V1),
+        }
+    }
+}
+
 /// Established sessions by peer.
 pub type Sessions = HashMap<PeerKey, Session>;
+
+/// Waits until `sessions` changes or one of its snap/1 sessions settles, which changes what
+/// [`Session::serving`] returns without changing the sessions. Fails once the sender is gone.
+pub async fn sessions_changed(
+    sessions: &mut watch::Receiver<Sessions>,
+) -> Result<(), watch::error::RecvError> {
+    let now = Instant::now();
+    let settles = sessions
+        .borrow()
+        .values()
+        .filter(|session| session.snap == Some(Snap::V1))
+        .map(|session| session.since + SNAP1_SETTLE)
+        .filter(|at| *at > now)
+        .min();
+    match settles {
+        Some(at) => tokio::select! {
+            changed = sessions.changed() => changed,
+            () = tokio::time::sleep_until(at) => Ok(()),
+        },
+        None => sessions.changed().await,
+    }
+}
 
 /// A snap reply as the session resolves it.
 pub(crate) type SnapReply = oneshot::Receiver<RequestResult<SnapResponse>>;
@@ -280,8 +313,8 @@ impl SnapLoad {
     }
 
     /// A request counted against the least loaded session serving `need` or later below
-    /// [`SNAP_PER_PEER`], waiting while every such session is full. Fails at once when none is
-    /// connected.
+    /// [`SNAP_PER_PEER`], waiting while every such session is full or a snap/1 one has yet to
+    /// settle. Fails at once when none is connected.
     async fn lease(
         self: &Arc<Self>,
         sessions: &mut watch::Receiver<Sessions>,
@@ -291,7 +324,10 @@ impl SnapLoad {
             let released = self.released.notified();
             let mut released = std::pin::pin!(released);
             released.as_mut().enable();
-            if let Some((peer, snap)) = self.least_loaded(&sessions.borrow_and_update(), need)? {
+            let now = Instant::now();
+            if let Some((peer, snap)) =
+                self.least_loaded(&sessions.borrow_and_update(), need, now)?
+            {
                 return Ok(Lease {
                     load: Arc::clone(self),
                     peer,
@@ -300,7 +336,7 @@ impl SnapLoad {
             }
             tokio::select! {
                 () = released => {}
-                changed = sessions.changed() => changed.map_err(|_| NetError::Stopped)?,
+                changed = sessions_changed(sessions) => changed.map_err(|_| NetError::Stopped)?,
             }
         }
     }
@@ -309,21 +345,23 @@ impl SnapLoad {
         &self,
         sessions: &Sessions,
         need: Snap,
+        now: Instant,
     ) -> Result<Option<(PeerKey, Snap)>, NetError> {
-        let mut load = self.load.lock();
-        let mut serving = sessions
-            .iter()
-            .filter_map(|(peer, session)| {
-                let snap = session.snap.filter(|snap| *snap >= need)?;
-                Some((load.get(peer).copied().unwrap_or_default(), *peer, snap))
-            })
-            .peekable();
-        if serving.peek().is_none() {
+        if !sessions
+            .values()
+            .any(|session| session.snap.is_some_and(|snap| snap >= need))
+        {
             return Err(NetError::NoPeer {
                 capability: need.missing(),
             });
         }
-        let Some((_, peer, snap)) = serving
+        let mut load = self.load.lock();
+        let Some((_, peer, snap)) = sessions
+            .iter()
+            .filter_map(|(peer, session)| {
+                let snap = session.serving(now).filter(|snap| *snap >= need)?;
+                Some((load.get(peer).copied().unwrap_or_default(), *peer, snap))
+            })
             .filter(|(count, ..)| *count < SNAP_PER_PEER)
             .min_by_key(|(count, ..)| *count)
         else {
@@ -765,19 +803,19 @@ impl Peers for Devp2p {
     }
 }
 
-/// The session counts in `sessions`: every session with a snap version is a state peer, and
-/// only state peer sessions have a dialable record.
+/// The session counts in `sessions` now: the state peers are the sessions serving a snap
+/// version, and their dialable records are the ones to remember.
 fn census(sessions: &Sessions) -> Census {
+    let now = Instant::now();
+    let serving = || {
+        sessions
+            .values()
+            .filter(move |session| session.serving(now).is_some())
+    };
     Census {
         peers: sessions.len(),
-        state_peers: sessions
-            .values()
-            .filter(|session| session.snap.is_some())
-            .count(),
-        snap_records: sessions
-            .values()
-            .filter_map(|session| session.dialable)
-            .collect(),
+        state_peers: serving().count(),
+        snap_records: serving().filter_map(|session| session.dialable).collect(),
     }
 }
 

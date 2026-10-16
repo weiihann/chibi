@@ -44,7 +44,8 @@ pub struct Reply<T> {
 pub struct Census {
     /// Connected sessions.
     pub peers: usize,
-    /// Connected sessions that speak snap/1 or snap/2: the state peers, which serve proofs.
+    /// Connected sessions serving snap/2, or snap/1 once connected
+    /// [`SNAP1_SETTLE`](crate::devp2p::SNAP1_SETTLE): the state peers, which serve proofs.
     pub state_peers: usize,
     /// Addresses of the connected state peers chibi dialed, dialed first on the next start
     /// because discovery takes minutes to find one.

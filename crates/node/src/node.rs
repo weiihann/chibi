@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
-use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, Sessions};
+use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, Sessions, sessions_changed};
 use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
 use crate::follow::Search;
@@ -185,7 +185,8 @@ pub enum Startup {
     Waiting {
         /// Connected devp2p sessions.
         peers: usize,
-        /// Connected state peers: sessions that speak snap/1 or snap/2.
+        /// Connected state peers: sessions serving snap/2, or snap/1 once connected
+        /// [`SNAP1_SETTLE`](crate::devp2p::SNAP1_SETTLE).
         state_peers: usize,
         /// Time since the wait began.
         elapsed: Duration,
@@ -324,7 +325,8 @@ pub struct Status {
     pub snapshot: Snapshot,
     /// Connected devp2p sessions.
     pub peers: usize,
-    /// Connected state peers: sessions that speak snap/1 or snap/2.
+    /// Connected state peers: sessions serving snap/2, or snap/1 once connected
+    /// [`SNAP1_SETTLE`](crate::devp2p::SNAP1_SETTLE).
     pub state_peers: usize,
 }
 
@@ -336,7 +338,8 @@ pub struct Health {
     pub head: BlockNumHash,
     /// Connected devp2p sessions.
     pub peers: usize,
-    /// Connected state peers: sessions that speak snap/1 or snap/2.
+    /// Connected state peers: sessions serving snap/2, or snap/1 once connected
+    /// [`SNAP1_SETTLE`](crate::devp2p::SNAP1_SETTLE).
     pub state_peers: usize,
     /// Pinned keys, configured and seeded, the anchor's store holds.
     pub pinned: Held,
@@ -473,10 +476,11 @@ async fn wait_for_state_peer(
     let mut logged: Option<tokio::time::Instant> = None;
     loop {
         let (peers, state_peers) = {
+            let now = tokio::time::Instant::now();
             let sessions = sessions.borrow_and_update();
             let state_peers = sessions
                 .values()
-                .filter(|session| session.snap.is_some())
+                .filter(|session| session.serving(now).is_some())
                 .count();
             (sessions.len(), state_peers)
         };
@@ -501,7 +505,9 @@ async fn wait_for_state_peer(
             state_peers,
             elapsed,
         });
-        if let Ok(Err(_)) = tokio::time::timeout(STATE_PEER_PROGRESS, sessions.changed()).await {
+        if let Ok(Err(_)) =
+            tokio::time::timeout(STATE_PEER_PROGRESS, sessions_changed(&mut sessions)).await
+        {
             return Err(NodeError::Net(NetError::Stopped));
         }
     }

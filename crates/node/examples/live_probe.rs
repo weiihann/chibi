@@ -18,8 +18,10 @@ use chibi_core::state::Store;
 use chibi_core::verify;
 use chibi_core::wire::{AccountRangeRequest, StorageRangeRequest};
 use chibi_node::beacon::{self, Beacon, BeaconConfig};
-use chibi_node::devp2p::{Devp2p, HeadHint, NetConfig, Sessions, rng_secret_key};
+use chibi_node::devp2p::{Devp2p, HeadHint, NetConfig, Sessions, rng_secret_key, sessions_changed};
 use chibi_node::{Heads, NetError, Network, NetworkSpec, Peers};
+use tokio::sync::watch::error::RecvError;
+use tokio::time::Instant;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -71,10 +73,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     let mut sessions = net.sessions();
-    let found = tokio::time::timeout(
-        SNAP_PEER_WAIT,
-        sessions.wait_for(|sessions| sessions.values().any(|session| session.snap.is_some())),
-    )
+    let found = tokio::time::timeout(SNAP_PEER_WAIT, async {
+        while state_peers(&sessions.borrow_and_update()) == 0 {
+            sessions_changed(&mut sessions).await?;
+        }
+        Ok::<_, RecvError>(())
+    })
     .await
     .is_ok_and(|seen| seen.is_ok());
     if !found {
@@ -181,21 +185,27 @@ async fn fetch_header(
     Err("no peer served the attested header".into())
 }
 
+/// The sessions serving a snap version now.
+fn state_peers(sessions: &Sessions) -> usize {
+    let now = Instant::now();
+    sessions
+        .values()
+        .filter(|session| session.serving(now).is_some())
+        .count()
+}
+
 fn log_sessions(sessions: &Sessions) {
+    let now = Instant::now();
     let mut clients: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for session in sessions.values() {
         let name = session.client.split('/').next().unwrap_or_default();
         let entry = clients.entry(name).or_default();
         entry.0 += 1;
-        entry.1 += usize::from(session.snap.is_some());
+        entry.1 += usize::from(session.serving(now).is_some());
     }
-    let state_peers = sessions
-        .values()
-        .filter(|session| session.snap.is_some())
-        .count();
     info!(
         peers = sessions.len(),
-        state_peers,
+        state_peers = state_peers(sessions),
         ?clients,
         "sessions (client: (peers, state peers))"
     );
