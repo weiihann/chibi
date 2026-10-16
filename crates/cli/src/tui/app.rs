@@ -1739,8 +1739,9 @@ enum Key {
 }
 
 impl Key {
-    /// The key a terminal key event means here: Tab moves like Down; Ctrl+W, Alt+Backspace
-    /// and Ctrl+Backspace erase a word and Ctrl+U the whole field. `None` for keys the TUI
+    /// The key a terminal key event means here: Tab moves like Down; Ctrl+H is Backspace
+    /// (crossterm decodes the ^H byte some terminals send for Backspace as Ctrl+H); Ctrl+W,
+    /// Alt+Backspace and Ctrl+Backspace erase a word and Ctrl+U the whole field. `None` for keys the TUI
     /// ignores, among them every other character typed with Ctrl but not Alt (Ctrl+Alt is
     /// how AltGr characters arrive, so those type).
     #[expect(
@@ -1752,6 +1753,7 @@ impl Key {
         let alt = event.modifiers.contains(KeyModifiers::ALT);
         Some(match event.code {
             KeyCode::Char('w') if ctrl && !alt => Self::EraseWord,
+            KeyCode::Char('h') if ctrl && !alt => Self::Backspace,
             KeyCode::Char('u') if ctrl && !alt => Self::EraseAll,
             KeyCode::Char(_) if ctrl && !alt => return None,
             KeyCode::Char(c) => Self::Char(c),
