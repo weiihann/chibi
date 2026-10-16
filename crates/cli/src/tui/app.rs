@@ -3105,6 +3105,39 @@ mod tests {
     }
 
     #[test]
+    fn the_quit_warning_ends_with_its_pending_transfer() {
+        let mut app = ready(Network::Sepolia);
+        for hash in [
+            b256!("0x3333333333333333333333333333333333333333333333333333333333333333"),
+            b256!("0x4444444444444444444444444444444444444444444444444444444444444444"),
+        ] {
+            submit(&mut app, "1", BOB, Ok(FEE));
+            press(&mut app, KeyCode::Char('y'));
+            app.sent(Ok(hash));
+            app.tracked(Tracked::Pending);
+            assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+            assert_eq!(
+                app.notice.as_deref(),
+                Some(
+                    "a transfer is still pending; chibi's outbox rebroadcasts it on the next run. press q again to quit"
+                )
+            );
+            app.tracked(Tracked::Receipt { success: true });
+            assert_eq!((app.notice.as_deref(), app.quit_armed), (None, false));
+            press(&mut app, KeyCode::Enter);
+        }
+
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.sent(Ok(b256!(
+            "0x5555555555555555555555555555555555555555555555555555555555555555"
+        )));
+        app.notice = Some("saved the keystore".to_owned());
+        app.tracked(Tracked::Receipt { success: true });
+        assert_eq!(app.notice.as_deref(), Some("saved the keystore"));
+    }
+
+    #[test]
     fn a_failed_receipt_or_a_refused_submission_keeps_the_form() {
         let mut app = ready(Network::Sepolia);
         submit(&mut app, "1", BOB, Ok(FEE));
