@@ -510,6 +510,7 @@ mod tests {
             &["chibi", "node", "--background", "--rpc-port", "8745"],
             &["chibi", "wallet"],
             &["chibi", "wallet", "--logs", "--keystore", "/k.json"],
+            &["chibi", "init", "--keystore", "/k.json"],
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }
@@ -522,6 +523,7 @@ mod tests {
             &["chibi", "wallet", "-b"],
             &["chibi", "wallet", "--background"],
             &["chibi", "wallet", "--detached"],
+            &["chibi", "node", "--keystore", "/k.json"],
         ] {
             let error = Cli::try_parse_from(argv).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{argv:?}");
