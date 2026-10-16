@@ -59,7 +59,7 @@ pub use reth_network::config::{SecretKey, rng_secret_key};
 
 use crate::network::{BlockClock, NetworkSpec};
 use crate::peers::{Census, NetError, PeerKey, Peers, Reply, SNAP_PER_PEER};
-use crate::snap1::Snap1;
+use crate::snap1::{Retired, Snap1};
 
 /// Soft cap on snap response sizes, matching reth's own snap downloaders.
 const RESPONSE_BYTES: u64 = 512 * 1024;
@@ -234,28 +234,31 @@ struct SnapLoad {
 
 impl SnapLoad {
     /// Hands `send` the session in `sessions` serving `need` or a later snap version with the
-    /// fewest requests in flight, and waits for the reply it returns. A snap/2 request counts
-    /// against the session until reth resolves the reply, even if the caller stops waiting
-    /// first, because reth keeps the request out at the peer until then. A snap/1 request
-    /// stops counting when its caller stops waiting: nothing times it out, so its connection
-    /// forgets it then.
+    /// fewest requests in flight, and waits for the reply it returns. A request counts against
+    /// the session until it is retired, even if the caller stops waiting first: a snap/2
+    /// request when reth resolves its reply, and a request `send` returns a [`Retired`] for
+    /// when that closes. Such a request is withdrawn when its caller stops waiting.
     async fn submit(
         self: &Arc<Self>,
         mut sessions: watch::Receiver<Sessions>,
         need: Snap,
-        send: impl FnOnce(PeerId, Snap) -> SnapReply,
+        send: impl FnOnce(PeerId, Snap) -> (SnapReply, Option<Retired>),
     ) -> Result<(PeerId, SnapResponse), NetError> {
         let lease = self.lease(&mut sessions, need).await?;
         let peer = lease.peer.0;
-        let reply = send(peer, lease.snap);
+        let (reply, retired) = send(peer, lease.snap);
         let (mut forward, forwarded) = oneshot::channel();
         tokio::spawn(async move {
-            let reply = match lease.snap {
-                Snap::V2 => Some(reply.await),
-                Snap::V1 => tokio::select! {
-                    reply = reply => Some(reply),
-                    () = forward.closed() => None,
-                },
+            let reply = match retired {
+                None => Some(reply.await),
+                Some(retired) => {
+                    let reply = tokio::select! {
+                        reply = reply => Some(reply),
+                        () = forward.closed() => None,
+                    };
+                    retired.await.ok();
+                    reply
+                }
             };
             drop(lease);
             if let Some(reply) = reply {
@@ -503,12 +506,15 @@ impl Devp2p {
     ) -> Result<(PeerId, SnapResponse), NetError> {
         self.snap_load
             .submit(self.sessions.subscribe(), need, |peer, snap| match snap {
-                Snap::V1 => self.snap1.send(peer, request),
+                Snap::V1 => {
+                    let (reply, retired) = self.snap1.send(peer, request);
+                    (reply, Some(retired))
+                }
                 Snap::V2 => {
                     let (response, reply) = oneshot::channel();
                     self.handle
                         .send_request(peer, PeerRequest::GetSnap { request, response });
-                    reply
+                    (reply, None)
                 }
             })
             .await
@@ -1127,7 +1133,7 @@ mod tests {
                 load.submit(sessions, need, |peer, snap| {
                     let (response, reply) = oneshot::channel();
                     wire.0.lock().push((PeerKey(peer), snap, response));
-                    reply
+                    (reply, None)
                 })
                 .await
             })
@@ -1434,7 +1440,8 @@ mod tests {
         let (load, sessions, snap1) = (Arc::clone(load), sessions.subscribe(), snap1.clone());
         tokio::spawn(async move {
             load.submit(sessions, Snap::V1, |peer, _| {
-                snap1.send(peer, code_request())
+                let (reply, retired) = snap1.send(peer, code_request());
+                (reply, Some(retired))
             })
             .await
         })

@@ -8,7 +8,8 @@
 //! requests here, per connection. Inbound requests get an empty reply keeping their request id,
 //! because peers drop sessions whose requests go unanswered.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,9 +31,11 @@ use reth_network_api::{Direction, PeerId};
 use reth_network_p2p::error::{RequestError, RequestResult};
 use reth_network_p2p::snap::client::SnapResponse;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Instant, Sleep, sleep_until};
 use tracing::debug;
 
 use crate::devp2p::{SNAP_1, SnapReply};
+use crate::peers::REQUEST_TIMEOUT;
 
 const GET_ACCOUNT_RANGE: u8 = 0x00;
 const ACCOUNT_RANGE: u8 = 0x01;
@@ -48,54 +51,75 @@ const PROTOCOL: Protocol = Protocol::new(SNAP_1, 8);
 
 type Responder = oneshot::Sender<RequestResult<SnapResponse>>;
 
-/// A request for a snap/1 connection and where its reply goes.
+/// Closes when the connection is done with a request: answered, timed out, dropped unsent, or
+/// failed by the connection closing.
+pub(crate) type Retired = oneshot::Receiver<Infallible>;
+
+/// A request for a snap/1 connection and its caller.
 #[derive(Debug)]
 struct Command {
     request: SnapProtocolMessage,
-    reply: Responder,
+    waiting: Waiting,
 }
 
-/// The open snap/1 connections by peer, and the handler reth opens them through.
+/// Where a request's reply goes, and the handle whose drop retires it.
+#[derive(Debug)]
+struct Waiting {
+    reply: Responder,
+    _retire: oneshot::Sender<Infallible>,
+}
+
+/// Each peer's open snap/1 connections, by the serial each opened under.
+type Registry = HashMap<PeerId, BTreeMap<u64, mpsc::UnboundedSender<Command>>>;
+
+/// The open snap/1 connections and the handler reth opens them through.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Snap1 {
-    connections: Arc<Mutex<HashMap<PeerId, Registered>>>,
+    connections: Arc<Mutex<Registry>>,
     opened: Arc<AtomicU64>,
 }
 
-#[derive(Debug)]
-struct Registered {
-    /// Which connection to the peer this is, so that a closing connection cannot unregister
-    /// its successor.
-    serial: u64,
-    commands: mpsc::UnboundedSender<Command>,
-}
-
 impl Snap1 {
-    /// Sends `request` on `peer`'s snap/1 connection. The reply fails when `peer` has none or
-    /// it closes before the peer answers, and for a request snap/1 lacks.
-    pub(crate) fn send(&self, peer: PeerId, request: SnapProtocolMessage) -> SnapReply {
+    /// Sends `request` on `peer`'s newest open snap/1 connection. The reply fails when `peer`
+    /// has none or it closes before the peer answers, when the peer does not answer within
+    /// [`REQUEST_TIMEOUT`], and for a request snap/1 lacks. A caller that drops the reply
+    /// before the request is framed withdraws it.
+    pub(crate) fn send(&self, peer: PeerId, request: SnapProtocolMessage) -> (SnapReply, Retired) {
         let (reply, replied) = oneshot::channel();
-        if let Some(registered) = self.connections.lock().get(&peer) {
+        let (retire, retired) = oneshot::channel();
+        let command = Command {
+            request,
+            waiting: Waiting {
+                reply,
+                _retire: retire,
+            },
+        };
+        if let Some(commands) = self
+            .connections
+            .lock()
+            .get(&peer)
+            .and_then(|open| open.values().rev().find(|commands| !commands.is_closed()))
+        {
             // A closed connection drops the command, which fails the reply.
-            registered.commands.send(Command { request, reply }).ok();
+            commands.send(command).ok();
         }
-        replied
+        (replied, retired)
     }
 
     pub(crate) fn open<S>(&self, peer: PeerId, inbound: S) -> Connection<S> {
         let (commands_tx, commands) = mpsc::unbounded_channel();
         let serial = self.opened.fetch_add(1, Ordering::Relaxed);
-        self.connections.lock().insert(
-            peer,
-            Registered {
-                serial,
-                commands: commands_tx,
-            },
-        );
+        self.connections
+            .lock()
+            .entry(peer)
+            .or_default()
+            .insert(serial, commands_tx);
         Connection {
             inbound,
             commands,
             pending: HashMap::new(),
+            deadlines: VecDeque::new(),
+            timer: None,
             replies: VecDeque::new(),
             next_request: 0,
             peer,
@@ -152,8 +176,12 @@ impl ConnectionHandler for Snap1 {
 pub(crate) struct Connection<S> {
     inbound: S,
     commands: mpsc::UnboundedReceiver<Command>,
-    /// Callers waiting for a reply, by the request id chibi gave their request.
-    pending: HashMap<u64, Responder>,
+    /// Callers waiting for a reply, by the request id chibi gave their request. An entry stays
+    /// until the peer answers or [`REQUEST_TIMEOUT`] passes, even once its caller stops waiting.
+    pending: HashMap<u64, Waiting>,
+    /// When each request sent times out, oldest first.
+    deadlines: VecDeque<(Instant, u64)>,
+    timer: Option<Pin<Box<Sleep>>>,
     /// Empty replies to the peer's requests, not yet sent.
     replies: VecDeque<BytesMut>,
     next_request: u64,
@@ -178,7 +206,7 @@ impl<S> Connection<S> {
                 if let Some((request_id, response)) = response(id, body)
                     && let Some(waiting) = self.pending.remove(&request_id)
                 {
-                    waiting.send(Ok(response)).ok();
+                    waiting.reply.send(Ok(response)).ok();
                 }
                 return;
             }
@@ -189,9 +217,34 @@ impl<S> Connection<S> {
         }
     }
 
+    /// Fails every pending request whose deadline passed with a timeout, and arms the timer
+    /// for the next.
+    fn expire(&mut self, cx: &mut Context<'_>) {
+        while let Some(&(deadline, request_id)) = self.deadlines.front() {
+            if self.pending.contains_key(&request_id) {
+                let timer = self
+                    .timer
+                    .get_or_insert_with(|| Box::pin(sleep_until(deadline)));
+                if timer.deadline() != deadline {
+                    timer.as_mut().reset(deadline);
+                }
+                if timer.as_mut().poll(cx).is_pending() {
+                    return;
+                }
+            }
+            self.deadlines.pop_front();
+            if let Some(waiting) = self.pending.remove(&request_id) {
+                waiting.reply.send(Err(RequestError::Timeout)).ok();
+            }
+        }
+    }
+
     /// Frames `command`'s request under the next request id and keeps its caller waiting.
     fn request(&mut self, command: Command) -> Option<BytesMut> {
-        let Command { mut request, reply } = command;
+        let Command {
+            mut request,
+            waiting,
+        } = command;
         let request_id = self.next_request;
         let frame = match &mut request {
             SnapProtocolMessage::GetAccountRange(message) => {
@@ -211,12 +264,17 @@ impl<S> Connection<S> {
             | SnapProtocolMessage::StorageRanges(_)
             | SnapProtocolMessage::ByteCodes(_)
             | SnapProtocolMessage::BlockAccessLists(_) => {
-                reply.send(Err(RequestError::UnsupportedCapability)).ok();
+                waiting
+                    .reply
+                    .send(Err(RequestError::UnsupportedCapability))
+                    .ok();
                 return None;
             }
         };
         self.next_request = request_id.wrapping_add(1);
-        self.pending.insert(request_id, reply);
+        self.pending.insert(request_id, waiting);
+        self.deadlines
+            .push_back((Instant::now() + REQUEST_TIMEOUT, request_id));
         Some(frame)
     }
 }
@@ -236,9 +294,11 @@ impl<S: Stream<Item = BytesMut> + Unpin> Stream for Connection<S> {
         if let Some(reply) = this.replies.pop_front() {
             return Poll::Ready(Some(reply));
         }
-        this.pending
-            .retain(|_, waiting| waiting.poll_closed(cx).is_pending());
+        this.expire(cx);
         while let Poll::Ready(Some(command)) = this.commands.poll_recv(cx) {
+            if command.waiting.reply.is_closed() {
+                continue;
+            }
             if let Some(frame) = this.request(command) {
                 return Poll::Ready(Some(frame));
             }
@@ -250,22 +310,26 @@ impl<S: Stream<Item = BytesMut> + Unpin> Stream for Connection<S> {
 impl<S> Drop for Connection<S> {
     fn drop(&mut self) {
         let mut connections = self.registry.connections.lock();
-        if connections
-            .get(&self.peer)
-            .is_some_and(|registered| registered.serial == self.serial)
-        {
-            connections.remove(&self.peer);
+        if let Some(open) = connections.get_mut(&self.peer) {
+            open.remove(&self.serial);
+            if open.is_empty() {
+                connections.remove(&self.peer);
+            }
         }
         drop(connections);
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
             command
+                .waiting
                 .reply
                 .send(Err(RequestError::ConnectionDropped))
                 .ok();
         }
         for (_, waiting) in self.pending.drain() {
-            waiting.send(Err(RequestError::ConnectionDropped)).ok();
+            waiting
+                .reply
+                .send(Err(RequestError::ConnectionDropped))
+                .ok();
         }
     }
 }
@@ -323,8 +387,7 @@ fn empty_reply(id: u8, request_id: u64, lists: usize) -> BytesMut {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicBool;
-    use std::task::{Wake, Waker};
+    use std::task::Waker;
     use std::time::Duration;
 
     use alloy_primitives::{B256, B512};
@@ -348,14 +411,10 @@ mod tests {
         (to_chibi, snap1.open(PEER, inbound))
     }
 
-    fn poll_with(connection: &mut Wire, waker: &Waker) -> Poll<Option<Vec<u8>>> {
-        connection
-            .poll_next_unpin(&mut Context::from_waker(waker))
-            .map(|frame| frame.map(|frame| frame.to_vec()))
-    }
-
     fn poll(connection: &mut Wire) -> Poll<Option<Vec<u8>>> {
-        poll_with(connection, Waker::noop())
+        connection
+            .poll_next_unpin(&mut Context::from_waker(Waker::noop()))
+            .map(|frame| frame.map(|frame| frame.to_vec()))
     }
 
     /// Every frame the connection sends before it has nothing more to send.
@@ -412,8 +471,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn requests_are_framed_with_the_ids_chibi_assigns() {
+    #[tokio::test]
+    async fn requests_are_framed_with_the_ids_chibi_assigns() {
         let snap1 = Snap1::default();
         let (_to_chibi, mut connection) = connect(&snap1);
         let _replies = [
@@ -460,14 +519,16 @@ mod tests {
     fn a_request_snap1_lacks_fails_without_reaching_the_peer() {
         let snap1 = Snap1::default();
         let (_to_chibi, mut connection) = connect(&snap1);
-        let mut reply = snap1.send(
-            PEER,
-            SnapProtocolMessage::GetBlockAccessLists(GetBlockAccessListsMessage {
-                request_id: 0,
-                block_hashes: vec![B256::repeat_byte(0x55)],
-                response_bytes: RESPONSE_BYTES,
-            }),
-        );
+        let mut reply = snap1
+            .send(
+                PEER,
+                SnapProtocolMessage::GetBlockAccessLists(GetBlockAccessListsMessage {
+                    request_id: 0,
+                    block_hashes: vec![B256::repeat_byte(0x55)],
+                    response_bytes: RESPONSE_BYTES,
+                }),
+            )
+            .0;
         assert_eq!(drain(&mut connection), Vec::<Vec<u8>>::new());
         assert_eq!(
             reply.try_recv(),
@@ -476,12 +537,12 @@ mod tests {
         assert!(connection.pending.is_empty());
     }
 
-    #[test]
-    fn replies_reach_their_callers_by_request_id() {
+    #[tokio::test]
+    async fn replies_reach_their_callers_by_request_id() {
         let snap1 = Snap1::default();
         let (to_chibi, mut connection) = connect(&snap1);
-        let mut first = snap1.send(PEER, account_request());
-        let mut second = snap1.send(PEER, account_request());
+        let mut first = snap1.send(PEER, account_request()).0;
+        let mut second = snap1.send(PEER, account_request()).0;
         assert_eq!(drain(&mut connection).len(), 2);
 
         receive(&to_chibi, &[0x01, 0xc3, 0x01, 0xc0, 0xc0]);
@@ -495,11 +556,11 @@ mod tests {
         assert!(connection.pending.is_empty());
     }
 
-    #[test]
-    fn replies_to_unknown_ids_and_garbage_frames_are_dropped() {
+    #[tokio::test]
+    async fn replies_to_unknown_ids_and_garbage_frames_are_dropped() {
         let snap1 = Snap1::default();
         let (to_chibi, mut connection) = connect(&snap1);
-        let mut waiting = snap1.send(PEER, account_request());
+        let mut waiting = snap1.send(PEER, account_request()).0;
         drain(&mut connection);
 
         let dropped: [&[u8]; 12] = [
@@ -590,54 +651,43 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct Woken(AtomicBool);
-
-    impl Wake for Woken {
-        fn wake(self: Arc<Self>) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn a_caller_that_stops_waiting_leaves_no_pending_entry() {
+    #[tokio::test(start_paused = true)]
+    async fn a_sent_request_whose_caller_gave_up_stays_pending_until_it_times_out() {
         let snap1 = Snap1::default();
         let (_to_chibi, mut connection) = connect(&snap1);
-        let abandoned = snap1.send(PEER, account_request());
-        let _kept = snap1.send(PEER, account_request());
+        let (abandoned, mut retired) = snap1.send(PEER, account_request());
         drain(&mut connection);
-
-        let woken = Arc::new(Woken::default());
-        assert_eq!(
-            poll_with(&mut connection, &Waker::from(Arc::clone(&woken))),
-            Poll::Pending
-        );
-        assert_eq!(connection.pending.len(), 2);
         drop(abandoned);
-        assert!(woken.0.load(Ordering::SeqCst));
         drain(&mut connection);
-        assert_eq!(connection.pending.keys().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(connection.pending.len(), 1);
+        assert_eq!(retired.try_recv(), Err(TryRecvError::Empty));
+
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        drain(&mut connection);
+        assert!(connection.pending.is_empty());
+        assert_eq!(retired.try_recv(), Err(TryRecvError::Closed));
     }
 
-    #[test]
-    fn closing_the_session_fails_every_pending_and_queued_caller() {
+    #[tokio::test]
+    async fn closing_the_session_fails_every_pending_and_queued_caller() {
         let snap1 = Snap1::default();
         let (to_chibi, mut connection) = connect(&snap1);
-        let mut sent = snap1.send(PEER, account_request());
+        let (mut sent, mut sent_retired) = snap1.send(PEER, account_request());
         drain(&mut connection);
-        let mut queued = snap1.send(PEER, account_request());
+        let mut queued = snap1.send(PEER, account_request()).0;
 
         drop(to_chibi);
         assert_eq!(poll(&mut connection), Poll::Ready(None));
         drop(connection);
         assert_eq!(sent.try_recv(), Ok(Err(RequestError::ConnectionDropped)));
         assert_eq!(queued.try_recv(), Ok(Err(RequestError::ConnectionDropped)));
-        let mut late = snap1.send(PEER, account_request());
+        assert_eq!(sent_retired.try_recv(), Err(TryRecvError::Closed));
+        let mut late = snap1.send(PEER, account_request()).0;
         assert_eq!(late.try_recv(), Err(TryRecvError::Closed));
     }
 
-    #[test]
-    fn an_older_connection_closing_keeps_the_newer_one_registered() {
+    #[tokio::test]
+    async fn an_older_connection_closing_keeps_the_newer_one_registered() {
         let snap1 = Snap1::default();
         let (_old_wire, old) = connect(&snap1);
         let (_new_wire, mut new) = connect(&snap1);
@@ -646,8 +696,8 @@ mod tests {
         assert_eq!(drain(&mut new).len(), 1);
     }
 
-    #[test]
-    fn a_second_connection_closing_keeps_the_first_one_registered() {
+    #[tokio::test]
+    async fn a_second_connection_closing_keeps_the_first_one_registered() {
         let snap1 = Snap1::default();
         let (_first_wire, mut first) = connect(&snap1);
         let (_second_wire, second) = connect(&snap1);
@@ -656,8 +706,8 @@ mod tests {
         assert_eq!(drain(&mut first).len(), 1);
     }
 
-    #[test]
-    fn a_command_whose_caller_gave_up_before_it_was_sent_is_dropped() {
+    #[tokio::test]
+    async fn a_command_whose_caller_gave_up_before_it_was_sent_is_dropped() {
         let snap1 = Snap1::default();
         let (_to_chibi, mut connection) = connect(&snap1);
         drop(snap1.send(PEER, account_request()));
@@ -673,7 +723,7 @@ mod tests {
     async fn a_request_the_peer_leaves_unanswered_fails_at_the_timeout() {
         let snap1 = Snap1::default();
         let (_to_chibi, mut connection) = connect(&snap1);
-        let mut reply = snap1.send(PEER, account_request());
+        let mut reply = snap1.send(PEER, account_request()).0;
         drain(&mut connection);
 
         tokio::time::advance(REQUEST_TIMEOUT - Duration::from_millis(1)).await;
