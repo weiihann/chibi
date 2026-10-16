@@ -55,16 +55,10 @@ unsupported() {
 }
 
 download() {
-    if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$2" "$1"
-    elif [ "$scheme" = file ]; then
-        err "file:// URLs need curl, which is not installed"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q --https-only --max-redirect=5 -O "$2" "$1"
-    else
-        err "this script needs curl or wget"
-    fi
+    curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$2" "$1"
 }
+
+command -v curl >/dev/null 2>&1 || err "this script needs curl"
 
 if command -v sha256sum >/dev/null 2>&1; then
     sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
@@ -84,8 +78,7 @@ else
     base_url="$repo_url/releases/latest/download"
 fi
 case "$base_url" in
-https://*) scheme="https" ;;
-file://*) scheme="file" ;;
+https://* | file://*) ;;
 *) err "release URL must start with https:// (or file:// for testing): $base_url" ;;
 esac
 install_dir=${CHIBI_INSTALL_DIR:-$HOME/.local/bin}
