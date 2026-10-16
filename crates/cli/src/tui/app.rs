@@ -3111,6 +3111,32 @@ mod tests {
     }
 
     #[test]
+    fn the_quit_warning_ends_with_its_transfer_after_quitting_is_disarmed() {
+        let mut app = ready(Network::Sepolia);
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.sent(Ok(b256!(
+            "0x5555555555555555555555555555555555555555555555555555555555555555"
+        )));
+        app.tracked(Tracked::Pending);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        press(&mut app, KeyCode::Char('l'));
+        app.tracked(Tracked::Receipt { success: true });
+        assert_eq!((app.notice.as_deref(), app.quit_armed), (None, false));
+    }
+
+    #[test]
+    fn the_quit_warning_ends_with_a_rejected_send() {
+        let mut app = ready(Network::Sepolia);
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(press(&mut app, KeyCode::Char('q')), None);
+        assert_eq!(app.notice.as_deref(), Some(QUIT_WARNING));
+        app.sent(Err("nonce too low".to_owned()));
+        assert_eq!((app.notice.as_deref(), app.quit_armed), (None, false));
+    }
+
+    #[test]
     fn the_quit_warning_ends_with_its_pending_transfer() {
         let mut app = ready(Network::Sepolia);
         for hash in [
