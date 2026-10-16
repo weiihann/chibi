@@ -50,6 +50,9 @@ const NOT_RECIPIENT: &str = "expected 0x followed by 40 hex digits, or a name li
 const NAME_NOT_ASCII: &str =
     "chibi takes names in plain letters, digits and hyphens; paste the address for others";
 
+/// Shown on the first `q` while a transfer is in flight.
+const QUIT_WARNING: &str = "a transfer is still pending; chibi's outbox rebroadcasts it on the next run. press q again to quit";
+
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -1034,6 +1037,12 @@ impl App {
             Tracked::Receipt { success: false } => SendState::Failed,
             Tracked::Dropped => SendState::Dropped,
         };
+        if self.quit_armed && !sending.in_flight() {
+            self.quit_armed = false;
+            if self.notice.as_deref() == Some(QUIT_WARNING) {
+                self.notice = None;
+            }
+        }
     }
 
     /// The hash to track, while the transfer has no verified receipt.
@@ -1464,10 +1473,7 @@ impl App {
         if in_flight && !self.quit_armed {
             self.quit_armed = true;
             self.form.picker = None;
-            self.notice = Some(
-                "a transfer is still pending; chibi's outbox rebroadcasts it on the next run. press q again to quit"
-                    .to_owned(),
-            );
+            self.notice = Some(QUIT_WARNING.to_owned());
             return None;
         }
         Some(Action::Quit)
