@@ -12,6 +12,7 @@ pub mod heads;
 pub mod network;
 pub mod node;
 pub mod peers;
+mod snap1;
 #[cfg(test)]
 mod tests;
 
