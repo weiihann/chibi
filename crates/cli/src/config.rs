@@ -127,9 +127,6 @@ pub struct ConfigArgs {
     /// Run no peer discovery; dial only the trusted and built-in peers.
     #[arg(long)]
     pub disable_discovery: bool,
-    /// Encrypted JSON keystore `chibi wallet` sends from.
-    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
-    pub keystore: Option<PathBuf>,
 }
 
 impl ConfigArgs {
@@ -158,9 +155,6 @@ impl ConfigArgs {
             config.discovery_port = Some(port);
         }
         config.disable_discovery |= self.disable_discovery;
-        if let Some(path) = &self.keystore {
-            config.keystore = Some(path.clone());
-        }
     }
 
     /// The flags that give the same keys again.
@@ -192,9 +186,6 @@ impl ConfigArgs {
         }
         if self.disable_discovery {
             argv.push("--disable-discovery".into());
-        }
-        if let Some(path) = &self.keystore {
-            argv.extend(["--keystore".into(), path.as_os_str().to_owned()]);
         }
         argv
     }

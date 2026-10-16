@@ -17,8 +17,8 @@ use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, InquireError, Select, Text};
 
 use crate::config::{
-    Config, ConfigArgs, DEFAULT_RPC_PORT, InvalidConfig, InvalidRpcHost, RpcHost, parse_address,
-    process_env,
+    Config, ConfigArgs, DEFAULT_RPC_PORT, InvalidConfig, InvalidRpcHost, RpcHost, absolute_path,
+    parse_address, process_env,
 };
 
 /// How long the port check waits for a listener to accept.
@@ -41,6 +41,9 @@ pub struct InitArgs {
     pub rpc_port: Option<NonZeroU16>,
     #[command(flatten)]
     pub keys: ConfigArgs,
+    /// Encrypted JSON keystore `chibi wallet` sends from.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    pub keystore: Option<PathBuf>,
 }
 
 /// Why `chibi init` wrote nothing.
@@ -213,6 +216,9 @@ fn collect<A: Ask>(
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
     args.keys.apply(&mut config);
+    if let Some(keystore) = &args.keystore {
+        config.keystore = Some(keystore.clone());
+    }
     config.validate()?;
     let mut carried = Carried::default();
     if let Some(existing) = existing {
@@ -892,7 +898,7 @@ mod tests {
     fn data_dir_beacon_url_and_keystore_flags_are_written_only_when_given() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let answered = |keys: ConfigArgs| {
+        let answered = |keys: ConfigArgs, keystore: Option<PathBuf>| {
             let mut lines = Lines {
                 input: Cursor::new(&b""[..]),
                 output: Vec::new(),
@@ -903,11 +909,12 @@ mod tests {
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
                 keys,
+                keystore,
             };
             collect(&mut lines, args, &path).unwrap().unwrap().0
         };
 
-        let plain = answered(ConfigArgs::default());
+        let plain = answered(ConfigArgs::default(), None);
         plain.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("data_dir"), "{text}");
@@ -915,12 +922,14 @@ mod tests {
         assert!(!text.contains("keystore"), "{text}");
         std::fs::remove_file(&path).unwrap();
 
-        let custom = answered(ConfigArgs {
-            beacon_url: Some("http://127.0.0.1:5052".parse().unwrap()),
-            data_dir: Some(dir.path().join("data")),
-            keystore: Some(dir.path().join("key.json")),
-            ..ConfigArgs::default()
-        });
+        let custom = answered(
+            ConfigArgs {
+                beacon_url: Some("http://127.0.0.1:5052".parse().unwrap()),
+                data_dir: Some(dir.path().join("data")),
+                ..ConfigArgs::default()
+            },
+            Some(dir.path().join("key.json")),
+        );
         assert_eq!(custom.data_dir, Some(dir.path().join("data")));
         custom.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -958,6 +967,7 @@ mod tests {
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
                 keys,
+                keystore: None,
             };
             collect(&mut lines, args, &path).map(|config| config.unwrap().0)
         };
@@ -1018,6 +1028,7 @@ mod tests {
                     data_dir,
                     ..ConfigArgs::default()
                 },
+                keystore: None,
             };
             collect(&mut lines, args, &path).unwrap().unwrap()
         };

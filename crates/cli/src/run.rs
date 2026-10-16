@@ -8,7 +8,7 @@ use std::io;
 use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,7 +26,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, ConfigArgs, RpcHost, process_env};
+use crate::config::{Config, ConfigArgs, RpcHost, absolute_path, process_env};
 use crate::rpc::{self, RpcConfig};
 use crate::tui::{self, LogBuffer, Wallet, transfer};
 
@@ -100,6 +100,9 @@ pub struct WalletArgs {
     /// Start with the log pane open.
     #[arg(long)]
     pub logs: bool,
+    /// Encrypted JSON keystore to send from instead of the configured one.
+    #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+    pub keystore: Option<PathBuf>,
 }
 
 /// The config at `path`. Without a file there, a config the user `named` with `--config` or
@@ -116,6 +119,15 @@ pub fn config(path: &Path, named: bool) -> eyre::Result<Config> {
             Ok(Config::default())
         }
     }
+}
+
+/// [`load`] with the keystore `chibi wallet` was given.
+fn wallet_config(path: &Path, named: bool, args: &WalletArgs) -> eyre::Result<Config> {
+    let mut config = load(path, named, &args.overrides)?;
+    if let Some(keystore) = &args.keystore {
+        config.keystore = Some(keystore.clone());
+    }
+    Ok(config)
 }
 
 /// [`config`] with the command-line overrides applied.
@@ -192,7 +204,7 @@ pub fn wallet(args: &WalletArgs, path: &Path, config_flag: Option<&Path>) -> eyr
         .with_ansi(false)
         .with_writer(logs.clone())
         .init();
-    let config = load(path, config_flag.is_some(), &args.overrides)?;
+    let config = wallet_config(path, config_flag.is_some(), args)?;
     let data_dir = config.network_dir(config.network, process_env)?;
     let wallet = tui_wallet(&config)?;
     let served = Served::bind(&config)?;
@@ -751,7 +763,7 @@ mod tests {
 
         let args = wallet_args(&["--logs", "--keystore", "b.json"]);
         assert!(args.logs);
-        let config = load(&path, true, &args.overrides).unwrap();
+        let config = wallet_config(&path, true, &args).unwrap();
         let flagged = config.keystore.clone().unwrap();
         assert!(flagged.is_absolute() && flagged.ends_with("b.json"));
         let error = tui_wallet(&config).unwrap_err().to_string();
