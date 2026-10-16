@@ -7,7 +7,7 @@ chibi is early software. It targets Sepolia first. Mainnet support exists in the
 ## How it works
 
 - A sync-committee light client ([helios](https://github.com/a16z/helios)) vouches for execution block hashes. chibi fetches each header over devp2p and checks its hash.
-- Account and storage values come from single-key snap/2 range proofs, checked against the verified header's state root. A key chibi never fetched is never read as zero. Only state peers, the devp2p peers that speak snap/2, can serve these proofs (see [Peers and keys](#peers-and-keys)).
+- Account and storage values come from single-key snap range proofs, checked against the verified header's state root. A key chibi never fetched is never read as zero. Only state peers, the devp2p peers that speak snap/1 or snap/2, can serve these proofs (see [Peers and keys](#peers-and-keys)).
 - chibi keeps only the state your wallet and dapps read (see [What chibi keeps](#what-chibi-keeps)).
 - After the Glamsterdam upgrade, each block's access list (EIP-7928) keeps those keys current. Before it, chibi proves the pinned keys again at every new head and re-proves the learned keys in the background.
 - `eth_call` and `eth_estimateGas` run in a local EVM. A missing key is fetched with a proof and the call runs again.
@@ -25,7 +25,7 @@ JSON-RPC opens as soon as the head is verified. Pinned and learned keys are prov
 
 ## Peers and keys
 
-A peer is any devp2p node chibi is connected to. A state peer is a peer that speaks snap/2, the protocol that serves the account and storage proofs chibi needs. Most Sepolia nodes do not, so chibi can have many peers and no state peer; without one, the head and state requests stall.
+A peer is any devp2p node chibi is connected to. A state peer is a peer that speaks snap/1 or snap/2, the protocols that serve the account and storage proofs chibi needs. Many Sepolia nodes speak neither, so chibi can have many peers and no state peer; without one, the head and state requests stall. Block access lists come from snap/2 peers or eth/71 peers, never over snap/1.
 
 Pinned keys come from the config: each watched address's account and the balance keys of every token in the [token list](#token-list), the keys ENS lookups read, and the slots of `[[contracts]]`. chibi proves them at start, keeps them current, and never evicts them; one that no state peer can prove at a new head stays unheld and is retried, without holding the head back. Learned keys are the accounts and slots your wallet's requests read. chibi keeps them current too, but the 1024 budget counts pinned and learned keys together: while the total is over 1024, the least recently used learned key is evicted. Pinned keys are never evicted, so a large pinned set leaves less room for learned keys.
 
@@ -84,11 +84,11 @@ chibi stop       # stops a background chibi
 
 On first start chibi needs a weak-subjectivity checkpoint for the light client. Without one in the config, it takes the newest checkpoint from public checkpoint services and logs a warning. Later starts reuse the checkpoint the light client saved.
 
-chibi then waits for a state peer (snap/2), logging `waiting for a state peer (snap/2)` with the peer and state peer counts every 30 seconds. On Sepolia this has taken from a few seconds to several minutes, because few peers serve snap/2 (on 2026-10-05 only Nethermind nodes did). chibi dials a short list of known state peers and the outbound state peers it reached on earlier runs first. When the first one connects, chibi prints a small cat and `found a state peer` to standard output (with `node -b`, into `chibi.log`). The JSON-RPC server opens only after the first verified head.
+chibi then waits for a state peer (snap), logging `waiting for a state peer (snap)` with the peer and state peer counts every 30 seconds. On Sepolia this took from a few seconds to several minutes while chibi spoke only snap/2, which only Nethermind nodes served (2026-10-05). On 2026-10-16, 10 of 17 Sepolia peers were state peers: 6 Nethermind nodes announcing snap/1 and snap/2, and 4 Geth nodes announcing snap/1 only. chibi dials a short list of known state peers and the outbound state peers it reached on earlier runs first. When the first one connects, chibi prints a small cat and `found a state peer` to standard output (with `node -b`, into `chibi.log`). The JSON-RPC server opens only after the first verified head.
 
 When the log shows `JSON-RPC on http://127.0.0.1:8545, chain id 11155111`, add a custom network in your wallet with that URL and chain id (with a config, the URL uses its `rpc_host` and `rpc_port`).
 
-Once serving, chibi logs a `status` line every minute, such as `status head=9372110 peers=12 state_peers=2 pinned=3/3 learned=41/42`. It gives the verified head, the connected peers and state peers, and how many pinned and learned keys the head holds out of how many there are (see [Peers and keys](#peers-and-keys)). After a reanchor, learned keys are proven again in the background, so `learned` can briefly lag. A pinned key no state peer can prove at a new head never holds the head back: chibi moves to the head without it and keeps retrying it, so `pinned` can lag too. The warning `no state peer (snap/2) connected` repeats while no state peer is connected, and another names up to five pinned keys the head has lacked for two status lines in a row; a key still warming right after start is not reported.
+Once serving, chibi logs a `status` line every minute, such as `status head=9372110 peers=12 state_peers=2 pinned=3/3 learned=41/42`. It gives the verified head, the connected peers and state peers, and how many pinned and learned keys the head holds out of how many there are (see [Peers and keys](#peers-and-keys)). After a reanchor, learned keys are proven again in the background, so `learned` can briefly lag. A pinned key no state peer can prove at a new head never holds the head back: chibi moves to the head without it and keeps retrying it, so `pinned` can lag too. The warning `no state peer (snap) connected` repeats while no state peer is connected, and another names up to five pinned keys the head has lacked for two status lines in a row; a key still warming right after start is not reported.
 
 `chibi status` reads the snapshot saved at the last verified head, so it works without a running node. For each watched address it shows the address's primary ENS name, ETH, the nonce, and every listed token whose balance chibi can compute from the keys it holds and is not zero, in list order. Every listed token is pinned for each watched address, so its balance shows once the first head is proven. Those values are labeled with their block and are not re-verified.
 
@@ -175,7 +175,7 @@ Data (light-client checkpoint, devp2p key, `chibi.db` with the saved snapshot, p
 
 ### Peers
 
-chibi reads state from state peers: devp2p peers that speak snap/2 and so can serve proofs. By default it finds peers through discovery, starting from the network's boot nodes, and also dials the network's built-in state peers (Sepolia has four; mainnet has none) and the state peers it reached on earlier runs. These keys change that. Each has a flag: `chibi init` writes it into the config, and `chibi node` and `chibi wallet` use it for that run only.
+chibi reads state from state peers: devp2p peers that speak snap/1 or snap/2 and so can serve proofs. By default it finds peers through discovery, starting from the network's boot nodes, and also dials the network's built-in state peers (Sepolia has four; mainnet has none) and the state peers it reached on earlier runs. These keys change that. Each has a flag: `chibi init` writes it into the config, and `chibi node` and `chibi wallet` use it for that run only.
 
 | Field | Flag | Default | Meaning |
 |---|---|---|---|
@@ -219,7 +219,7 @@ Limits:
 
 - State is served only at the verified head (`latest` and `pending`) and the 8 blocks before it, by number or hash. Older blocks, `eth_getLogs`, and filters return error `-32004`.
 - Block responses carry header fields and an empty transaction list.
-- If every state peer disconnects, chibi keeps serving its last verified head as `latest` and logs `step failed` (`no connected peer serves state (snap/2)`) until one returns. `eth_syncing` still reports `false`.
+- If every state peer disconnects, chibi keeps serving its last verified head as `latest` and logs `step failed` (`no connected peer serves state (snap)`) until one returns. `eth_syncing` still reports `false`.
 - Receipts and transaction lookups cover only transactions sent through chibi.
 - Blob transactions are rejected.
 
@@ -232,7 +232,7 @@ A peer that lies can delay chibi but cannot make it serve a wrong value, because
 ```sh
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo run -p chibi-node --example live_probe   # live Sepolia: verified header and snap/2 replies
+cargo run -p chibi-node --example live_probe   # live Sepolia: verified header and snap replies
 cargo run -p chibi-node --example live_node -- 0xAddress   # live Sepolia: a full node start
 scripts/oracle-check.sh 0xAddress   # compare a running chibi with a public RPC at chibi's head
 ```

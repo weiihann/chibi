@@ -35,6 +35,6 @@ Preconditions:
 
 - An unfunded or underpriced transaction still returns a hash, because chibi broadcasts without a mempool. Peers drop it silently and `cast send` times out. Check the balance with `cast balance` first.
 - Receipts exist only for transactions sent through this chibi instance. Looking up someone else's transaction returns `null`.
-- A stale head (see `doctor.sh`) stalls inclusion: the receipt never appears until a state peer (snap/2) returns.
+- A stale head (see `doctor.sh`) stalls inclusion: the receipt never appears until a state peer (snap) returns.
 - Never write the private key into evidence. `cast send --json` output does not contain it; keep it that way when adding commands.
 - Pending transactions survive a restart through the outbox in the data directory's `chibi.db`. `cleanup.sh` deletes the data directory, so finish the receipt check before cleanup.

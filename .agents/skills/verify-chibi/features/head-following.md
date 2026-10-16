@@ -30,7 +30,7 @@ Preconditions:
 
 ## Gotchas
 
-- `step failed ... no connected peer serves state (snap/2)` followed by no new `head verified` lines is the stale-head state: chibi keeps serving its last head and `eth_syncing` still answers `false`. It is a real behaviour to report, not a harness fault.
+- `step failed ... no connected peer serves state (snap)` followed by no new `head verified` lines is the stale-head state: chibi keeps serving its last head and `eth_syncing` still answers `false`. It is a real behaviour to report, not a harness fault.
 - helios attests a head about 4 s into each slot, and under Gloas one slot late, so chibi's head trails the explorer by a block or two.
 - `chibi status` values are a display snapshot from disk. They prove persistence, not verification.
 - After the fork, an `Extended` step makes no proof requests for keys chibi holds; only unheld keys are warmed. Compare the values with `oracle-check.sh` anyway; that is the only check that the access list was applied correctly.
