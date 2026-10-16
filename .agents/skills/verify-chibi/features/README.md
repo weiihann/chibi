@@ -22,7 +22,7 @@ This directory is the maintained source for verifying chibi's user-facing behavi
 - Capture the action and the resulting state, and say which block it was at.
 - RPC proof is chibi's response next to the oracle's at the same block.
 - CLI proof is the command, its output, and its exit code.
-- Node proof is the matching `chibi.log` line.
+- Node proof is the matching `chibi.log` line, grepped from `.agents/skills/verify-chibi/scripts/log.sh "$RUN_DIR"` (the raw file has colour codes around field names).
 - Name the feature ID and entry point with each artifact.
 - Report an unreachable path with the command tried and the unmet precondition: fork not active, no funded key, or a stale head from `doctor.sh`.
 
@@ -32,9 +32,9 @@ Each feature file has an H1 title and one paragraph describing the user-visible 
 
 ## Features
 
-- [Verified state reads](./state-reads.md) covers balances, nonces, token balances, code, storage, `eth_call`, and gas estimates against the oracle. Runs before the fork.
-- [Head following](./head-following.md) covers reanchoring every block before the fork, applying block access lists after it, staleness, and `chibi status`.
-- [Send and confirm](./send-and-confirm.md) covers sending a signed transaction through chibi and getting a verified receipt. Needs a funded Sepolia key.
-- [Onboarding](./onboarding.md) covers `install.sh`, interactive and flag-driven `chibi init`, and the first `chibi node`.
+- [Verified state reads](./state-reads.md) covers balances, nonces, token balances, code, storage, `eth_call`, and gas estimates against the oracle.
+- [Head following](./head-following.md) covers applying block access lists at each head, reanchoring when it cannot, state peers and staleness, and `chibi status`.
+- [Send and confirm](./send-and-confirm.md) covers sending a signed transaction through chibi and getting a verified receipt. Needs a funded Sepolia keystore.
+- [Onboarding](./onboarding.md) covers `install.sh` (download, checksum, install; tested from a local release), interactive and flag-driven `chibi init`, the first `chibi node`, and running without a config.
 - [RPC exposure](./rpc-exposure.md) covers the Host filter, the CORS allowlist, unsupported methods, and block responses.
-- [Terminal UI](./tui.md) covers `chibi wallet`: keystore unlock, the state-peer wait and its cat, the transfer form and its validation, sending and tracking to a verified receipt, the state-peer pause, and the Sepolia-only rule. Driven in tmux on a scratch port with a scratch keystore; sending needs a funded Sepolia key.
+- [Terminal UI](./tui.md) covers `chibi wallet`: wallet setup, keystore unlock, watch-only mode, the state-peer wait and its cat, the transfer form with its editing keys and validation, sending to an address or ENS name and tracking to a verified receipt and explorer link, the state-peer pause, and the Sepolia-only rule. Driven in tmux on a scratch port with a scratch keystore; sending needs a funded Sepolia keystore.

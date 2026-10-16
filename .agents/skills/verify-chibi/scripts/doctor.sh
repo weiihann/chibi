@@ -28,8 +28,7 @@ fi
 listener=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
 [ "$listener" = "$pid" ] && ok "port $PORT is held by pid $pid" || fail "port $PORT is held by '${listener:-nobody}', not $pid"
 
-esc=$(printf '\033')
-log=$(sed "s/${esc}\[[0-9;]*m//g" "$run_dir/chibi.log")
+log=$("$(dirname "$0")/log.sh" "$run_dir")
 printf '%s\n' "$log" | grep -q "data_dir=$run_dir/home" && ok "data dir is inside $run_dir/home" \
     || fail "log does not show a data dir under $run_dir/home"
 
