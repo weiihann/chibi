@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alloy_primitives::{Address, BlockNumber, address};
+use alloy_primitives::{Address, BlockNumber, TxHash, address};
 use reth_chainspec::{ChainSpec, MAINNET, SEPOLIA, mainnet, sepolia};
 use reth_network_peers::{NodeRecord, mainnet_nodes, parse_nodes, sepolia_nodes};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,7 @@ impl Network {
                 state_peers: parse_nodes(SEPOLIA_SNAP_PEERS),
                 tokens: SEPOLIA_TOKENS,
                 ens_resolver: SEPOLIA_ENS_RESOLVER,
+                explorer: Explorer("https://sepolia.etherscan.io"),
                 clock: BlockClock {
                     number: sepolia::SEPOLIA_OSAKA_BLOCK,
                     timestamp: sepolia::SEPOLIA_OSAKA_TIMESTAMP,
@@ -79,6 +80,7 @@ impl Network {
                 state_peers: Vec::new(),
                 tokens: MAINNET_TOKENS,
                 ens_resolver: MAINNET_ENS_RESOLVER,
+                explorer: Explorer("https://etherscan.io"),
                 clock: BlockClock {
                     number: mainnet::MAINNET_OSAKA_BLOCK,
                     timestamp: mainnet::MAINNET_OSAKA_TIMESTAMP,
@@ -133,6 +135,8 @@ pub struct NetworkSpec {
     /// ENS's UniversalResolver, whose `reverse` gives each watched address's primary name
     /// after checking that the name resolves back to the address.
     pub ens_resolver: Address,
+    /// The block explorer chibi links sent transactions to. chibi never contacts it.
+    pub explorer: Explorer,
     /// A block with a known number and timestamp, for estimating the head from the wall clock.
     pub clock: BlockClock,
 }
@@ -163,6 +167,17 @@ pub struct Token {
     pub address: Address,
     /// Decimal places of one whole token.
     pub decimals: u8,
+}
+
+/// A block explorer, by its base URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Explorer(pub &'static str);
+
+impl Explorer {
+    /// The page of the transaction `hash`.
+    pub fn tx_url(self, hash: TxHash) -> String {
+        format!("{}/tx/{hash}", self.0)
+    }
 }
 
 /// A post-merge block whose number and timestamp are known.

@@ -20,7 +20,7 @@ pub use beacon::{Beacon, BeaconConfig, BeaconError};
 pub use devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, NodeRecord, Ports};
 pub use disk::Disk;
 pub use heads::{Heads, HeadsSender};
-pub use network::{Network, NetworkSpec, Token};
+pub use network::{Explorer, Network, NetworkSpec, Token};
 pub use node::{
     BlockSel, ContractSnapshot, FeeHistory, Follower, Health, Held, Holding, Node, NodeConfig,
     NodeError, Snapshot, Startup, Status, Stepped, SubmittedTx, TrackedContract, TxReceipt,

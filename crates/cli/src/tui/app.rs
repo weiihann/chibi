@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, TxHash, U256};
-use chibi_node::{Network, Startup, Token};
+use chibi_node::{Explorer, Network, Startup, Token};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -498,6 +498,8 @@ pub struct App {
     pub screen: Screen,
     /// The followed network.
     pub network: Network,
+    /// Its block explorer.
+    pub explorer: Explorer,
     /// Its chain id.
     pub chain_id: u64,
     /// The network's registry tokens.
@@ -566,6 +568,7 @@ impl App {
         Self {
             screen: Screen::Unlock,
             network,
+            explorer: network.spec().explorer,
             chain_id,
             registry,
             frame: 0,

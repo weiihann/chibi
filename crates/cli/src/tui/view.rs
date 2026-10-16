@@ -1100,6 +1100,9 @@ fn sending(app: &App, now: Instant) -> Body {
         }
     };
     lines.push(Line::raw(status));
+    if let (SendState::Succeeded | SendState::Failed, Some(hash)) = (&sending.state, sending.hash) {
+        lines.push(Line::raw(app.explorer.tx_url(hash)));
+    }
     match ascii {
         Some(ascii) => Body::Scene {
             cat: cat(app, now, ascii),
