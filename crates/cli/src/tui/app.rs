@@ -1023,6 +1023,7 @@ impl App {
             }
             Err(reason) => sending.state = SendState::Rejected(reason),
         }
+        self.settle_quit_warning();
     }
 
     /// The node's view of the sent transfer.
@@ -1037,11 +1038,17 @@ impl App {
             Tracked::Receipt { success: false } => SendState::Failed,
             Tracked::Dropped => SendState::Dropped,
         };
-        if self.quit_armed && !sending.in_flight() {
-            self.quit_armed = false;
-            if self.notice.as_deref() == Some(QUIT_WARNING) {
-                self.notice = None;
-            }
+        self.settle_quit_warning();
+    }
+
+    /// Drops the quit warning once no transfer is in flight.
+    fn settle_quit_warning(&mut self) {
+        if self.sending.as_ref().is_some_and(Sending::in_flight) {
+            return;
+        }
+        self.quit_armed = false;
+        if self.notice.as_deref() == Some(QUIT_WARNING) {
+            self.notice = None;
         }
     }
 
