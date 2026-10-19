@@ -23,10 +23,10 @@ A full node holds all of Ethereum's state and takes days to sync. An RPC provide
 | | Full node | RPC provider | chibi |
 |---|---|---|---|
 | Ready to serve | days | instantly | **in minutes** |
-| State on disk | the whole chain | none | **kilobytes** |
+| Data on disk | the whole chain | none | **kilobytes** |
 | Checks the answers | yes, by re-executing | no | **yes, every value by proof** |
 
-From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs. A chibi that had run for days kept 36 KB in its data directory.
+From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs. Its data directory holds about 36 KB: the proven state itself stays in memory.
 
 ## What you get
 
