@@ -10,8 +10,8 @@ Sync the state you use in minutes. Transact through your own local RPC. Trust no
 </p>
 
 <p align="center">
-  <a href="assets/chibi-wallet.mp4"><img alt="chibi wallet unlocking a keystore, finding a state peer, and sending 1 USDC on Sepolia with a verified receipt" src="assets/chibi-wallet.gif" width="900"></a>
-  <br><sub><code>chibi wallet</code> sending 1 USDC on Sepolia, waits sped up. Click for the full-quality video.</sub>
+  <a href="assets/chibi-demo.mp4"><img alt="chibi node starting on Sepolia and opening JSON-RPC, then MetaMask sending 20 USDC through it, confirmed on Etherscan" src="assets/chibi-demo.gif" width="900"></a>
+  <br><sub><code>chibi node</code> serving MetaMask on Sepolia, waits sped up. Click to download the full-quality MP4.</sub>
 </p>
 
 ```sh
