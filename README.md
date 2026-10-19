@@ -41,6 +41,11 @@ From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs
 - **Direct sends.** Signed transactions go straight to Ethereum peers, and their receipts are proven too.
 - **A terminal wallet.** `chibi wallet` sends ETH and tokens, resolves ENS names, watches balances read-only, and has cats.
 
+<p align="center">
+  <a href="assets/chibi-wallet.mp4"><img alt="chibi wallet unlocking a keystore, finding a state peer, and sending 1 USDC on Sepolia with a verified receipt" src="assets/chibi-wallet.gif" width="900"></a>
+  <br><sub><code>chibi wallet</code> sending 1 USDC on Sepolia, waits sped up. Click to download the full-quality MP4.</sub>
+</p>
+
 ## Commands
 
 | Command | |
