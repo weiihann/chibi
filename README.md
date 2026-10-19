@@ -9,6 +9,11 @@ Sync the state you use in minutes. Transact through your own local RPC. Trust no
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green"></a>
 </p>
 
+<p align="center">
+  <a href="assets/chibi-wallet.mp4"><img alt="chibi wallet unlocking a keystore, finding a state peer, and sending 1 USDC on Sepolia with a verified receipt" src="assets/chibi-wallet.gif" width="900"></a>
+  <br><sub><code>chibi wallet</code> sending 1 USDC on Sepolia, waits sped up. Click for the full-quality video.</sub>
+</p>
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/weiihann/chibi/main/install.sh | sh
 chibi node
