@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, TxHash};
 use alloy_signer_local::PrivateKeySigner;
-use chibi_node::{Holding, Node, NodeConfig, Peers, Startup, Token};
+use chibi_core::history::send_check;
+use chibi_node::{History, Holding, Node, NodeConfig, NodeError, Peers, Startup, Token};
 use crossterm::event::{self, Event, KeyEventKind};
 use eyre::WrapErr;
 use ratatui::Terminal;
@@ -28,16 +29,20 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::fmt::MakeWriter;
 
-use self::app::{Action, App, Balances, CAT_FRAME, RequestId};
+use self::app::{Action, App, Balances, CAT_FRAME, HistoryLines, HistoryPane, RequestId};
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
 use self::wallet::Saved;
+use crate::activity::{NO_HISTORY, activity_line, coverage_line, recent, unix_now};
 use crate::config::process_env;
 use crate::names::printable;
 use crate::run::{self, STARTING, Served};
 
 /// Log lines kept for the log pane.
 const LOG_LINES: usize = 1_000;
+
+/// Activities the history pane loads, newest first.
+const HISTORY_ACTIVITIES: usize = 50;
 
 /// How often the TUI animates the ASCII cats, reads the node's health, and tracks a sent
 /// transfer.
@@ -238,6 +243,7 @@ fn release_raw() {
 /// What a background task finished.
 enum Done {
     Balances(Vec<(Address, Balances)>),
+    History(Address, Option<HistoryLines>),
     Estimated(Box<(Quote, u64, Result<Quoted, String>)>),
     Resolved(RequestId, Result<Address, String>),
     Sent(Result<TxHash, String>),
@@ -276,6 +282,8 @@ pub fn run(
     let mut app = App::new(node_config.network, spec.chain_id(), spec.tokens, logs_open);
     app.pixel_cats = cat::supported(process_env);
     app.watch_list(&node_config.watch.addresses);
+    app.history = node_config.watch.history.then(HistoryPane::default);
+    let data_dir = node_config.data_dir.clone();
     if wallet == Wallet::Setup {
         app.setup(process_env("HOME").map(PathBuf::from));
     }
@@ -334,7 +342,7 @@ pub fn run(
             node,
             quit,
         };
-        ui.drive(node_task, session).await
+        ui.drive(node_task, session, &data_dir).await
     });
     drop(ui);
     let rendered = renderer
@@ -506,6 +514,7 @@ impl Ui<'_> {
         &mut self,
         node_task: NodeTask<P>,
         session: Session,
+        data_dir: &Path,
     ) -> eyre::Result<()> {
         let NodeTask {
             task: mut serving,
@@ -580,6 +589,7 @@ impl Ui<'_> {
                     }
                     Some(finished) = tasks.join_next() => match finished {
                         Ok(Done::Balances(balances)) => self.app.refreshed(balances),
+                        Ok(Done::History(account, lines)) => self.app.history_read(account, lines),
                         Ok(Done::Estimated(estimated)) => {
                             let (quote, head, quoted) = *estimated;
                             self.app.estimated(quote, head, quoted);
@@ -600,8 +610,12 @@ impl Ui<'_> {
                                 health.pinned.total,
                                 health.seeded,
                             );
-                            if self.app.balances_request(health.head.number, health.pinned.held) {
+                            let due = self.app.balances_request(health.head.number, health.pinned.held);
+                            if due {
                                 refresh_balances(node, self.app.registry, &mut tasks);
+                            }
+                            if let Some(account) = self.app.history_request(due) {
+                                refresh_history(data_dir, account, self.app.registry, &mut tasks);
                             }
                             if let Some(hash) = self.app.tracking()
                                 && let Some(tracked) = transfer::track(node, hash)
@@ -670,6 +684,47 @@ fn refresh_balances<P: Peers>(
             .collect();
         Done::Balances(balances)
     });
+}
+
+/// Reads `account`'s history from `data_dir` off the event loop. A failed read is logged and
+/// answered with no lines, so the pane keeps its last ones.
+fn refresh_history(
+    data_dir: &Path,
+    account: Address,
+    registry: &'static [Token],
+    tasks: &mut JoinSet<Done>,
+) {
+    let data_dir = data_dir.to_owned();
+    tasks.spawn_blocking(move || {
+        let lines = read_history(&data_dir, account, registry, unix_now())
+            .inspect_err(|err| tracing::warn!(%err, %account, "cannot read the account history"))
+            .ok();
+        Done::History(account, lines)
+    });
+}
+
+/// `account`'s coverage line and its newest [`HISTORY_ACTIVITIES`] activities at `now`.
+fn read_history(
+    data_dir: &Path,
+    account: Address,
+    registry: &[Token],
+    now: u64,
+) -> Result<HistoryLines, NodeError> {
+    let Some(history) = History::open(data_dir)? else {
+        return Ok(HistoryLines {
+            coverage: NO_HISTORY.to_owned(),
+            activities: Vec::new(),
+        });
+    };
+    let coverage = history.coverage(account)?;
+    let activities = recent(&history, account, HISTORY_ACTIVITIES)?
+        .iter()
+        .map(|activity| activity_line(activity, account, registry, now))
+        .collect();
+    Ok(HistoryLines {
+        coverage: coverage_line(&coverage, &send_check(&coverage)),
+        activities,
+    })
 }
 
 /// The ETH balance, every registry token held with a nonzero balance, and the primary name
@@ -904,7 +959,7 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(5),
-            ui.drive(node_task, Session::Wallet(Arc::new(signer))),
+            ui.drive(node_task, Session::Wallet(Arc::new(signer)), dir.path()),
         )
         .await
         .expect("the UI ends while the terminal blocks")
@@ -1040,5 +1095,18 @@ mod tests {
             ..holding
         };
         assert_eq!(balances(&spoofed, &registry).name, None);
+    }
+
+    #[test]
+    fn history_reads_as_no_history_yet_before_anything_is_recorded() {
+        let account = address!("0x00000000000000000000000000000000000000aa");
+        let empty = HistoryLines {
+            coverage: "no history yet".to_owned(),
+            activities: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_history(dir.path(), account, &[], 0).unwrap(), empty);
+        drop(Disk::open(dir.path()).unwrap());
+        assert_eq!(read_history(dir.path(), account, &[], 0).unwrap(), empty);
     }
 }

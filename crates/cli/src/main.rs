@@ -18,18 +18,16 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::Address;
-use chibi_core::history::{Activity, Coverage, decode, send_check};
+use chibi_core::history::{Activity, Coverage, send_check};
 use chibi_node::disk::Holder;
 use chibi_node::{Disk, History, Network, NodeError, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 use eyre::WrapErr;
 
-use crate::activity::{ETH_DECIMALS, activity_line, coverage_line, format_units};
+use crate::activity::{ETH_DECIMALS, activity_line, coverage_line, format_units, recent, unix_now};
 use crate::config::{absolute_path, default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::names::printable;
@@ -169,7 +167,7 @@ fn read_histories(
     let mut histories = BTreeMap::new();
     for holding in &snapshot.holdings {
         let coverage = history.coverage(holding.address)?;
-        let recent = recent(&history, holding.address)?;
+        let recent = recent(&history, holding.address, RECENT)?;
         histories.insert(holding.address, AccountHistory { coverage, recent });
     }
     let covered = histories.values().any(|account| {
@@ -183,23 +181,6 @@ fn read_histories(
         histories.clear();
     }
     Ok(histories)
-}
-
-/// The account's newest [`RECENT`] activities, newest first.
-fn recent(history: &History, account: Address) -> Result<Vec<Activity>, NodeError> {
-    let rows = NonZeroUsize::MIN.saturating_add(RECENT - 1);
-    let mut found = Vec::with_capacity(RECENT);
-    let mut before = None;
-    while found.len() < RECENT {
-        let page = history.page(account, before, rows)?;
-        found.extend(decode(&page));
-        match page.next {
-            Some(next) => before = Some(next),
-            None => break,
-        }
-    }
-    found.truncate(RECENT);
-    Ok(found)
 }
 
 fn write_full_status<W: Write>(
@@ -223,12 +204,6 @@ fn write_full_status<W: Write>(
             "no snapshot for {network} yet; it is saved once `chibi node` or `chibi wallet` verifies its first head"
         ),
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn write_running<W: Write>(output: &mut W, running: Option<&Holder>) -> io::Result<()> {

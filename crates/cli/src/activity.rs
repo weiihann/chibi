@@ -1,14 +1,47 @@
 //! Account history as lines of text: one line per activity and one coverage line per account.
-//! Pure, so `chibi status` and the wallet show history in the same words.
+//! The formatting is pure, so `chibi status` and the wallet show history in the same words.
 
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, U256};
-use chibi_core::history::{Activity, Capability, Coverage, Effect, SendCheck};
-use chibi_node::Token;
+use chibi_core::history::{Activity, Capability, Coverage, Effect, SendCheck, decode};
+use chibi_node::{History, NodeError, Token};
+
+/// What the coverage line says for an account history holds nothing for.
+pub const NO_HISTORY: &str = "no history yet";
 
 /// Decimal places of one ether.
 pub const ETH_DECIMALS: u8 = 18;
+
+/// The newest `count` activities of `account`, newest first.
+pub fn recent(
+    history: &History,
+    account: Address,
+    count: usize,
+) -> Result<Vec<Activity>, NodeError> {
+    let rows = NonZeroUsize::MIN.saturating_add(count.saturating_sub(1));
+    let mut found = Vec::with_capacity(count);
+    let mut before = None;
+    while found.len() < count {
+        let page = history.page(account, before, rows)?;
+        found.extend(decode(&page));
+        match page.next {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+    found.truncate(count);
+    Ok(found)
+}
+
+/// The current Unix time in seconds, 0 if the clock is before 1970.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
 
 /// `value` base units as a decimal with `decimals` places, trailing zeros trimmed to two.
 pub fn format_units(value: U256, decimals: u8) -> String {
@@ -246,7 +279,7 @@ pub fn coverage_line(coverage: &Coverage, check: &SendCheck) -> String {
     let Some((ranges, first, last)) =
         logs.and_then(|ranges| Some((ranges, ranges.first()?, ranges.last()?)))
     else {
-        return "no history yet".to_owned();
+        return NO_HISTORY.to_owned();
     };
     let gaps: Vec<String> = ranges
         .gaps(first, last)

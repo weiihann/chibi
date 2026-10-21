@@ -94,6 +94,8 @@ pub struct View {
     body: Body,
     /// The keys the footer names, packed into rows when drawn.
     keys: &'static [&'static str],
+    /// Whether the footer names `h history` before `l logs`.
+    history_key: bool,
     notice: Option<String>,
     /// The tail of the log buffer, oldest first, while the log pane is open.
     logs: Option<Vec<String>>,
@@ -304,6 +306,7 @@ impl View {
             header: header_line(app),
             body: body(app, now),
             keys: keys(app),
+            history_key: app.history_key() && !app.history_shown(),
             notice: app.notice.clone(),
             logs: app.logs.then_some(logs),
         }
@@ -363,7 +366,8 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
         Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
             .wrap(Wrap { trim: false })
     });
-    let (mut areas, mut footer) = split(area, view.keys, notice.as_ref(), pane);
+    let keys = with_history(view.keys, view.history_key);
+    let (mut areas, mut footer) = split(area, &keys, notice.as_ref(), pane);
     match view.body {
         Body::Scene { cat, lines } => scene(frame, cat, lines, areas[0]),
         Body::Page { rows, side, picker } => page(frame, rows, side, picker, areas[0]),
@@ -375,7 +379,8 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
         } => {
             let list = WatchList::new(addresses, first, after, area.width);
             if list.scrolls(areas[0].height) {
-                (areas, footer) = split(area, WATCH_SCROLL_KEYS, notice.as_ref(), pane);
+                let keys = with_history(WATCH_SCROLL_KEYS, view.history_key);
+                (areas, footer) = split(area, &keys, notice.as_ref(), pane);
             }
             let rows = list.rows(areas[0].height);
             page(frame, rows, side, None, areas[0]);
@@ -614,6 +619,9 @@ fn plain(write: impl FnOnce(&mut Vec<Line<'static>>)) -> Body {
 }
 
 fn body(app: &App, now: Instant) -> Body {
+    if app.history_shown() {
+        return plain(|lines| history(app, lines));
+    }
     match app.screen {
         Screen::Menu => plain(|lines| menu(app, lines)),
         Screen::Backup => plain(|lines| backup(app, lines)),
@@ -1112,11 +1120,57 @@ fn sending(app: &App, now: Instant) -> Body {
     }
 }
 
+/// The history pane: the account, its coverage, then its activities from the first scrolled
+/// to, as many as the body holds.
+fn history(app: &App, lines: &mut Vec<Line<'static>>) {
+    let Some(account) = app.history_account() else {
+        return;
+    };
+    lines.push(Line::raw(format!("  {}", account.to_checksum(None))));
+    let read = app
+        .history
+        .as_ref()
+        .and_then(|pane| Some((pane.read.as_ref()?, pane.first)));
+    match read {
+        Some(((read, history), first)) if *read == account => {
+            lines.push(Line::raw(format!("  {}", history.coverage)));
+            if history.activities.is_empty() {
+                return;
+            }
+            lines.push(Line::default());
+            lines.extend(
+                history.activities[first.min(history.activities.len())..]
+                    .iter()
+                    .map(|activity| Line::raw(format!("  {activity}"))),
+            );
+        }
+        Some(_) | None => lines.push(Line::raw("  reading history...")),
+    }
+}
+
 /// The keys the footer names on Watching when some address is hidden.
 const WATCH_SCROLL_KEYS: &[&str] = &["up/down scroll", "l logs", "q quit"];
 
+/// The keys the footer names while the history pane is open.
+const HISTORY_KEYS: &[&str] = &["up/down scroll", "h/Esc close", "l logs", "q quit"];
+
+/// `keys` with `h history` before `l logs` when `history`.
+fn with_history(keys: &[&'static str], history: bool) -> Vec<&'static str> {
+    let mut all = Vec::with_capacity(keys.len() + 1);
+    for &key in keys {
+        if history && key == "l logs" {
+            all.push("h history");
+        }
+        all.push(key);
+    }
+    all
+}
+
 /// The keys the footer names on `app`'s screen.
 fn keys(app: &App) -> &'static [&'static str] {
+    if app.history_shown() {
+        return HISTORY_KEYS;
+    }
     match app.screen {
         Screen::Menu => &["up/down choose", "Enter select", "Esc quit"],
         Screen::Backup => &[
@@ -1242,7 +1296,9 @@ mod tests {
     use ratatui::buffer::{Buffer, Cell};
 
     use super::*;
-    use crate::tui::app::{Balances, EXCITED_FOR, EnsName, Picker, Review, Sending};
+    use crate::tui::app::{
+        Balances, EXCITED_FOR, EnsName, HistoryLines, HistoryPane, Picker, Review, Sending,
+    };
     use crate::tui::transfer::Draft;
 
     const SENDER: Address = address!("0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025");
@@ -2535,5 +2591,113 @@ mod tests {
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");
         }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn with_history(mut app: App) -> App {
+        app.history = Some(HistoryPane::default());
+        app
+    }
+
+    #[test]
+    fn the_open_history_pane_shows_the_coverage_then_the_newest_activities() {
+        let mut app = with_history(ready());
+        press(&mut app, KeyCode::Char('h'));
+        let account = "  0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025";
+        let rows = inside_rows(&app, 120, 30);
+        assert_eq!(rows[..3], ["", account, "  reading history..."]);
+
+        assert_eq!(app.history_request(false), Some(SENDER));
+        let coverage = "history since block 11,856,337 · gaps: none · no sends found";
+        let activities: Vec<String> = (0..40)
+            .map(|n| format!("11,900,{n:03}  {n} min ago  +0.001 ETH from 0x1111…2222"))
+            .collect();
+        app.history_read(
+            SENDER,
+            Some(HistoryLines {
+                coverage: coverage.to_owned(),
+                activities: activities.clone(),
+            }),
+        );
+        let rows = inside_rows(&app, 120, 30);
+        assert_eq!(
+            rows[..5],
+            [
+                "",
+                account,
+                &format!("  {coverage}"),
+                "",
+                &format!("  {}", activities[0])
+            ]
+        );
+        assert!(rows.contains(&format!("  {}", activities[1])), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("amount")), "{rows:?}");
+        assert_eq!(
+            rows.last().unwrap(),
+            "up/down scroll · h/Esc close · l logs · q quit"
+        );
+
+        press(&mut app, KeyCode::Down);
+        let rows = inside_rows(&app, 120, 30);
+        assert_eq!(rows[4], format!("  {}", activities[1]));
+        press(&mut app, KeyCode::Esc);
+        assert!(inside(&app, &[], 120, 30).contains("> amount"));
+    }
+
+    #[test]
+    fn the_history_pane_says_when_nothing_is_recorded_yet() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(WEIHAN));
+        app.history_read(
+            WEIHAN,
+            Some(HistoryLines {
+                coverage: crate::activity::NO_HISTORY.to_owned(),
+                activities: Vec::new(),
+            }),
+        );
+        let rows = inside_rows(&app, 120, 30);
+        assert_eq!(
+            rows[..3],
+            [
+                "",
+                "  0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7",
+                "  no history yet"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_footer_names_the_history_key_only_with_history_on() {
+        let twelve: Vec<Address> = (1..=12).map(Address::with_last_byte).collect();
+        let cases = [
+            (
+                ready(),
+                "Enter review · l logs",
+                "h history · l logs · q quit",
+            ),
+            (watching(), "l logs · q quit", "h history · l logs · q quit"),
+            (
+                watching_only(&twelve),
+                "up/down scroll · l logs · q quit",
+                "up/down scroll · h history · l logs · q quit",
+            ),
+        ];
+        for (app, off, on) in cases {
+            let shown = inside(&app, &[], 120, 16);
+            assert!(
+                shown.contains(off) && !shown.contains("h history"),
+                "{shown}"
+            );
+            let app = with_history(app);
+            let shown = inside(&app, &[], 120, 16);
+            assert!(shown.contains(on), "{shown}");
+        }
+        let mut app = with_history(ready());
+        app.form.field = Field::To;
+        assert!(!inside(&app, &[], 120, 30).contains("h history"));
     }
 }

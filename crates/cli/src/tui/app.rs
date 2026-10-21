@@ -493,6 +493,54 @@ impl Setup {
     }
 }
 
+/// What history holds for one account, as display lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryLines {
+    /// Where its coverage starts, its gaps, and whether its sends are complete.
+    pub coverage: String,
+    /// Its newest activities, newest first.
+    pub activities: Vec<String>,
+}
+
+/// The history pane, which exists only when history is on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryPane {
+    /// Whether it is open over the body.
+    pub open: bool,
+    /// The lines last read and the account they are about; `None` before the first read.
+    pub read: Option<(Address, HistoryLines)>,
+    /// The index in the activities of the first shown.
+    pub first: usize,
+    /// The account last asked for, so a failed read is retried on the next refresh rather
+    /// than on every tick.
+    asked: Option<Address>,
+    reading: bool,
+}
+
+impl HistoryPane {
+    /// Closes on `h` or Esc, and scrolls the loaded activities by one on Up and Down.
+    fn key(&mut self, key: Key) {
+        match key {
+            Key::Char('h') | Key::Esc => self.open = false,
+            Key::Up => self.first = self.first.saturating_sub(1),
+            Key::Down => {
+                let loaded = self
+                    .read
+                    .as_ref()
+                    .map_or(0, |(_, lines)| lines.activities.len());
+                self.first = (self.first + 1).min(loaded.saturating_sub(1));
+            }
+            Key::Char(_)
+            | Key::Backspace
+            | Key::EraseWord
+            | Key::EraseAll
+            | Key::Enter
+            | Key::Left
+            | Key::Right => {}
+        }
+    }
+}
+
 /// The whole TUI state.
 ///
 /// Not `Debug`: it holds the password being typed.
@@ -511,6 +559,8 @@ pub struct App {
     pub frame: u64,
     /// Whether the log pane is open.
     pub logs: bool,
+    /// The history pane; `None` when history is off.
+    pub history: Option<HistoryPane>,
     /// The password typed so far, in a buffer of [`PASSWORD_BYTES`] that is never
     /// reallocated and is wiped on unlock, on quit and on drop.
     pub password: Zeroizing<String>,
@@ -576,6 +626,7 @@ impl App {
             registry,
             frame: 0,
             logs,
+            history: None,
             password: Zeroizing::new(String::with_capacity(PASSWORD_BYTES)),
             unlocking: false,
             unlock_error: None,
@@ -693,6 +744,65 @@ impl App {
     /// Whether the session watches without a wallet: past setup and unlock with no sender.
     pub const fn watch_only(&self) -> bool {
         self.sender.is_none() && !self.screen.is_setup() && !matches!(self.screen, Screen::Unlock)
+    }
+
+    /// The account the history pane is about: the wallet's own, or while watching, the
+    /// address first in view.
+    pub fn history_account(&self) -> Option<Address> {
+        self.sender.or_else(|| {
+            self.watched
+                .get(self.watch_first)
+                .map(|(address, _)| *address)
+        })
+    }
+
+    /// Whether `h` opens the history pane on the screen up: history is on, no text field
+    /// takes the key, and the screen has a body the pane can replace.
+    pub fn history_key(&self) -> bool {
+        self.history.is_some()
+            && !self.typing_recipient()
+            && !(self.screen == Screen::Ready && self.form.picker.is_some())
+            && matches!(
+                self.screen,
+                Screen::Ready | Screen::Watching | Screen::Sending
+            )
+    }
+
+    /// Whether the history pane is open over the body.
+    pub fn history_shown(&self) -> bool {
+        self.history_key() && self.history.as_ref().is_some_and(|pane| pane.open)
+    }
+
+    /// The account to read history for, marking it asked: while the pane is open and no read
+    /// is outstanding, when `due` (the balances refresh) or the account in view is not the
+    /// one last asked for.
+    pub fn history_request(&mut self, due: bool) -> Option<Address> {
+        let account = self.history_account()?;
+        let pane = self.history.as_mut()?;
+        if !pane.open || pane.reading || !due && pane.asked == Some(account) {
+            return None;
+        }
+        pane.asked = Some(account);
+        pane.reading = true;
+        Some(account)
+    }
+
+    /// A history read for `account` finished. A failed read, `None`, keeps the last lines.
+    pub fn history_read(&mut self, account: Address, lines: Option<HistoryLines>) {
+        let Some(pane) = &mut self.history else {
+            return;
+        };
+        pane.reading = false;
+        let Some(lines) = lines else {
+            return;
+        };
+        pane.first = match &pane.read {
+            Some((read, _)) if *read == account => {
+                pane.first.min(lines.activities.len().saturating_sub(1))
+            }
+            Some(_) | None => 0,
+        };
+        pane.read = Some((account, lines));
     }
 
     /// Opens the setup menu, for a run that names no keystore, on the watch choice when the
@@ -1142,6 +1252,19 @@ impl App {
             self.logs = !self.logs;
             return None;
         }
+        if self.history_key()
+            && let Some(pane) = &mut self.history
+        {
+            if pane.open {
+                pane.key(key);
+                return None;
+            }
+            if key == Key::Char('h') {
+                pane.open = true;
+                pane.asked = None;
+                return None;
+            }
+        }
         match self.screen {
             Screen::Ready => {
                 self.form_key(key);
@@ -1188,7 +1311,7 @@ impl App {
         }
     }
 
-    /// Whether the recipient field takes every typed character, `q` and `l` included.
+    /// Whether the recipient field takes every typed character, `q`, `l` and `h` included.
     pub fn typing_recipient(&self) -> bool {
         self.screen == Screen::Ready && self.form.picker.is_none() && self.form.field == Field::To
     }
@@ -3779,5 +3902,131 @@ mod tests {
         app.refreshed(vec![(WEIHAN, held.clone()), (SENDER, held.clone())]);
         assert_eq!(app.watched, [(WEIHAN, held.clone()), (SENDER, held)]);
         assert!(!app.balances_request(100, 3));
+    }
+
+    fn with_history(mut app: App) -> App {
+        app.history = Some(HistoryPane::default());
+        app
+    }
+
+    fn history_open(app: &App) -> bool {
+        app.history.as_ref().is_some_and(|pane| pane.open)
+    }
+
+    fn history_lines(activities: usize) -> HistoryLines {
+        HistoryLines {
+            coverage: "history since block 100 · gaps: none · no sends found".to_owned(),
+            activities: (0..activities).map(|n| format!("activity {n}")).collect(),
+        }
+    }
+
+    #[test]
+    fn h_opens_and_closes_the_history_pane_on_ready_and_watching_and_esc_closes_it() {
+        for mut app in [
+            with_history(ready(Network::Sepolia)),
+            with_history(watching()),
+        ] {
+            let screen = app.screen;
+            assert_eq!(press(&mut app, KeyCode::Char('h')), None);
+            assert!(history_open(&app) && app.history_shown(), "{screen:?}");
+            assert_eq!(press(&mut app, KeyCode::Char('h')), None);
+            assert!(!history_open(&app) && !app.history_shown(), "{screen:?}");
+            press(&mut app, KeyCode::Char('h'));
+            assert_eq!(press(&mut app, KeyCode::Esc), None);
+            assert!(!history_open(&app), "{screen:?}");
+            assert_eq!(app.screen, screen);
+        }
+    }
+
+    #[test]
+    fn h_types_into_the_to_field_instead_of_opening_history() {
+        let mut app = with_history(ready(Network::Sepolia));
+        app.form.field = Field::To;
+        assert_eq!(press(&mut app, KeyCode::Char('h')), None);
+        assert_eq!((app.form.to.as_str(), history_open(&app)), ("h", false));
+        assert!(!app.history_shown());
+    }
+
+    #[test]
+    fn without_history_h_does_nothing_on_ready_but_types_into_the_to_field() {
+        let mut app = ready(Network::Sepolia);
+        let form = app.form.clone();
+        assert_eq!(press(&mut app, KeyCode::Char('h')), None);
+        assert_eq!(app.form, form);
+        assert!(app.history.is_none() && !app.history_shown());
+        app.form.field = Field::To;
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.form.to, "h");
+    }
+
+    #[test]
+    fn up_and_down_scroll_the_loaded_history_and_stop_at_the_ends() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(WEIHAN));
+        app.history_read(WEIHAN, Some(history_lines(3)));
+        let first = |app: &App| app.history.as_ref().map(|pane| pane.first);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(first(&app), Some(0));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(first(&app), Some(2));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(first(&app), Some(1));
+        assert_eq!(app.watch_first, 0);
+    }
+
+    #[test]
+    fn history_is_read_for_the_account_in_view_while_the_pane_is_open() {
+        let mut app = with_history(watching());
+        assert_eq!(app.history_request(true), None);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(WEIHAN));
+        assert_eq!(app.history_request(true), None);
+        app.history_read(WEIHAN, Some(history_lines(2)));
+        assert_eq!(app.history_request(false), None);
+        assert_eq!(app.history_request(true), Some(WEIHAN));
+        app.history_read(WEIHAN, None);
+        assert_eq!(
+            app.history.as_ref().and_then(|pane| pane.read.clone()),
+            Some((WEIHAN, history_lines(2)))
+        );
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(SENDER));
+
+        let mut app = with_history(ready(Network::Sepolia));
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(SENDER));
+        assert_eq!(ready(Network::Sepolia).history_request(true), None);
+    }
+
+    #[test]
+    fn the_history_pane_over_a_sent_transfer_takes_enter_and_esc_closes_only_it() {
+        let mut app = with_history(ready(Network::Sepolia));
+        submit(&mut app, "1", BOB, Ok(FEE));
+        press(&mut app, KeyCode::Char('y'));
+        app.sent(Ok(TxHash::ZERO));
+        app.tracked(Tracked::Receipt { success: true });
+        assert_eq!(app.screen, Screen::Sending);
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.history_shown());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Sending);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.screen, history_open(&app)), (Screen::Sending, false));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Ready);
+    }
+
+    #[test]
+    fn h_does_not_open_history_on_review() {
+        let mut app = with_history(ready(Network::Sepolia));
+        submit(&mut app, "1", BOB, Ok(FEE));
+        assert_eq!(app.screen, Screen::Review);
+        press(&mut app, KeyCode::Char('h'));
+        assert!(!history_open(&app));
     }
 }
