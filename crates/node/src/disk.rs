@@ -1,10 +1,11 @@
 //! The per-network data directory: its lock, the devp2p identity, and the state database.
 //!
 //! The database holds a display snapshot, the outbox of pending raw transactions, state
-//! peers worth dialing first, and the learned working-set keys, most recently used first.
-//! Pins are not saved: they follow from the config at each start. Its values are
-//! display-only: nothing read from it enters a `Store`.
+//! peers worth dialing first, the learned working-set keys, most recently used first, and
+//! the account history. Pins are not saved: they follow from the config at each start. Its
+//! values are display-only: nothing read from it enters a `Store`.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, Bytes, U256, hex};
+use alloy_primitives::{Address, B256, Bytes, U256, hex};
+use chibi_core::history::{BlockFacts, OpenState, Ranges, ScannedBlock};
 use chibi_core::state::Key;
 use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
@@ -464,6 +466,235 @@ impl Disk {
     }
 }
 
+/// Account history writes. Each is one transaction on the writer's connection, so a failed
+/// write leaves nothing behind. Blocks on fsync; call them off the async workers.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the history follower that calls these lands in a later unit"
+    )
+)]
+impl Disk {
+    /// The highest block history holds on the followed chain: the newest unsettled block, else
+    /// the settled mark. `None` before history records anything.
+    pub(crate) fn history_tip(&self) -> Result<Option<BlockNumHash>, NodeError> {
+        self.history(|conn| Ok(history_tip(conn)?))
+    }
+
+    /// Records consecutive verified blocks on the followed chain after `parent`, the verified
+    /// parent of the first. Blocks history already holds with the same hash are skipped, so a
+    /// replay writes nothing. The rest must extend the tip or start above it: a gap after a
+    /// re-anchor is allowed, a fork below the tip needs [`Disk::reconcile_history`] first.
+    pub(crate) fn record_head(
+        &self,
+        parent: BlockNumHash,
+        blocks: &[ScannedBlock],
+    ) -> Result<(), NodeError> {
+        self.history(|conn| {
+            check_chain(parent, blocks)?;
+            let mut from = parent;
+            let mut rest = blocks;
+            while let [block, tail @ ..] = rest
+                && followed_hash(conn, block.number)? == Some(block.hash)
+            {
+                from = BlockNumHash::new(block.number, block.hash);
+                rest = tail;
+            }
+            if rest.is_empty() {
+                return Ok(());
+            }
+            if let Some(tip) = history_tip(conn)?
+                && (from.number < tip.number || from.number == tip.number && from.hash != tip.hash)
+            {
+                // The highest block history may still agree on: `from` itself when it is a
+                // replayed block below the tip, the one under it when the tip's height forks.
+                let agreed = if from.number < tip.number {
+                    from.number
+                } else {
+                    from.number.saturating_sub(1)
+                };
+                return Err(HistoryError::Refused(format!(
+                    "history above block {agreed} needs a reconcile"
+                )));
+            }
+            for block in rest {
+                conn.execute(
+                    "INSERT INTO history_unsettled (number, hash) VALUES (?1, ?2)",
+                    params![block.number, block.hash.as_slice()],
+                )?;
+                if let Some(facts) = &block.facts {
+                    insert_facts(conn, facts, &RECORD)?;
+                }
+            }
+            union_coverage(conn, rest)?;
+            Ok(())
+        })
+    }
+
+    /// Settles history at `finalized`, or at the tip when the tip is lower, when the stored
+    /// hash there agrees: unsettled rows at or below it are dropped and the mark only rises.
+    /// Otherwise does nothing.
+    pub(crate) fn settle_history(&self, finalized: BlockNumHash) -> Result<(), NodeError> {
+        self.history(|conn| {
+            let Some(tip) = history_tip(conn)? else {
+                return Ok(());
+            };
+            let target = finalized.number.min(tip.number);
+            let Some(hash) = followed_hash(conn, target)? else {
+                return Ok(());
+            };
+            if target == finalized.number && hash != finalized.hash {
+                return Ok(());
+            }
+            if settled(conn)?.is_none_or(|mark| mark.number < target) {
+                conn.execute(
+                    "INSERT INTO history_settled (id, number, hash) VALUES (0, ?1, ?2)
+                     ON CONFLICT (id) DO UPDATE SET number = excluded.number, hash = excluded.hash",
+                    params![target, hash.as_slice()],
+                )?;
+            }
+            conn.execute("DELETE FROM history_unsettled WHERE number <= ?1", [target])?;
+            Ok(())
+        })
+    }
+
+    /// Retracts history that left the followed chain after a re-anchor. `ancestry` holds the
+    /// verified hashes of the new chain by number. History is kept up to the newest unsettled
+    /// block it agrees with, or up to the settled mark when none agrees; heights `ancestry`
+    /// lacks are not evidence either way. Returns the new tip.
+    pub(crate) fn reconcile_history(
+        &self,
+        ancestry: &BTreeMap<u64, B256>,
+    ) -> Result<Option<BlockNumHash>, NodeError> {
+        self.history(|conn| {
+            let settled = settled(conn)?.map(|mark| mark.number);
+            let mut keep = settled;
+            {
+                let mut select = conn
+                    .prepare("SELECT number, hash FROM history_unsettled ORDER BY number DESC")?;
+                for stored in select.query_map([], num_hash)? {
+                    let stored = stored?;
+                    if ancestry.get(&stored.number) == Some(&stored.hash) {
+                        keep = Some(stored.number).max(settled);
+                        break;
+                    }
+                }
+            }
+            retract_above(conn, keep)?;
+            Ok(history_tip(conn)?)
+        })
+    }
+
+    /// Adds blocks at or below the settled mark: the backward walk and supplements. Facts
+    /// already stored are kept, coverage only grows, and a block whose hash differs from the
+    /// one stored at its height is refused. Saves `cursor` as the backward walk's resume point.
+    pub(crate) fn augment_history(
+        &self,
+        blocks: &[ScannedBlock],
+        cursor: Option<BlockNumHash>,
+    ) -> Result<(), NodeError> {
+        self.history(|conn| {
+            let settled = settled(conn)?;
+            for block in blocks {
+                let Some(mark) = settled else {
+                    return Err(HistoryError::Refused(format!(
+                        "block {} cannot be added before history settles",
+                        block.number
+                    )));
+                };
+                if block.number > mark.number {
+                    return Err(HistoryError::Refused(format!(
+                        "block {} is above the settled history at block {}",
+                        block.number, mark.number
+                    )));
+                }
+                check_facts(block)?;
+                let stored = match block_hash(conn, block.number)? {
+                    Some(hash) => Some(hash),
+                    None => (mark.number == block.number).then_some(mark.hash),
+                };
+                if let Some(stored) = stored
+                    && stored != block.hash
+                {
+                    return Err(HistoryError::Refused(format!(
+                        "block {} has hash {} but history holds {stored}",
+                        block.number, block.hash
+                    )));
+                }
+                if let Some(facts) = &block.facts {
+                    insert_facts(conn, facts, &AUGMENT)?;
+                }
+            }
+            union_coverage(conn, blocks)?;
+            if let Some(cursor) = cursor {
+                conn.execute(
+                    "INSERT INTO history_backfill (id, number, hash) VALUES (0, ?1, ?2)
+                     ON CONFLICT (id) DO UPDATE SET number = excluded.number, hash = excluded.hash",
+                    params![cursor.number, cursor.hash.as_slice()],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Where the backward walk resumes: the lowest block it scanned. `None` before it starts.
+    pub(crate) fn backfill_cursor(&self) -> Result<Option<BlockNumHash>, NodeError> {
+        self.history(|conn| {
+            Ok(conn
+                .query_row("SELECT number, hash FROM history_backfill", [], num_hash)
+                .optional()?)
+        })
+    }
+
+    /// Records an account's proven state where its forward coverage opens. A state already
+    /// recorded at that block is kept.
+    pub(crate) fn open_history(&self, open: &OpenState) -> Result<(), NodeError> {
+        self.history(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO history_open (account, number, hash, balance, nonce)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    open.account.as_slice(),
+                    open.number,
+                    open.hash.as_slice(),
+                    open.balance.to_be_bytes::<32>().as_slice(),
+                    open.nonce
+                ],
+            )?;
+            let mut insert = conn.prepare(
+                "INSERT OR IGNORE INTO history_open_slot (account, number, contract, slot, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (contract, slot, value) in &open.slots {
+                insert.execute(params![
+                    open.account.as_slice(),
+                    open.number,
+                    contract.as_slice(),
+                    slot.to_be_bytes::<32>().as_slice(),
+                    value.to_be_bytes::<32>().as_slice()
+                ])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Runs `write` in one transaction on the writer's connection, committing only on success.
+    fn history<R>(
+        &self,
+        write: impl FnOnce(&Connection) -> Result<R, HistoryError>,
+    ) -> Result<R, NodeError> {
+        let mut db = self.db.lock();
+        in_transaction(&mut db.conn, write).map_err(|err| {
+            let path = self.dir().join(DB_FILE);
+            match err {
+                HistoryError::Db(err) => db_error(&path, &err),
+                HistoryError::Refused(why) => NodeError::Disk(format!("{}: {why}", path.display())),
+            }
+        })
+    }
+}
+
 /// Reads the state saved in `dir` without taking the lock, alongside a running writer, and
 /// without creating files there. Until a node has created the database, reads the legacy
 /// state file instead. `None` if there is neither.
@@ -696,6 +927,319 @@ fn clear(conn: &mut Connection) -> rusqlite::Result<Reset> {
     };
     tx.commit()?;
     Ok(reset)
+}
+
+/// Why a history write failed: the database, or a write the stored history refuses.
+enum HistoryError {
+    Db(rusqlite::Error),
+    Refused(String),
+}
+
+impl From<rusqlite::Error> for HistoryError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Db(err)
+    }
+}
+
+fn in_transaction<R>(
+    conn: &mut Connection,
+    write: impl FnOnce(&Connection) -> Result<R, HistoryError>,
+) -> Result<R, HistoryError> {
+    let tx = conn.transaction()?;
+    let result = write(&tx)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn num_hash(row: &rusqlite::Row<'_>) -> rusqlite::Result<BlockNumHash> {
+    Ok(BlockNumHash::new(
+        row.get(0)?,
+        B256::from(row.get::<_, [u8; 32]>(1)?),
+    ))
+}
+
+fn history_tip(conn: &Connection) -> rusqlite::Result<Option<BlockNumHash>> {
+    let newest = conn
+        .query_row(
+            "SELECT number, hash FROM history_unsettled ORDER BY number DESC LIMIT 1",
+            [],
+            num_hash,
+        )
+        .optional()?;
+    match newest {
+        Some(tip) => Ok(Some(tip)),
+        None => settled(conn),
+    }
+}
+
+fn settled(conn: &Connection) -> rusqlite::Result<Option<BlockNumHash>> {
+    conn.query_row("SELECT number, hash FROM history_settled", [], num_hash)
+        .optional()
+}
+
+/// The hash history holds for block `number` of the followed chain: its unsettled row, or the
+/// settled mark at that height.
+fn followed_hash(conn: &Connection, number: u64) -> rusqlite::Result<Option<B256>> {
+    let unsettled = conn
+        .query_row(
+            "SELECT hash FROM history_unsettled WHERE number = ?1",
+            [number],
+            |row| row.get::<_, [u8; 32]>(0),
+        )
+        .optional()?;
+    match unsettled {
+        Some(hash) => Ok(Some(B256::from(hash))),
+        None => Ok(settled(conn)?
+            .filter(|mark| mark.number == number)
+            .map(|mark| mark.hash)),
+    }
+}
+
+fn block_hash(conn: &Connection, number: u64) -> rusqlite::Result<Option<B256>> {
+    conn.query_row(
+        "SELECT hash FROM history_block WHERE number = ?1",
+        [number],
+        |row| row.get::<_, [u8; 32]>(0),
+    )
+    .optional()
+    .map(|hash| hash.map(B256::from))
+}
+
+/// Refuses blocks that are not consecutive children of `parent`, or whose facts do not fit.
+fn check_chain(parent: BlockNumHash, blocks: &[ScannedBlock]) -> Result<(), HistoryError> {
+    let mut previous = parent;
+    for block in blocks {
+        if previous.number.checked_add(1) != Some(block.number)
+            || block.parent_hash != previous.hash
+        {
+            return Err(HistoryError::Refused(format!(
+                "block {} ({}) does not extend block {} ({})",
+                block.number, block.hash, previous.number, previous.hash
+            )));
+        }
+        check_facts(block)?;
+        previous = BlockNumHash::new(block.number, block.hash);
+    }
+    Ok(())
+}
+
+/// Refuses facts recorded for another block, and logs the table cannot hold.
+fn check_facts(block: &ScannedBlock) -> Result<(), HistoryError> {
+    let Some(facts) = &block.facts else {
+        return Ok(());
+    };
+    if facts.block.number != block.number || facts.block.hash != block.hash {
+        return Err(HistoryError::Refused(format!(
+            "block {} carries the facts of block {} ({})",
+            block.number, facts.block.number, facts.block.hash
+        )));
+    }
+    if let Some(row) = facts.logs.iter().find(|row| row.log.topics().len() > 4) {
+        return Err(HistoryError::Refused(format!(
+            "log {} of block {} has more than four topics",
+            row.index, block.number
+        )));
+    }
+    Ok(())
+}
+
+/// The statements that store a block's facts, under one conflict rule.
+struct FactSql {
+    block: &'static str,
+    tx: &'static str,
+    log: &'static str,
+    touch: &'static str,
+    slot: &'static str,
+    withdrawal: &'static str,
+}
+
+macro_rules! fact_sql {
+    ($insert:literal) => {
+        FactSql {
+            block: concat!(
+                $insert,
+                " INTO history_block (number, hash, timestamp, beneficiary, base_fee,
+                 excess_blob_gas, tx_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
+            tx: concat!(
+                $insert,
+                " INTO history_tx (number, tx_index, hash, sender, raw, success, cumulative_gas,
+                 gas_used, first_log_index, log_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            ),
+            log: concat!(
+                $insert,
+                " INTO history_log (number, log_index, address, topic0, topic1, topic2, topic3,
+                 data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            ),
+            touch: concat!(
+                $insert,
+                " INTO history_touch (account, number, access_index, balance, nonce, code)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            ),
+            slot: concat!(
+                $insert,
+                " INTO history_slot (account, number, access_index, contract, slot, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            ),
+            withdrawal: concat!(
+                $insert,
+                " INTO history_withdrawal (number, withdrawal_index, validator, address,
+                 amount_gwei) VALUES (?1, ?2, ?3, ?4, ?5)"
+            ),
+        }
+    };
+}
+
+/// Forward writes: blocks above the tip hold no facts yet, so a conflict is a bug to surface.
+const RECORD: FactSql = fact_sql!("INSERT");
+/// Backward writes and supplements keep the facts already stored.
+const AUGMENT: FactSql = fact_sql!("INSERT OR IGNORE");
+
+fn insert_facts(conn: &Connection, facts: &BlockFacts, sql: &FactSql) -> rusqlite::Result<()> {
+    let block = &facts.block;
+    conn.prepare_cached(sql.block)?.execute(params![
+        block.number,
+        block.hash.as_slice(),
+        block.timestamp,
+        block.beneficiary.as_slice(),
+        block.base_fee,
+        block.excess_blob_gas,
+        block.tx_count
+    ])?;
+    let mut insert = conn.prepare_cached(sql.tx)?;
+    for tx in &facts.txs {
+        insert.execute(params![
+            block.number,
+            tx.index,
+            tx.hash.as_slice(),
+            tx.sender.as_slice(),
+            tx.raw.as_ref().map(|raw| &raw[..]),
+            tx.success,
+            tx.cumulative_gas,
+            tx.gas_used,
+            tx.first_log_index,
+            tx.log_count
+        ])?;
+    }
+    let mut insert = conn.prepare_cached(sql.log)?;
+    for row in &facts.logs {
+        let topic = |i: usize| row.log.topics().get(i).map(B256::as_slice);
+        insert.execute(params![
+            block.number,
+            row.index,
+            row.log.address.as_slice(),
+            topic(0),
+            topic(1),
+            topic(2),
+            topic(3),
+            &row.log.data.data[..]
+        ])?;
+    }
+    let mut insert = conn.prepare_cached(sql.touch)?;
+    for touch in &facts.touches {
+        let balance = touch.balance.map(|balance| balance.to_be_bytes::<32>());
+        insert.execute(params![
+            touch.account.as_slice(),
+            block.number,
+            touch.at.index(block.tx_count),
+            balance.as_ref().map(<[u8; 32]>::as_slice),
+            touch.nonce,
+            touch.code.as_ref().map(|code| &code[..])
+        ])?;
+    }
+    let mut insert = conn.prepare_cached(sql.slot)?;
+    for change in &facts.slots {
+        insert.execute(params![
+            change.account.as_slice(),
+            block.number,
+            change.at.index(block.tx_count),
+            change.contract.as_slice(),
+            change.slot.to_be_bytes::<32>().as_slice(),
+            change.value.to_be_bytes::<32>().as_slice()
+        ])?;
+    }
+    let mut insert = conn.prepare_cached(sql.withdrawal)?;
+    for withdrawal in &facts.withdrawals {
+        insert.execute(params![
+            block.number,
+            withdrawal.index,
+            withdrawal.validator,
+            withdrawal.address.as_slice(),
+            withdrawal.amount_gwei
+        ])?;
+    }
+    Ok(())
+}
+
+/// Adds each block to the coverage of every (account, capability) it was scanned for,
+/// rewriting each set's rows once so they stay disjoint and merged.
+fn union_coverage(conn: &Connection, blocks: &[ScannedBlock]) -> rusqlite::Result<()> {
+    let mut added: BTreeMap<(Address, u32), Ranges> = BTreeMap::new();
+    for block in blocks {
+        for &account in &block.accounts {
+            for capability in &block.capabilities {
+                added
+                    .entry((account, capability.code()))
+                    .or_default()
+                    .insert(block.number, block.number);
+            }
+        }
+    }
+    let mut select = conn.prepare_cached(
+        "SELECT first, last FROM history_coverage WHERE account = ?1 AND capability = ?2",
+    )?;
+    let mut delete =
+        conn.prepare_cached("DELETE FROM history_coverage WHERE account = ?1 AND capability = ?2")?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO history_coverage (account, capability, first, last) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for ((account, code), ranges) in added {
+        let key = params![account.as_slice(), code];
+        let mut stored = select
+            .query_map(key, |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Ranges>>()?;
+        for (first, last) in ranges.iter() {
+            stored.insert(first, last);
+        }
+        delete.execute(key)?;
+        for (first, last) in stored.iter() {
+            insert.execute(params![account.as_slice(), code, first, last])?;
+        }
+    }
+    Ok(())
+}
+
+/// Every table keyed by block number, cleared from a height up.
+const RETRACT: [&str; 9] = [
+    "DELETE FROM history_block WHERE number >= ?1",
+    "DELETE FROM history_tx WHERE number >= ?1",
+    "DELETE FROM history_log WHERE number >= ?1",
+    "DELETE FROM history_touch WHERE number >= ?1",
+    "DELETE FROM history_slot WHERE number >= ?1",
+    "DELETE FROM history_withdrawal WHERE number >= ?1",
+    "DELETE FROM history_open WHERE number >= ?1",
+    "DELETE FROM history_open_slot WHERE number >= ?1",
+    "DELETE FROM history_unsettled WHERE number >= ?1",
+];
+
+/// Deletes everything history holds above block `keep`, or all of it for `None`, and trims
+/// coverage to match. The settled mark stays.
+fn retract_above(conn: &Connection, keep: Option<u64>) -> rusqlite::Result<()> {
+    let Some(lowest) = keep.map_or(Some(0), |keep| keep.checked_add(1)) else {
+        return Ok(());
+    };
+    for statement in RETRACT {
+        conn.execute(statement, [lowest])?;
+    }
+    conn.execute("DELETE FROM history_coverage WHERE first >= ?1", [lowest])?;
+    if let Some(keep) = keep {
+        conn.execute(
+            "UPDATE history_coverage SET last = ?1 WHERE last > ?1",
+            [keep],
+        )?;
+    }
+    Ok(())
 }
 
 /// The key a `keys` row names: a 20-byte address and either no slot or a 32-byte one.
@@ -1467,5 +2011,546 @@ mod tests {
             assert_eq!(saved.outbox(), &[queued(1, 1)]);
             assert_eq!(saved.peers(), vec![record(1, 1)]);
         });
+    }
+
+    mod history {
+        use std::collections::BTreeMap;
+
+        use alloy_primitives::{Log, TxHash};
+        use chibi_core::history::{
+            At, BlockFacts, BlockRow, Capability, LogRow, OpenState, ScannedBlock, SlotChange,
+            Touch, TxRow, WithdrawalRow,
+        };
+
+        use super::*;
+
+        fn alice() -> Address {
+            Address::repeat_byte(0xa1)
+        }
+
+        fn bob() -> Address {
+            Address::repeat_byte(0xb0)
+        }
+
+        fn token() -> Address {
+            Address::repeat_byte(0x70)
+        }
+
+        /// The hash of block `number` on fork `fork`: the fork in the first byte, the number in
+        /// the last eight.
+        fn hash(number: u64, fork: u8) -> B256 {
+            let mut bytes = [0; 32];
+            bytes[0] = fork;
+            bytes[24..].copy_from_slice(&number.to_be_bytes());
+            B256::from(bytes)
+        }
+
+        fn at(number: u64, fork: u8) -> BlockNumHash {
+            BlockNumHash::new(number, hash(number, fork))
+        }
+
+        fn tx_hash(block: B256) -> TxHash {
+            let mut tx = block;
+            tx.0[1] = 0xee;
+            tx
+        }
+
+        /// One of each fact for alice in a one-transaction block.
+        fn facts(number: u64, hash: B256) -> BlockFacts {
+            BlockFacts {
+                block: BlockRow {
+                    number,
+                    hash,
+                    timestamp: 1_700_000_000 + number,
+                    beneficiary: Address::repeat_byte(0xfe),
+                    base_fee: Some(7),
+                    excess_blob_gas: None,
+                    tx_count: 1,
+                },
+                txs: vec![TxRow {
+                    index: 0,
+                    hash: tx_hash(hash),
+                    sender: alice(),
+                    raw: Some(Bytes::from_static(&[2, 1])),
+                    success: true,
+                    cumulative_gas: 21_000,
+                    gas_used: 21_000,
+                    first_log_index: 0,
+                    log_count: 1,
+                }],
+                logs: vec![LogRow {
+                    index: 0,
+                    log: Log::new_unchecked(
+                        token(),
+                        vec![B256::repeat_byte(0xdd), alice().into_word()],
+                        Bytes::from_static(&[1]),
+                    ),
+                }],
+                touches: vec![Touch {
+                    account: alice(),
+                    at: At::Tx(0),
+                    balance: Some(U256::from(number)),
+                    nonce: Some(number),
+                    code: None,
+                }],
+                slots: vec![SlotChange {
+                    account: alice(),
+                    at: At::Tx(0),
+                    contract: token(),
+                    slot: U256::from(3),
+                    value: U256::from(number),
+                }],
+                withdrawals: vec![WithdrawalRow {
+                    index: number,
+                    validator: 9,
+                    address: alice(),
+                    amount_gwei: 1,
+                }],
+            }
+        }
+
+        /// `len` blocks on fork `fork` after `parent`, scanned forward for alice, each with
+        /// one of every fact.
+        fn chain(parent: BlockNumHash, fork: u8, len: u64) -> Vec<ScannedBlock> {
+            let mut parent = parent;
+            (0..len)
+                .map(|_| {
+                    let number = parent.number + 1;
+                    let hash = hash(number, fork);
+                    let block = ScannedBlock {
+                        number,
+                        hash,
+                        parent_hash: parent.hash,
+                        accounts: vec![alice()],
+                        capabilities: vec![Capability::Bal, Capability::Logs],
+                        facts: Some(facts(number, hash)),
+                    };
+                    parent = BlockNumHash::new(number, hash);
+                    block
+                })
+                .collect()
+        }
+
+        /// Block `number` on fork `fork` scanned backward for alice's logs, with every fact.
+        fn backward(number: u64, fork: u8) -> ScannedBlock {
+            ScannedBlock {
+                number,
+                hash: hash(number, fork),
+                parent_hash: hash(number - 1, fork),
+                accounts: vec![alice()],
+                capabilities: vec![Capability::Logs],
+                facts: Some(facts(number, hash(number, fork))),
+            }
+        }
+
+        fn counts(disk: &Disk) -> Vec<(&'static str, u64)> {
+            let db = disk.db.lock();
+            HISTORY_TABLES
+                .iter()
+                .map(|&table| {
+                    let count = db
+                        .conn
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    (table, count)
+                })
+                .collect()
+        }
+
+        fn numbers(disk: &Disk, table: &str) -> Vec<u64> {
+            let db = disk.db.lock();
+            let mut select = db
+                .conn
+                .prepare(&format!(
+                    "SELECT DISTINCT number FROM {table} ORDER BY number"
+                ))
+                .unwrap();
+            select
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        fn coverage(disk: &Disk, account: Address, capability: Capability) -> Vec<(u64, u64)> {
+            let db = disk.db.lock();
+            let mut select = db
+                .conn
+                .prepare(
+                    "SELECT first, last FROM history_coverage
+                     WHERE account = ?1 AND capability = ?2 ORDER BY first",
+                )
+                .unwrap();
+            select
+                .query_map(params![account.as_slice(), capability.code()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        fn settled_mark(disk: &Disk) -> Option<BlockNumHash> {
+            settled(&disk.db.lock().conn).unwrap()
+        }
+
+        fn fresh() -> (tempfile::TempDir, Disk) {
+            let dir = tempfile::tempdir().unwrap();
+            let disk = Disk::open(dir.path()).unwrap();
+            (dir, disk)
+        }
+
+        #[test]
+        fn recording_a_step_twice_leaves_every_table_unchanged() {
+            let (_dir, disk) = fresh();
+            let step = chain(at(9, 1), 1, 3);
+            disk.record_head(at(9, 1), &step).unwrap();
+            let once = counts(&disk);
+            assert_eq!(
+                once,
+                [
+                    ("history_backfill", 0),
+                    ("history_block", 3),
+                    ("history_coverage", 2),
+                    ("history_log", 3),
+                    ("history_open", 0),
+                    ("history_open_slot", 0),
+                    ("history_settled", 0),
+                    ("history_slot", 3),
+                    ("history_touch", 3),
+                    ("history_tx", 3),
+                    ("history_unsettled", 3),
+                    ("history_withdrawal", 3),
+                ]
+            );
+            disk.record_head(at(9, 1), &step).unwrap();
+            assert_eq!(counts(&disk), once);
+            assert_eq!(disk.history_tip().unwrap(), Some(at(12, 1)));
+        }
+
+        #[test]
+        fn a_step_that_replays_part_of_the_tip_writes_only_the_new_blocks() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            disk.record_head(at(10, 1), &chain(at(10, 1), 1, 4))
+                .unwrap();
+            assert_eq!(numbers(&disk, "history_unsettled"), [10, 11, 12, 13, 14]);
+            assert_eq!(numbers(&disk, "history_tx"), [10, 11, 12, 13, 14]);
+            assert_eq!(coverage(&disk, alice(), Capability::Bal), [(10, 14)]);
+        }
+
+        #[test]
+        fn a_block_whose_parent_is_the_tip_height_with_another_hash_is_refused() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            let before = counts(&disk);
+            assert!(matches!(
+                disk.record_head(at(12, 2), &chain(at(12, 2), 2, 1)),
+                Err(NodeError::Disk(_))
+            ));
+            assert_eq!(counts(&disk), before, "nothing is written");
+            assert!(
+                disk.record_head(at(10, 1), &chain(at(10, 1), 2, 1))
+                    .is_err(),
+                "a parent below the tip needs a reconcile too"
+            );
+            assert_eq!(counts(&disk), before);
+            assert_eq!(disk.history_tip().unwrap(), Some(at(12, 1)));
+        }
+
+        #[test]
+        fn blocks_that_do_not_chain_are_refused() {
+            let (_dir, disk) = fresh();
+            let mut step = chain(at(9, 1), 1, 2);
+            step[1].parent_hash = hash(10, 2);
+            assert!(disk.record_head(at(9, 1), &step).is_err());
+            assert!(disk.record_head(at(8, 1), &chain(at(9, 1), 1, 2)).is_err());
+            assert_eq!(disk.history_tip().unwrap(), None);
+        }
+
+        #[test]
+        fn a_step_whose_parent_is_above_the_tip_is_accepted_and_leaves_a_coverage_gap() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 2)).unwrap();
+            disk.record_head(at(20, 1), &chain(at(20, 1), 1, 2))
+                .unwrap();
+            assert_eq!(disk.history_tip().unwrap(), Some(at(22, 1)));
+            assert_eq!(
+                coverage(&disk, alice(), Capability::Bal),
+                [(10, 11), (21, 22)]
+            );
+            assert_eq!(
+                coverage(&disk, alice(), Capability::Logs),
+                [(10, 11), (21, 22)]
+            );
+        }
+
+        #[test]
+        fn reconcile_keeps_everything_when_the_ancestry_matches_the_tip() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            let before = counts(&disk);
+            let ancestry = BTreeMap::from([(12, hash(12, 1)), (11, hash(11, 1))]);
+            assert_eq!(disk.reconcile_history(&ancestry).unwrap(), Some(at(12, 1)));
+            assert_eq!(counts(&disk), before);
+        }
+
+        #[test]
+        fn reconcile_retracts_to_the_fork_when_the_ancestry_matches_lower() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 5)).unwrap();
+            let ancestry = BTreeMap::from([
+                (15, hash(15, 2)),
+                (13, hash(13, 2)),
+                (12, hash(12, 1)),
+                (11, hash(11, 1)),
+            ]);
+            assert_eq!(disk.reconcile_history(&ancestry).unwrap(), Some(at(12, 1)));
+            for table in [
+                "history_unsettled",
+                "history_block",
+                "history_tx",
+                "history_log",
+                "history_touch",
+                "history_slot",
+                "history_withdrawal",
+            ] {
+                assert_eq!(numbers(&disk, table), [10, 11, 12], "{table}");
+            }
+            assert_eq!(coverage(&disk, alice(), Capability::Bal), [(10, 12)]);
+            assert_eq!(coverage(&disk, alice(), Capability::Logs), [(10, 12)]);
+            disk.record_head(at(12, 1), &chain(at(12, 1), 2, 2))
+                .unwrap();
+            assert_eq!(disk.history_tip().unwrap(), Some(at(14, 2)));
+        }
+
+        #[test]
+        fn reconcile_retracts_to_settled_when_nothing_matches_and_never_below() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 5)).unwrap();
+            disk.settle_history(at(11, 1)).unwrap();
+            disk.augment_history(&[backward(5, 1)], None).unwrap();
+            let ancestry = BTreeMap::from([(13, hash(13, 2)), (12, hash(12, 2))]);
+            assert_eq!(disk.reconcile_history(&ancestry).unwrap(), Some(at(11, 1)));
+            assert_eq!(numbers(&disk, "history_unsettled"), Vec::<u64>::new());
+            assert_eq!(numbers(&disk, "history_block"), [5, 10, 11]);
+            assert_eq!(numbers(&disk, "history_touch"), [5, 10, 11]);
+            assert_eq!(coverage(&disk, alice(), Capability::Bal), [(10, 11)]);
+            assert_eq!(
+                coverage(&disk, alice(), Capability::Logs),
+                [(5, 5), (10, 11)]
+            );
+            assert_eq!(settled_mark(&disk), Some(at(11, 1)));
+            assert_eq!(
+                disk.reconcile_history(&BTreeMap::new()).unwrap(),
+                Some(at(11, 1))
+            );
+            assert_eq!(numbers(&disk, "history_block"), [5, 10, 11]);
+        }
+
+        #[test]
+        fn reconcile_with_nothing_settled_and_nothing_matching_retracts_everything() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            let ancestry = BTreeMap::from([(12, hash(12, 2))]);
+            assert_eq!(disk.reconcile_history(&ancestry).unwrap(), None);
+            assert!(counts(&disk).iter().all(|&(_, count)| count == 0));
+        }
+
+        #[test]
+        fn settling_at_a_finalized_block_drops_unsettled_rows_at_and_below_it() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 5)).unwrap();
+            disk.settle_history(at(12, 1)).unwrap();
+            assert_eq!(settled_mark(&disk), Some(at(12, 1)));
+            assert_eq!(numbers(&disk, "history_unsettled"), [13, 14]);
+            assert_eq!(numbers(&disk, "history_block"), [10, 11, 12, 13, 14]);
+            assert_eq!(disk.history_tip().unwrap(), Some(at(14, 1)));
+
+            disk.settle_history(at(13, 2)).unwrap();
+            disk.settle_history(at(11, 1)).unwrap();
+            assert_eq!(
+                settled_mark(&disk),
+                Some(at(12, 1)),
+                "a hash that disagrees or a lower block moves nothing"
+            );
+            assert_eq!(numbers(&disk, "history_unsettled"), [13, 14]);
+        }
+
+        #[test]
+        fn with_the_tip_below_finalized_settling_settles_at_the_tip() {
+            let (_dir, disk) = fresh();
+            disk.settle_history(at(20, 1)).unwrap();
+            assert_eq!(settled_mark(&disk), None, "no history, nothing to settle");
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            disk.settle_history(at(20, 7)).unwrap();
+            assert_eq!(settled_mark(&disk), Some(at(12, 1)));
+            assert_eq!(numbers(&disk, "history_unsettled"), Vec::<u64>::new());
+            assert_eq!(disk.history_tip().unwrap(), Some(at(12, 1)));
+            disk.record_head(at(12, 1), &chain(at(12, 1), 1, 1))
+                .unwrap();
+            assert_eq!(disk.history_tip().unwrap(), Some(at(13, 1)));
+        }
+
+        #[test]
+        fn augmenting_below_settled_adds_facts_and_unions_coverage_once() {
+            let (_dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            disk.settle_history(at(12, 1)).unwrap();
+            disk.augment_history(&[backward(5, 1), backward(6, 1)], None)
+                .unwrap();
+            assert_eq!(
+                coverage(&disk, alice(), Capability::Logs),
+                [(5, 6), (10, 12)]
+            );
+            disk.augment_history(&[backward(6, 1), backward(7, 1)], None)
+                .unwrap();
+            disk.augment_history(&[backward(10, 1)], None).unwrap();
+            assert_eq!(
+                coverage(&disk, alice(), Capability::Logs),
+                [(5, 7), (10, 12)]
+            );
+            assert_eq!(coverage(&disk, alice(), Capability::Bal), [(10, 12)]);
+            assert_eq!(numbers(&disk, "history_block"), [5, 6, 7, 10, 11, 12]);
+            assert_eq!(
+                counts(&disk),
+                [
+                    ("history_backfill", 0),
+                    ("history_block", 6),
+                    ("history_coverage", 3),
+                    ("history_log", 6),
+                    ("history_open", 0),
+                    ("history_open_slot", 0),
+                    ("history_settled", 1),
+                    ("history_slot", 6),
+                    ("history_touch", 6),
+                    ("history_tx", 6),
+                    ("history_unsettled", 0),
+                    ("history_withdrawal", 6),
+                ]
+            );
+        }
+
+        #[test]
+        fn augmenting_a_block_whose_hash_conflicts_is_refused() {
+            let (_dir, disk) = fresh();
+            let mut step = chain(at(9, 1), 1, 3);
+            step[2].facts = None;
+            disk.record_head(at(9, 1), &step).unwrap();
+            disk.settle_history(at(12, 1)).unwrap();
+            let before = counts(&disk);
+            assert!(
+                disk.augment_history(&[backward(11, 2)], None).is_err(),
+                "a stored block row has another hash"
+            );
+            assert!(
+                disk.augment_history(&[backward(12, 2)], None).is_err(),
+                "the settled mark has another hash"
+            );
+            assert!(
+                disk.augment_history(&[backward(5, 1), backward(11, 2)], Some(at(5, 1)))
+                    .is_err()
+            );
+            assert_eq!(counts(&disk), before, "nothing is written");
+        }
+
+        #[test]
+        fn augmenting_above_settled_or_before_anything_settles_is_refused() {
+            let (_dir, disk) = fresh();
+            assert!(disk.augment_history(&[backward(5, 1)], None).is_err());
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            assert!(disk.augment_history(&[backward(5, 1)], None).is_err());
+            disk.settle_history(at(11, 1)).unwrap();
+            assert!(disk.augment_history(&[backward(12, 1)], None).is_err());
+            assert_eq!(numbers(&disk, "history_block"), [10, 11, 12]);
+        }
+
+        #[test]
+        fn the_backfill_cursor_round_trips() {
+            let (_dir, disk) = fresh();
+            assert_eq!(disk.backfill_cursor().unwrap(), None);
+            disk.augment_history(&[], Some(at(5, 1))).unwrap();
+            assert_eq!(disk.backfill_cursor().unwrap(), Some(at(5, 1)));
+            disk.augment_history(&[], Some(at(4, 1))).unwrap();
+            assert_eq!(disk.backfill_cursor().unwrap(), Some(at(4, 1)));
+        }
+
+        #[test]
+        fn two_accounts_sharing_one_tx_store_one_tx_row_and_a_touch_each() {
+            let (_dir, disk) = fresh();
+            let block_hash = hash(10, 1);
+            let mut facts = facts(10, block_hash);
+            facts.block.tx_count = 2;
+            facts.touches.push(Touch {
+                account: bob(),
+                at: At::Tx(0),
+                balance: None,
+                nonce: None,
+                code: None,
+            });
+            facts.touches.push(Touch {
+                account: bob(),
+                at: At::Post,
+                balance: Some(U256::from(5)),
+                nonce: None,
+                code: None,
+            });
+            let block = ScannedBlock {
+                number: 10,
+                hash: block_hash,
+                parent_hash: hash(9, 1),
+                accounts: vec![alice(), bob()],
+                capabilities: vec![Capability::Bal, Capability::Logs],
+                facts: Some(facts),
+            };
+            disk.record_head(at(9, 1), &[block]).unwrap();
+            assert_eq!(numbers(&disk, "history_tx"), [10]);
+            let db = disk.db.lock();
+            let touches: Vec<(Vec<u8>, u64, u64)> = db
+                .conn
+                .prepare(
+                    "SELECT account, number, access_index FROM history_touch
+                     ORDER BY account, access_index",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            drop(db);
+            assert_eq!(
+                touches,
+                [
+                    (alice().to_vec(), 10, 1),
+                    (bob().to_vec(), 10, 1),
+                    (bob().to_vec(), 10, 3),
+                ]
+            );
+            assert_eq!(coverage(&disk, alice(), Capability::Bal), [(10, 10)]);
+            assert_eq!(coverage(&disk, bob(), Capability::Logs), [(10, 10)]);
+        }
+
+        #[test]
+        fn opening_an_account_twice_stores_its_state_once() {
+            let (_dir, disk) = fresh();
+            let open = OpenState {
+                account: alice(),
+                number: 9,
+                hash: hash(9, 1),
+                balance: U256::from(1_000),
+                nonce: 4,
+                slots: vec![
+                    (token(), U256::from(3), U256::from(50)),
+                    (token(), U256::from(4), U256::from(60)),
+                ],
+            };
+            disk.open_history(&open).unwrap();
+            disk.open_history(&open).unwrap();
+            let counts = counts(&disk);
+            assert_eq!(counts[4], ("history_open", 1));
+            assert_eq!(counts[5], ("history_open_slot", 2));
+        }
     }
 }
