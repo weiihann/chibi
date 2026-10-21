@@ -37,7 +37,7 @@ use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
 use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, Sessions, sessions_changed};
 use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
-use crate::follow::{Recorder, Search};
+use crate::follow::{HistoryTask, Search};
 use crate::heads::Heads;
 use crate::network::{BlockClock, Network, NetworkSpec, Token};
 use crate::peers::{NetError, Paced, Peers, REQUEST_TIMEOUT};
@@ -231,8 +231,8 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) seed_due: bool,
     /// When seeding last ran.
     pub(crate) seeded_at: tokio::time::Instant,
-    /// Forward account history recording, `None` when history is off.
-    pub(crate) history: Option<Recorder>,
+    /// Account history, `None` when history is off.
+    pub(crate) history: Option<HistoryTask>,
 }
 
 /// Fee data for `eth_feeHistory`, oldest block first.
@@ -679,7 +679,7 @@ impl<P: Peers> Node<P> {
                 unreceipted: Vec::new(),
                 seed_due: true,
                 seeded_at: tokio::time::Instant::now(),
-                history: watch.history.then(Recorder::new),
+                history: watch.history.then(HistoryTask::new),
             },
         ))
     }

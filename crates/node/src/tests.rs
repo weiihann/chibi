@@ -11,6 +11,7 @@ use alloy_primitives::{Address, B256, Bytes, Log as EvmLog, TxKind, U256, addres
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolValue as _;
+use chibi_core::VerifiedHeader;
 use chibi_core::exec::{CallRequest, ExecutionResult};
 use chibi_core::history::{At, Capability, LogRow, OpenState, Touch, TxRow};
 use chibi_core::state::{HEADER_WINDOW, Key};
@@ -24,6 +25,7 @@ use chibi_core::wire::Transaction;
 
 use crate::disk::{Disk, History, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR, Log};
+use crate::follow::HISTORY_BUDGET;
 use crate::network::{MAINNET_ENS_RESOLVER, Token};
 use crate::node::{
     BlockSel, ContractSnapshot, Follower, Held, Node, NodeError, SEED_RETRY, Stepped,
@@ -2523,4 +2525,152 @@ async fn blocks_missed_while_down_are_walked_back_once_finality_passes_them() {
         covered(dir.path(), ALICE),
         logs_only(&[(first, first), (head, head)], &[(genesis, head)])
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_never_answers_contents_delays_a_head_by_at_most_the_history_budget() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    fixture.fault(Fault::SilentContents);
+
+    let mut paid = Vec::new();
+    for nonce in 0..2 {
+        let hash = fixture.mine(payment(nonce, eth(3 + nonce)));
+        let head = fixture.world(|w| w.verified(hash)).num_hash();
+        let started = tokio::time::Instant::now();
+        assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+        let took = started.elapsed();
+        assert!(took <= HISTORY_BUDGET, "the head step took {took:?}");
+        paid.push(head.number);
+    }
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+
+    fixture.heal();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let last = number(&fixture, fixture.mine(BlockWrites::default()));
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid[1], paid[0]]);
+    assert_eq!(covered(dir.path(), ALICE), both(&[(paid[0], last)]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_backward_batch_whose_write_fails_is_written_on_a_later_step() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let genesis = genesis_number(&fixture);
+    let paid = number(&fixture, fixture.mine(payment(0, eth(3))));
+    fixture.mine(BlockWrites::default());
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    let settled = fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    fixture.fault(Fault::SilentContents);
+    fixture.finalize(settled);
+    let settled = number(&fixture, settled);
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+
+    let blocker = follower.shared.disk.block_writes();
+    fixture.heal();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    drop(blocker);
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid]);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        logs_only(&[(settled, settled)], &[(genesis, settled)])
+    );
+}
+
+#[tokio::test]
+async fn blocks_extended_while_reconcile_keeps_failing_are_recorded_once_it_succeeds() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let watch = history_watch(&[ALICE]);
+    let first = {
+        let (_node, mut follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+        let first = fixture.mine(payment(0, eth(3)));
+        follower.step().await.unwrap();
+        number(&fixture, first)
+    };
+    fixture.mine_unseen(BlockWrites::default());
+    fixture.mine(BlockWrites::default());
+    fixture.fault(Fault::RejectAncestors);
+
+    let (_node, mut follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+    let paid = number(&fixture, fixture.mine(payment(1, eth(4))));
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [first]);
+
+    fixture.heal();
+    let last = number(&fixture, fixture.mine(BlockWrites::default()));
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid, first]);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        both(&[(first, first), (paid, last)])
+    );
+}
+
+fn opened(dir: &Path, account: Address) -> Vec<OpenState> {
+    history(dir).coverage(account).unwrap().opens
+}
+
+fn open_at(at: &VerifiedHeader, account: Address, balance: U256) -> OpenState {
+    OpenState {
+        account,
+        number: at.number(),
+        hash: at.hash(),
+        balance,
+        nonce: 0,
+        slots: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_first_block_whose_contents_arrive_late_opens_coverage_at_its_parent() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    let anchor = node.head();
+
+    fixture.fault(Fault::WithholdBodies);
+    fixture.mine(payment(0, eth(3)));
+    follower.step().await.unwrap();
+    fixture.heal();
+    fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+
+    assert_eq!(opened(dir.path(), ALICE), [open_at(&anchor, ALICE, eth(2))]);
+}
+
+#[tokio::test]
+async fn an_account_the_store_lacks_opens_on_a_later_step_once_it_is_proven() {
+    let fixture = Fixture::genesis([
+        (ALICE, WorldAccount::eoa(eth(2))),
+        (CAROL, WorldAccount::eoa(eth(9))),
+    ]);
+    fixture.fault(Fault::Unavailable(CAROL));
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE, CAROL])).await;
+    let anchor = node.head();
+
+    fixture.mine(payment(0, eth(3)));
+    follower.step().await.unwrap();
+    assert_eq!(opened(dir.path(), CAROL), Vec::new());
+
+    fixture.heal();
+    let proven = fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    let proven = fixture.world(|w| w.verified(proven));
+    fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+
+    assert_eq!(opened(dir.path(), ALICE), [open_at(&anchor, ALICE, eth(2))]);
+    assert_eq!(opened(dir.path(), CAROL), [open_at(&proven, CAROL, eth(9))]);
 }

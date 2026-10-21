@@ -1,8 +1,10 @@
 //! One follower step: reach the light client's newest head, warm the working set, follow
-//! finality, locate submitted transactions, and persist.
+//! finality, hand account history how the store moved, locate submitted transactions, and
+//! persist. Account history does its fetches and writes in a task of its own.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, TxHash, U256};
@@ -13,6 +15,8 @@ use chibi_core::verify::{VerifiedBody, VerifiedReceipts};
 use chibi_core::{TrustedHash, VerifiedHeader};
 use futures::StreamExt as _;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::fetch;
@@ -56,6 +60,10 @@ const BACKFILL_CONTENTS: usize = 16;
 /// Follower steps in which a block's contents may fail to arrive before the backward walk
 /// leaves the block uncovered.
 const BACKFILL_ATTEMPTS: u32 = 3;
+
+/// Longest one follower step waits for history work. Work still running then goes on in its
+/// own task while the follower moves on.
+pub(crate) const HISTORY_BUDGET: Duration = Duration::from_secs(2);
 
 /// Which blocks have been searched for pending transactions.
 ///
@@ -116,29 +124,154 @@ enum Reach {
 /// consumed their BALs, and the watched accounts' proven state at the block they extend.
 #[derive(Debug)]
 pub(crate) struct Extension {
-    /// The anchor the blocks extend.
-    parent: BlockNumHash,
     /// Each block's scan, oldest first.
     scans: Vec<Scan>,
     /// The watched accounts the anchor's store held, at the anchor.
     opens: Vec<OpenState>,
 }
 
-/// Account history: the follower records each extended block once its scan is complete,
-/// reconciling after a re-anchor, then walks back to fill older blocks. It exists only while
-/// history is on.
+/// How a follower step moved the store, as history needs to know it.
 #[derive(Debug)]
-pub(crate) struct Recorder {
-    /// Scans waiting for their block's contents, oldest first, consecutive.
-    queue: VecDeque<Scan>,
-    /// Coverage must reopen with proven state: at start, after a reconcile, and after a block
-    /// was dropped.
-    open_due: bool,
+pub(crate) enum Moved {
+    /// The store extended through these blocks.
+    Extended(Extension),
+    /// The store re-anchored, so stored history may have left the followed chain.
+    Reanchored,
+}
+
+/// Account history beside the follower. Its work runs in a task of its own, one run at a time,
+/// so a slow or silent peer delays only history. Each follower step hands it how the store
+/// moved, in step order, starts a run when none is going, and waits for runs at most
+/// [`HISTORY_BUDGET`]. A run is never cancelled before it ends, so no fetch or write is ever
+/// cut short; it exists only while history is on.
+#[derive(Debug)]
+pub(crate) struct HistoryTask {
+    /// The recorder while no run holds it. Exactly one of it and `running` is set.
+    idle: Option<Box<Recorder>>,
+    /// The run holding the recorder.
+    running: Option<Running>,
+    /// Moves not yet handed to a run, oldest first.
+    backlog: Vec<Moved>,
+}
+
+/// A history run in its own task, handing the recorder back when it ends. Dropping it aborts
+/// the run: the node is going away, and each write is one transaction, so none is half done.
+#[derive(Debug)]
+struct Running(JoinHandle<Box<Recorder>>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Running {
+    fn spawn<P: Peers>(
+        shared: Arc<Shared<P>>,
+        mut recorder: Box<Recorder>,
+        moves: Vec<Moved>,
+    ) -> Self {
+        Self(tokio::spawn(async move {
+            recorder.run(&shared, moves).await;
+            recorder
+        }))
+    }
+
+    /// The recorder once the run ends, or `None` when `deadline` passes or a newer head
+    /// arrives first; the run goes on either way.
+    async fn ended(
+        &mut self,
+        deadline: Instant,
+        latest: &mut watch::Receiver<Option<TrustedHash>>,
+    ) -> Option<Box<Recorder>> {
+        tokio::select! {
+            biased;
+            ended = &mut self.0 => Some(ended.unwrap_or_else(|err| {
+                warn!(target: "chibi::history", %err, "history run failed; starting over");
+                Box::default()
+            })),
+            Ok(()) = latest.changed() => None,
+            () = tokio::time::sleep_until(deadline) => None,
+        }
+    }
+}
+
+impl HistoryTask {
+    /// History whose first run reconciles and opens coverage.
+    pub(crate) fn new() -> Self {
+        Self {
+            idle: Some(Box::default()),
+            running: None,
+            backlog: Vec::new(),
+        }
+    }
+
+    /// Hands history how this step moved the store, then gives runs at most
+    /// [`HISTORY_BUDGET`], less if `latest` moves: a run that ended hands back the recorder,
+    /// and an idle recorder starts a run with everything handed since the last one. Every
+    /// await leaves the recorder or its run stored, so dropping this future loses nothing.
+    async fn step<P: Peers>(
+        &mut self,
+        shared: &Arc<Shared<P>>,
+        moved: Option<Moved>,
+        mut latest: watch::Receiver<Option<TrustedHash>>,
+    ) {
+        self.backlog.extend(moved);
+        let deadline = Instant::now() + HISTORY_BUDGET;
+        if let Some(running) = &mut self.running {
+            let Some(recorder) = running.ended(deadline, &mut latest).await else {
+                return;
+            };
+            self.idle = Some(recorder);
+            self.running = None;
+        }
+        if let Some(recorder) = self.idle.take() {
+            let moves = std::mem::take(&mut self.backlog);
+            self.running = Some(Running::spawn(Arc::clone(shared), recorder, moves));
+        }
+        if let Some(running) = &mut self.running
+            && let Some(recorder) = running.ended(deadline, &mut latest).await
+        {
+            self.idle = Some(recorder);
+            self.running = None;
+        }
+    }
+}
+
+/// Account history: a run records each extended block once its scan is complete,
+/// reconciling after a re-anchor, then walks back to fill older blocks.
+#[derive(Debug)]
+struct Recorder {
+    /// Blocks waiting for their contents or their write, oldest first, consecutive.
+    queue: VecDeque<Queued>,
+    /// Watched accounts whose forward coverage opened without a recorded opening state.
+    unopened: Unopened,
     /// Stored history may hold blocks off the followed chain: at start, after a re-anchor that
     /// could not reconcile yet, and after a write was refused as forking.
     reconcile_due: bool,
     /// The backward walk of this session.
     backfill: Backfill,
+}
+
+/// A block waiting to be recorded.
+#[derive(Debug)]
+struct Queued {
+    scan: Scan,
+    /// The watched accounts' proven state at the block's parent when the block is the first of
+    /// its extension, else empty. Kept with the block until it is recorded, since only then
+    /// does coverage open there.
+    opens: Vec<OpenState>,
+}
+
+/// Which watched accounts still need an opening state where their forward coverage opened.
+#[derive(Debug, Default)]
+enum Unopened {
+    /// Every watched account: at start, after a reconcile, and after a block was dropped.
+    #[default]
+    All,
+    /// These accounts, whose state the store lacked where coverage opened or whose opening
+    /// write failed. Empty when every account has one.
+    Accounts(BTreeSet<Address>),
 }
 
 /// The backward walk: settled blocks below the anchor scanned from their header blooms alone,
@@ -154,73 +287,79 @@ struct Backfill {
     ahead: VecDeque<VerifiedHeader>,
     /// Scans whose contents did not arrive, with the steps they failed in.
     retry: Vec<(Pending, u32)>,
+    /// Scanned blocks whose write failed. The walk writes them before it goes further: it
+    /// already passed them, so it would not scan them again.
+    unwritten: Vec<ScannedBlock>,
     /// The walk met the fork or the chain's first block.
     done: bool,
 }
 
-impl Recorder {
-    /// A recorder that reconciles and opens coverage on its first step.
-    pub(crate) fn new() -> Self {
+impl Default for Recorder {
+    /// A recorder that reconciles and opens coverage on its first run.
+    fn default() -> Self {
         Self {
             queue: VecDeque::new(),
-            open_due: true,
+            unopened: Unopened::All,
             reconcile_due: true,
             backfill: Backfill::default(),
         }
     }
+}
 
-    /// Records forward, then takes one bounded step of the backward walk. Failures are logged
-    /// and retried on a later step; they never stop following.
-    async fn step<P: Peers>(
-        &mut self,
-        shared: &Arc<Shared<P>>,
-        reanchored: bool,
-        extension: Option<Extension>,
-    ) {
-        if reanchored {
-            self.backfill = Backfill::default();
+impl Recorder {
+    /// Takes in each move in order, records forward, then takes one bounded step of the
+    /// backward walk. Failures are logged and retried on a later run; they never stop
+    /// following.
+    async fn run<P: Peers>(&mut self, shared: &Arc<Shared<P>>, moves: Vec<Moved>) {
+        for moved in moves {
+            match moved {
+                Moved::Extended(extension) => self.extended(extension),
+                Moved::Reanchored => self.reanchored(),
+            }
         }
-        self.forward(shared, reanchored, extension).await;
+        self.forward(shared).await;
         self.backfill.step(shared).await;
     }
 
-    /// Records what this step extended, after a reconcile when one is due, then settles.
-    async fn forward<P: Peers>(
-        &mut self,
-        shared: &Arc<Shared<P>>,
-        reanchored: bool,
-        extension: Option<Extension>,
-    ) {
-        if reanchored || self.reconcile_due {
-            self.queue.clear();
-            self.reconcile_due = true;
+    /// Queues an extension's blocks, the opening states with the first. Past
+    /// [`HISTORY_QUEUE`] the oldest are dropped, leaving a gap where coverage opens anew.
+    fn extended(&mut self, extension: Extension) {
+        let mut opens = extension.opens;
+        for scan in extension.scans {
+            let opens = std::mem::take(&mut opens);
+            self.queue.push_back(Queued { scan, opens });
+        }
+        let excess = self.queue.len().saturating_sub(HISTORY_QUEUE);
+        if excess > 0 {
+            self.queue.drain(..excess);
+            self.unopened = Unopened::All;
+            warn!(target: "chibi::history", dropped = excess, "block contents unavailable too long; leaving a history gap");
+        }
+    }
+
+    /// Drops the queued blocks, which may be off the new chain, makes a reconcile due before
+    /// the next write, and starts the backward walk again at the new anchor.
+    fn reanchored(&mut self) {
+        self.queue.clear();
+        self.reconcile_due = true;
+        self.backfill.restart();
+    }
+
+    /// Records the queued blocks that are complete, after a reconcile when one is due, writes
+    /// the opening states they carry, then settles. While a reconcile fails nothing is written
+    /// and the queue keeps every extended block, up to [`HISTORY_QUEUE`].
+    async fn forward<P: Peers>(&mut self, shared: &Arc<Shared<P>>) {
+        if self.reconcile_due {
             if let Err(err) = reconcile(shared).await {
                 warn!(target: "chibi::history", %err, "cannot reconcile history; holding writes until the next head");
                 return;
             }
             self.reconcile_due = false;
-            self.open_due = true;
+            self.unopened = Unopened::All;
         }
-        let (anchor, opens) = match extension {
-            Some(extension) => {
-                self.queue.extend(extension.scans);
-                (Some(extension.parent), extension.opens)
-            }
-            None => (None, Vec::new()),
-        };
-        let excess = self.queue.len().saturating_sub(HISTORY_QUEUE);
-        if excess > 0 {
-            self.queue.drain(..excess);
-            self.open_due = true;
-            warn!(target: "chibi::history", dropped = excess, "block contents unavailable too long; leaving a history gap");
-        }
-        let ready = self.complete(&shared.peers).await;
-        if let Some(first) = ready.first() {
-            let parent = BlockNumHash::new(first.number.saturating_sub(1), first.parent_hash);
-            let recorded = self.record(shared, parent, ready).await;
-            if recorded && self.open_due && anchor == Some(parent) {
-                self.open_due = !open(shared, opens).await;
-            }
+        let (blocks, opens) = self.complete(&shared.peers).await;
+        if let Some(opens) = self.record(shared, blocks, opens).await {
+            self.open(shared, opens).await;
         }
         if let Some(finalized) = shared.read(|s| s.finalized().map(VerifiedHeader::num_hash)) {
             let writer = Arc::clone(shared);
@@ -231,15 +370,24 @@ impl Recorder {
     }
 
     /// Completes queued scans oldest first, fetching contents where a scan needs them, and
-    /// returns the consecutive blocks ready to record. Stops at the first fetch failure,
-    /// keeping it and the rest queued; a block whose contents cannot complete its scan is
-    /// dropped.
-    async fn complete<P: Peers>(&mut self, peers: &Paced<P>) -> Vec<ScannedBlock> {
-        let mut ready = Vec::with_capacity(self.queue.len());
-        while let Some(scan) = self.queue.pop_front() {
+    /// returns the consecutive blocks ready to record with the opening states each carries.
+    /// Stops at the first fetch failure, keeping it and the rest queued; a block whose contents
+    /// cannot complete its scan is dropped.
+    async fn complete<P: Peers>(
+        &mut self,
+        peers: &Paced<P>,
+    ) -> (Vec<ScannedBlock>, Vec<Vec<OpenState>>) {
+        let mut blocks = Vec::with_capacity(self.queue.len());
+        let mut opens = Vec::with_capacity(self.queue.len());
+        while let Some(Queued {
+            scan,
+            opens: carried,
+        }) = self.queue.pop_front()
+        {
             let pending = match scan {
                 Scan::Done(block) => {
-                    ready.push(block);
+                    blocks.push(block);
+                    opens.push(carried);
                     continue;
                 }
                 Scan::NeedsContents(pending) => pending,
@@ -247,56 +395,97 @@ impl Recorder {
             let block = pending.header().number();
             match contents(peers, pending.header()).await {
                 Ok((body, receipts)) => match pending.complete(&body, &receipts) {
-                    Ok(scanned) => ready.push(scanned),
+                    Ok(scanned) => {
+                        blocks.push(scanned);
+                        opens.push(carried);
+                    }
                     Err(err) => {
                         warn!(target: "chibi::history", block, %err, "block contents do not complete its scan; leaving a history gap");
-                        self.open_due = true;
+                        self.unopened = Unopened::All;
                         break;
                     }
                 },
                 Err(err) => {
                     warn!(target: "chibi::history", block, %err, "block contents unavailable; retrying next head");
-                    self.queue.push_front(Scan::NeedsContents(pending));
+                    let scan = Scan::NeedsContents(pending);
+                    self.queue.push_front(Queued {
+                        scan,
+                        opens: carried,
+                    });
                     break;
                 }
             }
         }
-        ready
+        (blocks, opens)
     }
 
-    /// Writes `ready` after `parent`, returning whether it was written. A fork from the stored
-    /// history makes a reconcile due; any other refusal puts the blocks back to be written next
-    /// step.
+    /// Writes `blocks` after the first one's parent, returning the opening states they carry
+    /// once written. A refusal puts the blocks back to be written on a later run, after a
+    /// reconcile when they fork from the stored history.
     async fn record<P: Peers>(
         &mut self,
         shared: &Arc<Shared<P>>,
-        parent: BlockNumHash,
-        ready: Vec<ScannedBlock>,
-    ) -> bool {
+        blocks: Vec<ScannedBlock>,
+        opens: Vec<Vec<OpenState>>,
+    ) -> Option<Vec<Vec<OpenState>>> {
+        let first = blocks.first()?;
+        let parent = BlockNumHash::new(first.number.saturating_sub(1), first.parent_hash);
         let writer = Arc::clone(shared);
-        let written = blocking(move || match writer.disk.record_head(parent, &ready) {
-            Ok(()) => Ok(Ok(())),
-            Err(err) => Ok(Err((err, ready))),
+        let written = blocking(move || {
+            Ok(writer
+                .disk
+                .record_head(parent, &blocks)
+                .map_err(|err| (err, blocks)))
         })
         .await;
         match written {
-            Ok(Ok(())) => return true,
-            Ok(Err((err @ NodeError::HistoryReconcile { .. }, _))) => {
-                warn!(target: "chibi::history", %err, "history forks from the followed chain; reconciling next head");
-                self.reconcile_due = true;
-            }
-            Ok(Err((err, ready))) => {
-                warn!(target: "chibi::history", %err, "cannot record history; retrying next head");
-                for block in ready.into_iter().rev() {
-                    self.queue.push_front(Scan::Done(block));
+            Ok(Ok(())) => return Some(opens),
+            Ok(Err((err, blocks))) => {
+                if matches!(err, NodeError::HistoryReconcile { .. }) {
+                    warn!(target: "chibi::history", %err, "history forks from the followed chain; reconciling next head");
+                    self.reconcile_due = true;
+                } else {
+                    warn!(target: "chibi::history", %err, "cannot record history; retrying next head");
+                }
+                for (block, opens) in blocks.into_iter().zip(opens).rev() {
+                    let scan = Scan::Done(block);
+                    self.queue.push_front(Queued { scan, opens });
                 }
             }
             Err(err) => {
                 warn!(target: "chibi::history", %err, "cannot record history; leaving a history gap");
-                self.open_due = true;
+                self.unopened = Unopened::All;
             }
         }
-        false
+        None
+    }
+
+    /// Records, from `opens` in block order, the first opening state of each account still
+    /// owed one. An account the store lacked stays owed until a later block carries its state.
+    async fn open<P: Peers>(&mut self, shared: &Arc<Shared<P>>, opens: Vec<Vec<OpenState>>) {
+        let mut owed = match std::mem::take(&mut self.unopened) {
+            Unopened::All => shared.watch.addresses.iter().copied().collect(),
+            Unopened::Accounts(owed) => owed,
+        };
+        let due: Vec<OpenState> = opens
+            .into_iter()
+            .flatten()
+            .filter(|open| owed.remove(&open.account))
+            .collect();
+        if !due.is_empty() {
+            let accounts: Vec<Address> = due.iter().map(|open| open.account).collect();
+            let writer = Arc::clone(shared);
+            let opened = blocking(move || {
+                due.iter()
+                    .try_for_each(|open| writer.disk.open_history(open))
+            })
+            .await;
+            if let Err(err) = opened {
+                warn!(target: "chibi::history", %err, "cannot record where history opens; retrying");
+                owed.extend(accounts);
+            }
+        }
+        self.unopened = Unopened::Accounts(owed);
     }
 }
 
@@ -306,7 +495,11 @@ impl Backfill {
     /// forward recording; the walk waits at an uncovered one until history settles there.
     async fn step<P: Peers>(&mut self, shared: &Arc<Shared<P>>) {
         let watched = &shared.watch.addresses;
-        if watched.is_empty() || self.done && self.retry.is_empty() {
+        if watched.is_empty() || self.done && self.retry.is_empty() && self.unwritten.is_empty() {
+            return;
+        }
+        let unwritten = std::mem::take(&mut self.unwritten);
+        if !self.write(shared, unwritten).await {
             return;
         }
         let reader = Arc::clone(shared);
@@ -394,20 +587,48 @@ impl Backfill {
             }
             self.reached = Some(header);
         }
+        self.write(shared, ready).await;
+    }
+
+    /// Writes `ready` in one write and returns whether it was written. A failed write is kept
+    /// to write again before the walk goes further; the write is idempotent.
+    async fn write<P: Peers>(&mut self, shared: &Arc<Shared<P>>, ready: Vec<ScannedBlock>) -> bool {
         if ready.is_empty() {
-            return;
+            return true;
         }
         let blocks = ready.len();
         let writer = Arc::clone(shared);
-        match blocking(move || writer.disk.augment_history(&ready)).await {
-            Ok(()) => {
+        let written = blocking(move || {
+            Ok(writer
+                .disk
+                .augment_history(&ready)
+                .map_err(|err| (err, ready)))
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => {
                 let reached = self.reached.as_ref().map(VerifiedHeader::number);
                 debug!(target: "chibi::history", blocks, reached, "older history added");
+                return true;
+            }
+            Ok(Err((err, ready))) => {
+                warn!(target: "chibi::history", %err, blocks, "cannot add older history; retrying next head");
+                self.unwritten = ready;
             }
             Err(err) => {
-                warn!(target: "chibi::history", %err, blocks, "cannot add older history; leaving a history gap");
+                warn!(target: "chibi::history", %err, blocks, "cannot add older history; walking back again from the anchor");
+                self.restart();
             }
         }
+        false
+    }
+
+    /// Starts the walk again at the anchor, keeping blocks whose write is still owed.
+    fn restart(&mut self) {
+        *self = Self {
+            unwritten: std::mem::take(&mut self.unwritten),
+            ..Self::default()
+        };
     }
 
     /// Completes `pending` with its block's contents into `ready`. A block whose contents do
@@ -481,22 +702,6 @@ async fn reconcile<P: Peers>(shared: &Arc<Shared<P>>) -> Result<(), NodeError> {
     let tip = blocking(move || writer.disk.reconcile_history(&ancestry)).await?;
     debug!(target: "chibi::history", tip = tip.map(|tip| tip.number), "history reconciled");
     Ok(())
-}
-
-/// Records each watched account's proven state where its coverage opens. Returns whether
-/// every one was written.
-async fn open<P: Peers>(shared: &Arc<Shared<P>>, opens: Vec<OpenState>) -> bool {
-    let writer = Arc::clone(shared);
-    let opened = blocking(move || {
-        opens
-            .iter()
-            .try_for_each(|open| writer.disk.open_history(open))
-    })
-    .await;
-    if let Err(err) = &opened {
-        warn!(target: "chibi::history", %err, "cannot record where history opens; retrying");
-    }
-    opened.is_ok()
 }
 
 /// The watched accounts' proven state at `store`'s anchor. An account the store lacks is left
@@ -573,9 +778,14 @@ impl<P: Peers> Follower<P> {
         shared.warm(self.heads.latest.clone()).await;
 
         shared.follow_finalized(&self.heads).await;
-        if let Some(recorder) = &mut self.history {
-            let reanchored = matches!(stepped, Stepped::Reanchored(_));
-            recorder.step(&shared, reanchored, extension).await;
+        if let Some(history) = &mut self.history {
+            let moved = match stepped {
+                Stepped::Reanchored(_) => Some(Moved::Reanchored),
+                Stepped::Extended(_) | Stepped::Current => extension.map(Moved::Extended),
+            };
+            history
+                .step(&shared, moved, self.heads.latest.clone())
+                .await;
         }
         let anchor = shared.read(|s| s.anchor().clone());
         if shared.read(|s| s.txs().has_pending()) {
@@ -793,11 +1003,9 @@ impl<P: Peers> Shared<P> {
                 .try_for_each(|block| s.advance(block))
                 .map(|()| opens)
         })?;
-        Ok(scans.zip(opens).map(|(scans, opens)| Extension {
-            parent: anchor.num_hash(),
-            scans,
-            opens,
-        }))
+        Ok(scans
+            .zip(opens)
+            .map(|(scans, opens)| Extension { scans, opens }))
     }
 
     /// Proves the working-set keys the store lacks at the anchor, pins first, then learned

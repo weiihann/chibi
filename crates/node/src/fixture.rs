@@ -46,12 +46,17 @@ pub enum Fault {
     /// Receipt requests get an empty list: for a block with transactions, the answer of a peer
     /// that lacks them.
     EmptyReceipts,
+    /// Body and receipt requests are never answered, as by a peer that went silent.
+    SilentContents,
     /// The next account reply for this address claims this balance, sent by [`LIAR`].
     LieAboutBalance(Address, U256),
     /// The census counts no state peer.
     NoStatePeers,
     /// The next this many header requests fail as rejected.
     RejectHeaders(u32),
+    /// Requests for more than one header fail as rejected, so walks back from a head fail while
+    /// heads themselves still arrive.
+    RejectAncestors,
     /// Header requests fail as if the network had stopped.
     StopHeaders,
 }
@@ -104,9 +109,11 @@ struct Faults {
     withhold_bals: bool,
     withhold_bodies: bool,
     empty_receipts: bool,
+    silent_contents: bool,
     lie: Option<(B256, U256)>,
     no_state_peers: bool,
     rejected_headers: u32,
+    reject_ancestors: bool,
     stop_headers: bool,
 }
 
@@ -243,8 +250,10 @@ impl Fixture {
             Fault::WithholdBals => faults.withhold_bals = true,
             Fault::WithholdBodies => faults.withhold_bodies = true,
             Fault::EmptyReceipts => faults.empty_receipts = true,
+            Fault::SilentContents => faults.silent_contents = true,
             Fault::NoStatePeers => faults.no_state_peers = true,
             Fault::RejectHeaders(count) => faults.rejected_headers = count,
+            Fault::RejectAncestors => faults.reject_ancestors = true,
             Fault::StopHeaders => faults.stop_headers = true,
             Fault::LieAboutBalance(address, balance) => {
                 faults.lie = Some((keccak256(address), balance));
@@ -428,6 +437,9 @@ impl Peers for FixturePeers {
                 faults.rejected_headers -= 1;
                 return Err(NetError::Rejected);
             }
+            if faults.reject_ancestors && count > 1 {
+                return Err(NetError::Rejected);
+            }
         }
         let world = self.inner.world.lock();
         let mut headers = Vec::new();
@@ -483,7 +495,14 @@ impl Peers for FixturePeers {
     }
 
     async fn bodies(&self, blocks: Vec<B256>) -> Result<Reply<Vec<Body>>, NetError> {
-        if self.inner.faults.lock().withhold_bodies {
+        let (silent, withheld) = {
+            let faults = self.inner.faults.lock();
+            (faults.silent_contents, faults.withhold_bodies)
+        };
+        if silent {
+            std::future::pending::<()>().await;
+        }
+        if withheld {
             return Err(NetError::Rejected);
         }
         self.inner.log.lock().bodies += blocks.len();
@@ -492,6 +511,10 @@ impl Peers for FixturePeers {
     }
 
     async fn receipts(&self, block: B256) -> Result<Reply<Vec<Receipt>>, NetError> {
+        let silent = self.inner.faults.lock().silent_contents;
+        if silent {
+            std::future::pending::<()>().await;
+        }
         self.inner.log.lock().receipts += 1;
         if self.inner.faults.lock().empty_receipts {
             return Self::honest(Vec::new());
