@@ -33,7 +33,7 @@ use self::app::{Action, App, Balances, CAT_FRAME, HistoryLines, HistoryPane, Req
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
 use self::wallet::Saved;
-use crate::activity::{NO_HISTORY, activity_line, coverage_line, recent, unix_now};
+use crate::activity::{NO_HISTORY, activity_line, coverage_line, unix_now};
 use crate::config::process_env;
 use crate::names::printable;
 use crate::run::{self, STARTING, Served};
@@ -716,13 +716,14 @@ fn read_history(
             activities: Vec::new(),
         });
     };
-    let coverage = history.coverage(account)?;
-    let activities = recent(&history, account, HISTORY_ACTIVITIES)?
+    let view = history.view(account, HISTORY_ACTIVITIES)?;
+    let activities = view
+        .activities
         .iter()
         .map(|activity| activity_line(activity, account, registry, now))
         .collect();
     Ok(HistoryLines {
-        coverage: coverage_line(&coverage, &send_check(&coverage)),
+        coverage: coverage_line(&view.coverage, &send_check(&view.coverage)),
         activities,
     })
 }

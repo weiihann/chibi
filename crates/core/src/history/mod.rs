@@ -6,7 +6,7 @@
 mod decode;
 mod scan;
 
-pub use decode::{Activity, Effect, Missing, SendCheck, decode, send_check};
+pub use decode::{Activity, Effect, SendCheck, TopEnd, Unexplained, decode, send_check};
 pub use scan::{Pending, Scan, ScanError, scan_backward, scan_forward};
 
 use alloy_primitives::{Address, B256, Bytes, Log, TxHash, U256};
@@ -338,6 +338,14 @@ pub struct Page {
     /// newer of the newest balance-bearing touch and the newest proven open state below it,
     /// the touch when both are at one block.
     pub opening_balance: Option<(u64, U256)>,
+    /// The account's [`Capability::Bal`] ranges that overlap the stretch from the opening
+    /// balance to the page's newest block. A balance is carried from one block to a later one
+    /// only when no block between them is missing from these ranges.
+    pub bal: Ranges,
+    /// The account's proven open states from the page's lowest block up to below its newest,
+    /// as `(block number, balance)`, oldest first. Each is a fresh starting balance after the
+    /// coverage gap it closes.
+    pub opens: Vec<(u64, U256)>,
     /// The cursor for the next older page: the lowest block on this page, when the account has
     /// blocks below it.
     pub next: Option<u64>,
@@ -355,9 +363,34 @@ pub struct Coverage {
     pub settled: Option<u64>,
     /// The proven states where forward coverage opened, oldest first.
     pub opens: Vec<OpenState>,
-    /// The account's own stored transactions as `(block number, transaction)`, oldest first,
-    /// each with its encoding, which carries the nonce.
-    pub sends: Vec<(u64, TxRow)>,
+    /// The stored transactions with their encoding at the account's touches, as
+    /// `(block number, transaction)`, oldest first: its own sends, which carry their nonce,
+    /// and transactions that may carry its EIP-7702 authorizations, which carry theirs.
+    pub txs: Vec<(u64, TxRow)>,
+    /// The nonce post-values of the account's touches, oldest first. Only forward scans
+    /// record them, so they are complete over the account's [`Capability::Bal`] ranges.
+    pub nonces: Vec<NonceChange>,
+}
+
+/// An account's nonce after a change, from the block access list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NonceChange {
+    /// Block number.
+    pub number: u64,
+    /// The block access index of the change.
+    pub index: u64,
+    /// The nonce after the change.
+    pub nonce: u64,
+}
+
+/// An account's coverage and its newest activities, read from one snapshot of the history, so
+/// the coverage line and the activities beside it never disagree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct View {
+    /// What history holds for the account overall, with the send check's input.
+    pub coverage: Coverage,
+    /// The account's newest activities, newest first.
+    pub activities: Vec<Activity>,
 }
 
 #[cfg(test)]

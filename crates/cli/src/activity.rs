@@ -2,39 +2,17 @@
 //! The formatting is pure, so `chibi status` and the wallet show history in the same words.
 
 use std::fmt::Write as _;
-use std::num::NonZeroUsize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, U256};
-use chibi_core::history::{Activity, Capability, Coverage, Effect, SendCheck, decode};
-use chibi_node::{History, NodeError, Token};
+use chibi_core::history::{Activity, Capability, Coverage, Effect, SendCheck, TopEnd};
+use chibi_node::Token;
 
 /// What the coverage line says for an account history holds nothing for.
 pub const NO_HISTORY: &str = "no history yet";
 
 /// Decimal places of one ether.
 pub const ETH_DECIMALS: u8 = 18;
-
-/// The newest `count` activities of `account`, newest first.
-pub fn recent(
-    history: &History,
-    account: Address,
-    count: usize,
-) -> Result<Vec<Activity>, NodeError> {
-    let rows = NonZeroUsize::MIN.saturating_add(count.saturating_sub(1));
-    let mut found = Vec::with_capacity(count);
-    let mut before = None;
-    while found.len() < count {
-        let page = history.page(account, before, rows)?;
-        found.extend(decode(&page));
-        match page.next {
-            Some(next) => before = Some(next),
-            None => break,
-        }
-    }
-    found.truncate(count);
-    Ok(found)
-}
 
 /// The current Unix time in seconds, 0 if the clock is before 1970.
 pub fn unix_now() -> u64 {
@@ -136,9 +114,14 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             nonce,
             success,
             fee,
+            value,
         } => {
             let mut text = String::from(if *success { "sent" } else { "failed send" });
+            if let Some(value) = value {
+                let _ = write!(text, " {}", eth(*value));
+            }
             match (to, nonce) {
+                (Some(to), _) if *to == account => text.push_str(" to self"),
                 (Some(to), _) => {
                     let _ = write!(text, " to {}", short(*to));
                 }
@@ -255,6 +238,8 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             before: None,
             after,
         } => format!("balance now {}", eth(*after)),
+        Effect::Delegated { to: Some(to) } => format!("delegated to {}", short(*to)),
+        Effect::Delegated { to: None } => "delegation cleared".to_owned(),
         Effect::Other { emitter, .. } => format!("event from {}", short(*emitter)),
     }
 }
@@ -269,7 +254,7 @@ fn approval(owner: Address, account: Address, what: &str) -> String {
 }
 
 /// What history holds for an account, as one line: where its log coverage starts, the gaps
-/// inside it, and whether its sends are complete.
+/// inside it, and whether every nonce since its earliest send is explained.
 pub fn coverage_line(coverage: &Coverage, check: &SendCheck) -> String {
     let logs = coverage
         .ranges
@@ -300,24 +285,42 @@ pub fn coverage_line(coverage: &Coverage, check: &SendCheck) -> String {
     match check.earliest {
         None => parts.push("no sends found".to_owned()),
         Some(earliest) => {
-            if check.missing.is_empty() && check.top_gap.is_none() {
+            let complete = matches!(
+                check.top,
+                TopEnd::Checked {
+                    unexplained: None,
+                    ..
+                }
+            );
+            if check.unexplained.is_empty() && complete {
                 parts.push(format!("sends from nonce {earliest} complete"));
             }
-            for missing in &check.missing {
-                let (low, high) = missing.nonces;
-                let (below, above) = missing.between;
+            for unexplained in &check.unexplained {
+                let (low, high) = unexplained.nonces;
+                let (below, above) = unexplained.between;
                 parts.push(format!(
-                    "{} missing between blocks {} and {}",
+                    "{} unexplained between blocks {} and {}",
                     nonces(low, high),
                     grouped(below),
                     grouped(above)
                 ));
             }
-            if let Some((low, high)) = check.top_gap {
-                parts.push(format!(
-                    "{} missing after the newest send",
+            match check.top {
+                TopEnd::Checked {
+                    unexplained: Some((low, high)),
+                    ..
+                } => parts.push(format!(
+                    "{} unexplained after the newest send",
                     nonces(low, high)
-                ));
+                )),
+                TopEnd::Checked {
+                    unexplained: None, ..
+                } => {}
+                TopEnd::Unchecked => {
+                    if let Some(highest) = check.nonces.last() {
+                        parts.push(format!("nonces after {highest} unchecked"));
+                    }
+                }
             }
             if earliest > 0 {
                 parts.push("earlier sends may predate the history".to_owned());
@@ -431,8 +434,19 @@ mod tests {
                     nonce: Some(42),
                     success: true,
                     fee: Some(U256::from(21_000_000_000_000u64)),
+                    value: None,
                 },
                 "sent to 0x1111…2222 (nonce 42, fee 0.000021 ETH)",
+            ),
+            (
+                Effect::Sent {
+                    to: Some(ME),
+                    nonce: Some(44),
+                    success: true,
+                    fee: None,
+                    value: Some(U256::from(1_000_000_000u64)),
+                },
+                "sent 0.000000001 ETH to self (nonce 44)",
             ),
             (
                 Effect::Sent {
@@ -440,9 +454,15 @@ mod tests {
                     nonce: Some(43),
                     success: false,
                     fee: None,
+                    value: None,
                 },
                 "failed send to 0x1111…2222 (nonce 43)",
             ),
+            (
+                Effect::Delegated { to: Some(ODD) },
+                "delegated to 0x7070…7070",
+            ),
+            (Effect::Delegated { to: None }, "delegation cleared"),
             (
                 Effect::Nft {
                     token: ODD,
@@ -577,7 +597,7 @@ mod tests {
         (number, row)
     }
 
-    fn coverage(logs: &[(u64, u64)], sends: Vec<(u64, TxRow)>, opens: Vec<OpenState>) -> String {
+    fn coverage(logs: &[(u64, u64)], txs: Vec<(u64, TxRow)>, opens: Vec<OpenState>) -> String {
         let coverage = Coverage {
             account: ME,
             ranges: vec![
@@ -589,9 +609,22 @@ mod tests {
             ],
             settled: None,
             opens,
-            sends,
+            txs,
+            nonces: Vec::new(),
         };
         coverage_line(&coverage, &send_check(&coverage))
+    }
+
+    /// My proven state at block `number` with nonce `nonce`.
+    fn open(number: u64, nonce: u64) -> OpenState {
+        OpenState {
+            account: ME,
+            number,
+            hash: B256::repeat_byte(2),
+            balance: U256::ZERO,
+            nonce,
+            slots: Vec::new(),
+        }
     }
 
     #[test]
@@ -600,18 +633,26 @@ mod tests {
             coverage(
                 &[(11_856_337, 11_990_000)],
                 vec![send(11_900_000, 17), send(11_950_000, 18)],
-                Vec::new()
+                vec![open(11_960_000, 19)]
             ),
             "history since block 11,856,337 · gaps: none · sends from nonce 17 complete · \
              earlier sends may predate the history"
         );
         assert_eq!(
-            coverage(&[(100, 200)], vec![send(150, 0)], Vec::new()),
+            coverage(&[(100, 200)], vec![send(150, 0)], vec![open(160, 1)]),
             "history since block 100 · gaps: none · sends from nonce 0 complete"
         );
         assert_eq!(
             coverage(&[(100, 200)], Vec::new(), Vec::new()),
             "history since block 100 · gaps: none · no sends found"
+        );
+    }
+
+    #[test]
+    fn coverage_without_an_open_state_leaves_later_sends_unchecked() {
+        assert_eq!(
+            coverage(&[(100, 200)], vec![send(150, 0)], Vec::new()),
+            "history since block 100 · gaps: none · nonces after 0 unchecked"
         );
     }
 
@@ -625,7 +666,7 @@ mod tests {
                     (11_950_002, 11_990_000)
                 ],
                 vec![send(11_900_000, 0)],
-                Vec::new()
+                vec![open(11_950_000, 1)]
             ),
             "history since block 11,856,337 · gaps: 11,901,200-11,912,800, 11,950,001 · \
              sends from nonce 0 complete"
@@ -633,32 +674,29 @@ mod tests {
     }
 
     #[test]
-    fn coverage_names_missing_nonces_and_where_they_lie() {
+    fn coverage_names_unexplained_nonces_and_where_they_lie() {
         assert_eq!(
             coverage(
                 &[(1_000, 2_000)],
                 vec![send(1_100, 5), send(1_500, 7), send(1_600, 10)],
-                Vec::new()
+                vec![open(1_700, 11)]
             ),
-            "history since block 1,000 · gaps: none · nonce 6 missing between blocks 1,100 and \
-             1,500 · nonces 8-9 missing between blocks 1,500 and 1,600 · \
+            "history since block 1,000 · gaps: none · nonce 6 unexplained between blocks 1,100 \
+             and 1,500 · nonces 8-9 unexplained between blocks 1,500 and 1,600 · \
              earlier sends may predate the history"
         );
     }
 
     #[test]
     fn coverage_names_a_top_gap_below_the_open_nonce() {
-        let open = OpenState {
-            account: ME,
-            number: 1_800,
-            hash: B256::repeat_byte(2),
-            balance: U256::ZERO,
-            nonce: 3,
-            slots: Vec::new(),
-        };
         assert_eq!(
-            coverage(&[(1_000, 2_000)], vec![send(1_100, 0)], vec![open]),
-            "history since block 1,000 · gaps: none · nonces 1-2 missing after the newest send"
+            coverage(
+                &[(1_000, 2_000)],
+                vec![send(1_100, 0)],
+                vec![open(1_800, 3)]
+            ),
+            "history since block 1,000 · gaps: none · nonces 1-2 unexplained after the newest \
+             send"
         );
     }
 

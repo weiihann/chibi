@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, Bytes, Log, U256, hex};
 use chibi_core::history::{
-    At, BlockFacts, BlockRow, Capability, Coverage, LogRow, OpenState, Page, Ranges, ScannedBlock,
-    SlotChange, Touch, TxRow, WithdrawalRow,
+    Activity, At, BlockFacts, BlockRow, Capability, Coverage, LogRow, NonceChange, OpenState, Page,
+    Ranges, ScannedBlock, SlotChange, Touch, TxRow, View, WithdrawalRow, decode,
 };
 use chibi_core::state::Key;
 use parking_lot::Mutex;
@@ -794,6 +794,32 @@ impl History {
         self.read(|conn| read_coverage(conn, account))
     }
 
+    /// The account's coverage, with the send check's input, and its newest `activities`
+    /// activities, newest first, read in one transaction so a writer between them cannot make
+    /// them disagree.
+    pub fn view(&self, account: Address, activities: usize) -> Result<View, NodeError> {
+        self.view_between(account, activities, || {})
+    }
+
+    /// [`History::view`], running `between` after the coverage is read and before the
+    /// activities are, so a test can write there.
+    fn view_between(
+        &self,
+        account: Address,
+        activities: usize,
+        between: impl FnOnce(),
+    ) -> Result<View, NodeError> {
+        self.read(|conn| {
+            let coverage = read_coverage(conn, account)?;
+            between();
+            let activities = read_activities(conn, account, activities)?;
+            Ok(View {
+                coverage,
+                activities,
+            })
+        })
+    }
+
     /// Runs `read` in one deferred transaction, ended before returning.
     fn read<R>(
         &self,
@@ -805,6 +831,28 @@ impl History {
         tx.commit().map_err(fail)?;
         Ok(result)
     }
+}
+
+/// The newest `count` activities of `account`, newest first, decoded from as many pages as
+/// hold them.
+fn read_activities(
+    conn: &Connection,
+    account: Address,
+    count: usize,
+) -> rusqlite::Result<Vec<Activity>> {
+    let rows = NonZeroUsize::MIN.saturating_add(count.saturating_sub(1));
+    let mut found = Vec::with_capacity(count);
+    let mut before = None;
+    while found.len() < count {
+        let page = read_page(conn, account, before, rows)?;
+        found.extend(decode(&page));
+        match page.next {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+    found.truncate(count);
+    Ok(found)
 }
 
 fn read_page(
@@ -839,14 +887,43 @@ fn read_page(
         None => None,
     };
     let floor = numbers.last().copied().unwrap_or(below);
+    let newest = numbers.first().copied();
     let mut blocks = Vec::with_capacity(numbers.len());
     for number in numbers {
         blocks.extend(read_block(conn, account, number)?);
     }
+    let opening_balance = opening_balance(conn, account, floor)?;
+    let (bal, opens) = match newest {
+        Some(newest) => {
+            let from = opening_balance.map_or(floor, |(number, _)| number);
+            let bal = conn
+                .prepare_cached(
+                    "SELECT first, last FROM history_coverage
+                     WHERE account = ?1 AND capability = ?2 AND last >= ?3 AND first <= ?4",
+                )?
+                .query_map(
+                    params![account.as_slice(), Capability::Bal.code(), from, newest],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<rusqlite::Result<Ranges>>()?;
+            let opens = parsed(
+                conn,
+                "SELECT number, balance FROM history_open
+                 WHERE account = ?1 AND number >= ?2 AND number < ?3 ORDER BY number",
+                params![account.as_slice(), floor, newest],
+                "history_open",
+                number_balance,
+            )?;
+            (bal, opens)
+        }
+        None => (Ranges::default(), Vec::new()),
+    };
     Ok(Page {
         account,
         blocks,
-        opening_balance: opening_balance(conn, account, floor)?,
+        opening_balance,
+        bal,
+        opens,
         next,
     })
 }
@@ -1088,11 +1165,16 @@ fn read_coverage(conn: &Connection, account: Address) -> rusqlite::Result<Covera
             },
         )?;
     }
-    let sends = parsed(
+    // Every transaction relevant to the account has a touch at its index, and those stored
+    // whole carry the account's sends and authorizations.
+    let txs = parsed(
         conn,
-        "SELECT tx_index, hash, sender, raw, success, cumulative_gas, gas_used,
-         first_log_index, log_count, number FROM history_tx WHERE sender = ?1
-         ORDER BY number, tx_index",
+        "SELECT x.tx_index, x.hash, x.sender, x.raw, x.success, x.cumulative_gas, x.gas_used,
+         x.first_log_index, x.log_count, x.number
+         FROM history_touch AS t JOIN history_tx AS x
+         ON x.number = t.number AND x.tx_index = t.access_index - 1
+         WHERE t.account = ?1 AND x.raw IS NOT NULL
+         ORDER BY x.number, x.tx_index",
         [account.as_slice()],
         "history_tx",
         |row| {
@@ -1102,12 +1184,27 @@ fn read_coverage(conn: &Connection, account: Address) -> rusqlite::Result<Covera
             Ok(Some((row.get(9)?, tx)))
         },
     )?;
+    let nonces = parsed(
+        conn,
+        "SELECT number, access_index, nonce FROM history_touch
+         WHERE account = ?1 AND nonce IS NOT NULL ORDER BY number, access_index",
+        [account.as_slice()],
+        "history_touch",
+        |row| {
+            Ok(Some(NonceChange {
+                number: row.get(0)?,
+                index: row.get(1)?,
+                nonce: row.get(2)?,
+            }))
+        },
+    )?;
     Ok(Coverage {
         account,
         ranges,
         settled: settled(conn)?.map(|mark| mark.number),
         opens,
-        sends,
+        txs,
+        nonces,
     })
 }
 
@@ -3249,6 +3346,58 @@ mod tests {
         }
 
         #[test]
+        fn a_page_carries_its_bal_coverage_and_the_open_states_inside_it() {
+            let (dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            disk.record_head(at(20, 1), &chain(at(20, 1), 1, 2))
+                .unwrap();
+            disk.open_history(&OpenState {
+                account: alice(),
+                number: 20,
+                hash: hash(20, 1),
+                balance: U256::from(2_000),
+                nonce: 20,
+                slots: vec![],
+            })
+            .unwrap();
+            let history = reader(&dir);
+
+            let newest = page(&history, alice(), None, 3);
+            assert_eq!(block_numbers(&newest), [22, 21, 12]);
+            assert_eq!(newest.opening_balance, Some((11, U256::from(11))));
+            assert_eq!(newest.bal, Ranges::from_iter([(10, 12), (21, 22)]));
+            assert_eq!(newest.opens, [(20, U256::from(2_000))]);
+            let older = page(&history, alice(), newest.next, 1);
+            assert_eq!(block_numbers(&older), [11]);
+            assert_eq!(older.bal, Ranges::from_iter([(10, 12)]));
+            assert_eq!(older.opens, []);
+        }
+
+        #[test]
+        fn a_view_reads_coverage_and_activities_from_one_snapshot() {
+            let (dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 2)).unwrap();
+            let history = reader(&dir);
+            disk.db
+                .lock()
+                .conn
+                .busy_timeout(Duration::from_millis(10))
+                .unwrap();
+
+            let view = history
+                .view_between(alice(), 1, || {
+                    // Refused while the view's snapshot is open; accepted between two reads.
+                    let _ = disk.record_head(at(11, 1), &chain(at(11, 1), 1, 1));
+                })
+                .unwrap();
+
+            assert_eq!(view.coverage.ranges[0].0, Capability::Bal);
+            assert_eq!(view.coverage.ranges[0].1.last(), Some(11));
+            let newest: Vec<_> = view.activities.iter().map(|found| found.number).collect();
+            assert_eq!(newest, [11]);
+        }
+
+        #[test]
         fn rows_that_do_not_parse_are_skipped() {
             let (dir, disk) = fresh();
             disk.record_head(at(9, 1), &chain(at(9, 1), 1, 1)).unwrap();
@@ -3268,7 +3417,7 @@ mod tests {
         }
 
         #[test]
-        fn coverage_lists_known_ranges_the_settled_mark_opens_and_own_sends_in_order() {
+        fn coverage_lists_ranges_the_settled_mark_opens_txs_at_touches_and_nonces_in_order() {
             let (dir, disk) = fresh();
             let mut step = chain(at(9, 1), 1, 3);
             let facts = step[1].facts.as_mut().unwrap();
@@ -3292,6 +3441,26 @@ mod tests {
                 code: None,
             });
             step[1].accounts.push(bob());
+            let relayed = step[2].facts.as_mut().unwrap();
+            relayed.block.tx_count = 2;
+            relayed.txs.push(TxRow {
+                index: 1,
+                hash: B256::repeat_byte(0x33),
+                sender: bob(),
+                raw: Some(Bytes::from_static(&[4, 1])),
+                success: true,
+                cumulative_gas: 42_000,
+                gas_used: 21_000,
+                first_log_index: 1,
+                log_count: 0,
+            });
+            relayed.touches.push(Touch {
+                account: alice(),
+                at: At::Tx(1),
+                balance: None,
+                nonce: None,
+                code: None,
+            });
             disk.record_head(at(9, 1), &step).unwrap();
             disk.settle_history(at(11, 1)).unwrap();
             disk.augment_history(&[backward(5, 1)]).unwrap();
@@ -3341,13 +3510,33 @@ mod tests {
             );
             assert_eq!(coverage.settled, Some(11));
             assert_eq!(coverage.opens, opens);
-            let sends: Vec<_> = coverage
-                .sends
+            let txs: Vec<_> = coverage
+                .txs
                 .iter()
                 .map(|(number, tx)| (*number, tx.index, tx.sender, tx.raw.clone()))
                 .collect();
             let own = |number| (number, 0, alice(), Some(Bytes::from_static(&[2, 1])));
-            assert_eq!(sends, [own(5), own(10), own(11), own(12), own(21), own(22)]);
+            let relayed = (12, 1, bob(), Some(Bytes::from_static(&[4, 1])));
+            assert_eq!(
+                txs,
+                [own(5), own(10), own(11), own(12), relayed, own(21), own(22)]
+            );
+            let nonces: Vec<_> = coverage
+                .nonces
+                .iter()
+                .map(|change| (change.number, change.index, change.nonce))
+                .collect();
+            assert_eq!(
+                nonces,
+                [
+                    (5, 1, 5),
+                    (10, 1, 10),
+                    (11, 1, 11),
+                    (12, 1, 12),
+                    (21, 1, 21),
+                    (22, 1, 22)
+                ]
+            );
         }
     }
 }

@@ -7,7 +7,7 @@ use alloy_consensus::Transaction as _;
 use alloy_eips::eip2718::Decodable2718 as _;
 use alloy_primitives::{Address, B256, Log, TxHash, U256, address, b256};
 
-use super::{At, BlockFacts, Coverage, Page, Touch};
+use super::{At, BlockFacts, Capability, Coverage, Page, Touch};
 use crate::wire;
 
 /// The emitter of EIP-7708 ETH transfer logs.
@@ -44,8 +44,9 @@ pub struct Activity {
 /// What an [`Activity`] did to the account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
-    /// The account sent a transaction. Its value is not here: ETH moves come only from
-    /// [`Effect::Eth`], so a send is never counted twice.
+    /// The account sent a transaction. Its value shows only for a send to itself, which emits
+    /// no EIP-7708 log: every other ETH move comes from [`Effect::Eth`], so no value is ever
+    /// counted twice.
     Sent {
         /// The recipient, `None` for a contract creation or when the encoding is not stored.
         to: Option<Address>,
@@ -56,6 +57,8 @@ pub enum Effect {
         /// Execution gas used times the effective gas price, without any blob fee. `None` when
         /// the encoding is not stored, or the price needs a base fee the block lacks.
         fee: Option<U256>,
+        /// The value of a send to the account itself, when non-zero.
+        value: Option<U256>,
     },
     /// ETH moved, from an EIP-7708 transfer log.
     Eth {
@@ -162,6 +165,12 @@ pub enum Effect {
         /// The balance after the change.
         after: U256,
     },
+    /// The account's EIP-7702 delegation was set or cleared, by its own transaction or by one
+    /// that relayed its authorization.
+    Delegated {
+        /// The code the account now delegates to, `None` when the delegation was cleared.
+        to: Option<Address>,
+    },
     /// A log naming the account that none of the known shapes match.
     Other {
         /// The contract that emitted it.
@@ -176,10 +185,24 @@ pub enum Effect {
 pub fn decode(page: &Page) -> Vec<Activity> {
     let mut found = Vec::new();
     // Balance deltas need the balance before each touch, so blocks are walked oldest first
-    // and the result is ordered afterwards.
-    let mut balance = page.opening_balance.map(|(_, balance)| balance);
+    // and the result is ordered afterwards. The balance is known as of the end of a block.
+    let mut known = page.opening_balance;
+    let mut opens = page.opens.iter().copied().peekable();
     for facts in page.blocks.iter().rev() {
+        let number = facts.block.number;
+        // A proven open state replaces whatever was carried: it closes a gap the carried
+        // balance knows nothing about.
+        while let Some((at, balance)) = opens.next_if(|&(at, _)| at < number) {
+            if known.is_none_or(|(since, _)| at >= since) {
+                known = Some((at, balance));
+            }
+        }
+        // A block missing from the Bal ranges may hold changes no touch records.
+        let mut balance = known
+            .filter(|&(since, _)| page.bal.gaps(since.saturating_add(1), number).is_empty())
+            .map(|(_, balance)| balance);
         decode_block(page.account, facts, &mut balance, &mut found);
+        known = balance.map(|balance| (number, balance));
     }
     // Stable, so the items of one ERC-1155 batch keep their order.
     found.sort_by_key(|found| Reverse(found.key));
@@ -222,10 +245,22 @@ fn decode_block(
         .collect();
     touches.sort_by_key(|touch| touch.at.index(block.tx_count));
     let withdrawn = facts.withdrawals.iter().any(|w| w.address == account);
+    let tx_at = |at: At| match at {
+        At::Tx(n) => facts.txs.iter().find(|tx| tx.index == n),
+        At::System | At::Post => None,
+    };
+    // Where the block access list recorded a code change, it is what happened, and an
+    // authorization in the transaction there says nothing more.
+    let mut code_changed = Vec::new();
     for touch in touches {
         let before = *balance;
+        let tx = tx_at(touch.at);
+        if let Some(to) = touch.code.as_ref().and_then(|code| delegation(code)) {
+            code_changed.push(touch.at);
+            push(touch.at, 0, tx.map(|tx| tx.hash), Effect::Delegated { to });
+        }
         let effect = match touch.at {
-            At::Tx(n) if facts.txs.iter().any(|tx| tx.index == n) => None,
+            At::Tx(_) if tx.is_some() => None,
             At::Tx(_) => Some(Effect::FeeCredit {
                 amount: touch
                     .balance
@@ -278,6 +313,13 @@ fn decode_block(
             }
         }
         let to = decoded.as_ref().and_then(|decoded| decoded.to());
+        if !code_changed.contains(&at)
+            && let Some(to) = decoded
+                .as_ref()
+                .and_then(|decoded| authorized(decoded, account))
+        {
+            push(at, 0, Some(tx.hash), Effect::Delegated { to });
+        }
         if tx.sender == account {
             let effect = Effect::Sent {
                 to,
@@ -286,12 +328,38 @@ fn decode_block(
                 fee: decoded
                     .as_ref()
                     .and_then(|decoded| fee(decoded, tx.gas_used, block.base_fee)),
+                // A send to oneself emits no EIP-7708 log, so its value shows nowhere else.
+                value: decoded
+                    .as_ref()
+                    .map(|decoded| decoded.value())
+                    .filter(|value| to == Some(account) && !value.is_zero()),
             };
             push(at, 0, Some(tx.hash), effect);
         } else if !named && to == Some(account) {
             push(at, 0, Some(tx.hash), Effect::Called { from: tx.sender });
         }
     }
+}
+
+/// What an account's code says about its delegation: `Some(Some(target))` for the EIP-7702
+/// designator `0xef0100 || target`, `Some(None)` for no code (a cleared delegation), `None`
+/// for any other code.
+fn delegation(code: &[u8]) -> Option<Option<Address>> {
+    match code {
+        [] => Some(None),
+        [0xef, 0x01, 0x00, target @ ..] => Some(Some(Address::try_from(target).ok()?)),
+        _ => None,
+    }
+}
+
+/// The delegation the last of `account`'s EIP-7702 authorizations in `tx` sets: `Some(None)`
+/// when it clears the delegation, `None` when `tx` carries none of the account's. An
+/// authorization whose signature does not recover delegates nobody.
+fn authorized(tx: &wire::Transaction, account: Address) -> Option<Option<Address>> {
+    tx.authorization_list()?
+        .iter()
+        .rfind(|authorization| authorization.recover_authority().ok() == Some(account))
+        .map(|authorization| Some(authorization.address).filter(|to| !to.is_zero()))
 }
 
 /// Gas used times the effective gas price. A dynamic-fee price needs the block's base fee.
@@ -444,51 +512,104 @@ fn word(data: &[u8], at: usize) -> Option<usize> {
     usize::try_from(U256::from_be_slice(word)).ok()
 }
 
-/// A run of nonces with no stored send, though sends on both sides of it are stored.
+/// A run of nonces that nothing stored explains, though explained nonces lie on both sides.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Missing {
-    /// The missing nonces, inclusive.
+pub struct Unexplained {
+    /// The unexplained nonces, inclusive.
     pub nonces: (u64, u64),
-    /// The blocks of the stored sends just below and just above the run, so the missing sends
-    /// lie between them.
+    /// The blocks of the explained nonces just below and just above the run, so whatever used
+    /// the nonces lies between them.
     pub between: (u64, u64),
 }
 
-/// What the stored sends prove about the account's nonces: which sends are missing from
-/// history, and where.
+/// Whether the nonces above the highest explained one were checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SendCheck {
-    /// The nonces of the stored sends, ascending.
-    pub nonces: Vec<u64>,
-    /// Runs of nonces missing between stored sends.
-    pub missing: Vec<Missing>,
-    /// The lowest stored nonce. Sends below it are unknown: they may predate history.
-    pub earliest: Option<u64>,
-    /// The newest proven open state as `(block number, nonce)`.
-    pub open_nonce: Option<(u64, u64)>,
-    /// The nonces from the highest stored one + 1 to the open nonce - 1, when the newest open
-    /// state lies at or above every stored send and they do not reach its nonce.
-    pub top_gap: Option<(u64, u64)>,
+pub enum TopEnd {
+    /// The account has no proven open state, so nothing bounds its nonces from above.
+    Unchecked,
+    /// Checked against the newest proven open state.
+    Checked {
+        /// The newest open state as `(block number, nonce)`.
+        open: (u64, u64),
+        /// The nonces from the highest explained one + 1 to the open nonce - 1, when the open
+        /// state lies at or above every explained nonce and they do not reach its nonce.
+        unexplained: Option<(u64, u64)>,
+    },
 }
 
-/// Checks the account's stored sends against each other and against the newest open state.
-/// Sends whose encoding is not stored carry no nonce and are skipped.
+/// What stored history proves about the account's nonces: which nonces nothing explains, and
+/// where. A nonce is explained by a stored send, an EIP-7702 authorization of the account in a
+/// stored transaction, or a nonce change in a forward-covered block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendCheck {
+    /// The explained nonces, ascending.
+    pub nonces: Vec<u64>,
+    /// Runs of nonces between explained ones that nothing explains.
+    pub unexplained: Vec<Unexplained>,
+    /// The lowest explained nonce. Nonces below it are unknown: they may predate history.
+    pub earliest: Option<u64>,
+    /// The nonces above the highest explained one.
+    pub top: TopEnd,
+}
+
+/// Checks the nonces stored history explains against each other and against the newest open
+/// state. A nonce is explained by the account's stored send, by its EIP-7702 authorization in
+/// any stored transaction, or by a nonce change in a forward-covered block, which explains
+/// every nonce since the last known one when no Bal gap lies between them. Transactions whose
+/// encoding is not stored carry no nonce and are skipped.
 pub fn send_check(coverage: &Coverage) -> SendCheck {
-    let mut sends: Vec<(u64, u64)> = coverage
-        .sends
+    let account = coverage.account;
+    // `(nonce, block number)` of every nonce something stored explains.
+    let mut explained: Vec<(u64, u64)> = Vec::new();
+    for (number, tx) in &coverage.txs {
+        let Some(decoded) = tx
+            .raw
+            .as_ref()
+            .and_then(|raw| wire::Transaction::decode_2718_exact(raw).ok())
+        else {
+            continue;
+        };
+        if tx.sender == account {
+            explained.push((decoded.nonce(), *number));
+        }
+        // An authorization raises its authority's nonce whoever sends the transaction.
+        explained.extend(
+            decoded
+                .authorization_list()
+                .unwrap_or_default()
+                .iter()
+                .filter(|authorization| authorization.recover_authority().ok() == Some(account))
+                .map(|authorization| (authorization.nonce, *number)),
+        );
+    }
+    let bal = coverage
+        .ranges
         .iter()
-        .filter_map(|(number, tx)| {
-            let raw = tx.raw.as_ref()?;
-            let nonce = wire::Transaction::decode_2718_exact(raw).ok()?.nonce();
-            Some((nonce, *number))
-        })
-        .collect();
-    sends.sort_unstable();
-    sends.dedup_by_key(|&mut (nonce, _)| nonce);
-    let missing = sends
+        .find(|(capability, _)| *capability == Capability::Bal)
+        .map(|(_, ranges)| ranges);
+    let mut opens = coverage.opens.iter().peekable();
+    let mut last: Option<(u64, u64)> = None;
+    for change in &coverage.nonces {
+        while let Some(open) = opens.next_if(|open| open.number < change.number) {
+            if last.is_none_or(|(at, _)| open.number >= at) {
+                last = Some((open.number, open.nonce));
+            }
+        }
+        let unbroken = |&(at, _): &(u64, u64)| {
+            bal.is_some_and(|bal| bal.gaps(at.saturating_add(1), change.number).is_empty())
+        };
+        let from = last
+            .filter(unbroken)
+            .map_or(change.nonce.saturating_sub(1), |(_, nonce)| nonce);
+        explained.extend((from..change.nonce).map(|nonce| (nonce, change.number)));
+        last = Some((change.number, change.nonce));
+    }
+    explained.sort_unstable();
+    explained.dedup_by_key(|&mut (nonce, _)| nonce);
+    let unexplained = explained
         .windows(2)
         .filter_map(|pair| match *pair {
-            [(low, below), (high, above)] if high - low > 1 => Some(Missing {
+            [(low, below), (high, above)] if high - low > 1 => Some(Unexplained {
                 nonces: (low + 1, high - 1),
                 between: (below, above),
             }),
@@ -500,32 +621,43 @@ pub fn send_check(coverage: &Coverage) -> SendCheck {
         .iter()
         .max_by_key(|open| open.number)
         .map(|open| (open.number, open.nonce));
-    let newest_send = sends.iter().map(|&(_, number)| number).max();
-    let top_gap = match (open_nonce, sends.last(), newest_send) {
-        (Some((at, open)), Some(&(highest, _)), Some(newest))
-            if at >= newest && highest.saturating_add(1) < open =>
-        {
-            Some((highest + 1, open - 1))
-        }
-        _ => None,
+    let newest = explained.iter().map(|&(_, number)| number).max();
+    let top = match open_nonce {
+        None => TopEnd::Unchecked,
+        Some((at, open)) => TopEnd::Checked {
+            open: (at, open),
+            unexplained: match (explained.last(), newest) {
+                (Some(&(highest, _)), Some(newest))
+                    if at >= newest && highest.saturating_add(1) < open =>
+                {
+                    Some((highest + 1, open - 1))
+                }
+                _ => None,
+            },
+        },
     };
     SendCheck {
-        nonces: sends.iter().map(|&(nonce, _)| nonce).collect(),
-        missing,
-        earliest: sends.first().map(|&(nonce, _)| nonce),
-        open_nonce,
-        top_gap,
+        nonces: explained.iter().map(|&(nonce, _)| nonce).collect(),
+        unexplained,
+        earliest: explained.first().map(|&(nonce, _)| nonce),
+        top,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_consensus::{Signed, TxEip1559, TxLegacy};
+    use alloy_consensus::{SignableTransaction as _, Signed, TxEip1559, TxEip7702, TxLegacy};
     use alloy_eips::eip2718::Encodable2718 as _;
+    use alloy_eips::eip7702::{Authorization, SignedAuthorization};
     use alloy_primitives::{Bytes, Log, Signature, TxKind, keccak256};
+    use alloy_signer::SignerSync as _;
+    use alloy_signer_local::PrivateKeySigner;
 
     use super::*;
-    use crate::history::{BlockFacts, BlockRow, LogRow, OpenState, Touch, TxRow, WithdrawalRow};
+    use crate::history::{
+        BlockFacts, BlockRow, Capability, LogRow, NonceChange, OpenState, Ranges, Touch, TxRow,
+        WithdrawalRow,
+    };
     use crate::wire;
 
     const A: Address = address!("0x00000000000000000000000000000000000000aa");
@@ -541,7 +673,7 @@ mod tests {
         Signature::new(U256::from(1u64), U256::from(1u64), false)
     }
 
-    fn eip1559(nonce: u64, to: Address, max_fee: u128, priority: u128) -> Bytes {
+    fn eip1559(nonce: u64, to: Address, value: u64, max_fee: u128, priority: u128) -> Bytes {
         let tx = TxEip1559 {
             chain_id: 11_155_111,
             nonce,
@@ -549,7 +681,7 @@ mod tests {
             max_fee_per_gas: max_fee,
             max_priority_fee_per_gas: priority,
             to: TxKind::Call(to),
-            value: U256::from(5u64),
+            value: U256::from(value),
             ..TxEip1559::default()
         };
         wire::Transaction::Eip1559(Signed::new_unhashed(tx, signature()))
@@ -570,6 +702,48 @@ mod tests {
         wire::Transaction::Legacy(Signed::new_unhashed(tx, signature()))
             .encoded_2718()
             .into()
+    }
+
+    /// An EIP-7702 transaction carrying `authorizations`, with a placeholder signature of its
+    /// own: only the authorizations' signatures are recovered.
+    fn eip7702(nonce: u64, to: Address, authorizations: Vec<SignedAuthorization>) -> Bytes {
+        let tx = TxEip7702 {
+            chain_id: 11_155_111,
+            nonce,
+            gas_limit: 100_000,
+            max_fee_per_gas: 20,
+            max_priority_fee_per_gas: 2,
+            to,
+            authorization_list: authorizations,
+            ..TxEip7702::default()
+        };
+        wire::Transaction::Eip7702(tx.into_signed(signature()))
+            .encoded_2718()
+            .into()
+    }
+
+    /// The key whose address is [`me`].
+    fn my_key() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap()
+    }
+
+    /// The account the authorization tests are about: one with a key, so its signature
+    /// recovers to it.
+    fn me() -> Address {
+        address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
+    }
+
+    /// My authorization at `nonce` to delegate to `to`.
+    fn authorization(nonce: u64, to: Address) -> SignedAuthorization {
+        let authorization = Authorization {
+            chain_id: U256::from(11_155_111u64),
+            address: to,
+            nonce,
+        };
+        let signature = my_key()
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        authorization.into_signed(signature)
     }
 
     fn facts(number: u64, tx_count: u32, base_fee: Option<u64>) -> BlockFacts {
@@ -630,11 +804,14 @@ mod tests {
         ns.iter().flat_map(|&n| word(n)).collect()
     }
 
+    /// A page of `blocks` covered by one unbroken block access list range.
     fn page(blocks: Vec<BlockFacts>, opening_balance: Option<(u64, U256)>) -> Page {
         Page {
             account: A,
             blocks,
             opening_balance,
+            bal: Ranges::from_iter([(0, 1_000)]),
+            opens: vec![],
             next: None,
         }
     }
@@ -668,31 +845,30 @@ mod tests {
     }
 
     #[test]
-    fn a_self_send_is_one_send_with_its_fee_and_one_eth_move() {
-        let mut block = facts(100, 1, Some(7));
-        block.txs = vec![TxRow {
-            log_count: 1,
-            ..tx(0, A, Some(eip1559(3, A, 20, 2)), true)
-        }];
-        block.logs = vec![log(
-            0,
-            ETH_LOGS,
-            &[TRANSFER, A.into_word(), A.into_word()],
-            word(5).to_vec(),
-        )];
-        block.touches = vec![touch(At::Tx(0), Some(811_000))];
+    fn a_self_send_shows_its_value_and_a_send_to_another_does_not() {
+        let mut block = facts(100, 2, Some(7));
+        block.txs = vec![
+            tx(0, A, Some(eip1559(3, A, GWEI, 20, 2)), true),
+            tx(1, A, Some(eip1559(4, B, GWEI, 20, 2)), true),
+        ];
+        block.touches = vec![
+            touch(At::Tx(0), Some(811_000)),
+            touch(At::Tx(1), Some(622_000)),
+        ];
 
         assert_eq!(
             decode(&page(vec![block], Some((99, U256::from(1_000_000u64))))),
             [
                 activity(
                     100,
-                    At::Tx(0),
-                    Some(hash(1)),
-                    Effect::Eth {
-                        from: A,
-                        to: A,
-                        amount: U256::from(5u64),
+                    At::Tx(1),
+                    Some(hash(2)),
+                    Effect::Sent {
+                        to: Some(B),
+                        nonce: Some(4),
+                        success: true,
+                        fee: Some(U256::from(189_000u64)),
+                        value: None,
                     },
                 ),
                 activity(
@@ -704,6 +880,7 @@ mod tests {
                         nonce: Some(3),
                         success: true,
                         fee: Some(U256::from(189_000u64)),
+                        value: Some(U256::from(1_000_000_000u64)),
                     },
                 ),
             ]
@@ -844,6 +1021,7 @@ mod tests {
                     nonce: Some(2),
                     success: false,
                     fee: Some(U256::from(63_000u64)),
+                    value: None,
                 },
             )]
         );
@@ -986,6 +1164,7 @@ mod tests {
                     nonce: None,
                     success: true,
                     fee: None,
+                    value: None,
                 }),
             ]
         );
@@ -1008,6 +1187,178 @@ mod tests {
         );
     }
 
+    /// A page with a fee credit at the second transaction of block 100 and of block 200, Bal
+    /// coverage over each block alone, and the balance before block 100 known.
+    fn credits_across_a_gap(opens: Vec<(u64, U256)>) -> Page {
+        let credit = |number: u64, balance: u64| {
+            let mut block = facts(number, 2, Some(7));
+            block.touches = vec![touch(At::Tx(1), Some(balance))];
+            block
+        };
+        Page {
+            account: A,
+            blocks: vec![credit(200, 5_200), credit(100, 1_300)],
+            opening_balance: Some((99, U256::from(1_000u64))),
+            bal: Ranges::from_iter([(99, 100), (200, 200)]),
+            opens,
+            next: None,
+        }
+    }
+
+    fn credit(number: u64, amount: Option<u64>) -> Activity {
+        activity(
+            number,
+            At::Tx(1),
+            None,
+            Effect::FeeCredit {
+                amount: amount.map(U256::from),
+            },
+        )
+    }
+
+    #[test]
+    fn a_fee_credit_after_a_gap_counts_from_the_new_opening_balance() {
+        let page = credits_across_a_gap(vec![(199, U256::from(5_000u64))]);
+        assert_eq!(
+            decode(&page),
+            [credit(200, Some(200)), credit(100, Some(300))]
+        );
+    }
+
+    #[test]
+    fn a_fee_credit_after_a_gap_with_no_opening_state_has_no_amount() {
+        let page = credits_across_a_gap(vec![]);
+        assert_eq!(decode(&page), [credit(200, None), credit(100, Some(300))]);
+    }
+
+    /// `code` for a delegation to `to`: the EIP-7702 designator.
+    fn designator(to: Address) -> Bytes {
+        [&[0xef, 0x01, 0x00][..], to.as_slice()].concat().into()
+    }
+
+    #[test]
+    fn a_relayed_authorization_shows_a_delegation_and_a_cleared_one_shows_none() {
+        let mut block = facts(100, 2, Some(7));
+        block.txs = vec![
+            tx(
+                0,
+                B,
+                Some(eip7702(0, C, vec![authorization(4, TOKEN)])),
+                true,
+            ),
+            tx(
+                1,
+                B,
+                Some(eip7702(1, C, vec![authorization(5, Address::ZERO)])),
+                true,
+            ),
+        ];
+        block.touches = vec![
+            Touch {
+                account: me(),
+                ..touch(At::Tx(0), None)
+            },
+            Touch {
+                account: me(),
+                ..touch(At::Tx(1), None)
+            },
+        ];
+        let page = Page {
+            account: me(),
+            ..page(vec![block], None)
+        };
+
+        assert_eq!(
+            decode(&page),
+            [
+                activity(
+                    100,
+                    At::Tx(1),
+                    Some(hash(2)),
+                    Effect::Delegated { to: None }
+                ),
+                activity(
+                    100,
+                    At::Tx(0),
+                    Some(hash(1)),
+                    Effect::Delegated { to: Some(TOKEN) }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forward_code_change_shows_a_delegation_once_and_a_cleared_one_shows_none() {
+        let mut block = facts(100, 2, Some(7));
+        block.txs = vec![
+            tx(0, B, None, true),
+            tx(
+                1,
+                me(),
+                Some(eip7702(3, me(), vec![authorization(4, Address::ZERO)])),
+                true,
+            ),
+        ];
+        block.touches = vec![
+            Touch {
+                account: me(),
+                code: Some(designator(TOKEN)),
+                ..touch(At::Tx(0), None)
+            },
+            Touch {
+                account: me(),
+                nonce: Some(5),
+                code: Some(Bytes::new()),
+                ..touch(At::Tx(1), None)
+            },
+        ];
+        let page = Page {
+            account: me(),
+            ..page(vec![block], None)
+        };
+
+        assert_eq!(
+            decode(&page),
+            [
+                activity(
+                    100,
+                    At::Tx(1),
+                    Some(hash(2)),
+                    Effect::Delegated { to: None }
+                ),
+                activity(
+                    100,
+                    At::Tx(1),
+                    Some(hash(2)),
+                    Effect::Sent {
+                        to: Some(me()),
+                        nonce: Some(3),
+                        success: true,
+                        fee: Some(U256::from(189_000u64)),
+                        value: None,
+                    }
+                ),
+                activity(
+                    100,
+                    At::Tx(0),
+                    Some(hash(1)),
+                    Effect::Delegated { to: Some(TOKEN) }
+                ),
+            ]
+        );
+    }
+
+    fn open(number: u64, nonce: u64) -> OpenState {
+        OpenState {
+            account: A,
+            number,
+            hash: B256::with_last_byte(0xb0),
+            balance: U256::ZERO,
+            nonce,
+            slots: vec![],
+        }
+    }
+
     fn coverage(sends: &[(u64, Option<u64>)], opens: &[(u64, u64)]) -> Coverage {
         Coverage {
             account: A,
@@ -1015,24 +1366,18 @@ mod tests {
             settled: None,
             opens: opens
                 .iter()
-                .map(|&(number, nonce)| OpenState {
-                    account: A,
-                    number,
-                    hash: B256::with_last_byte(0xb0),
-                    balance: U256::ZERO,
-                    nonce,
-                    slots: vec![],
-                })
+                .map(|&(number, nonce)| open(number, nonce))
                 .collect(),
-            sends: sends
+            txs: sends
                 .iter()
                 .map(|&(number, nonce)| (number, tx(0, A, nonce.map(|n| legacy(n, B, 3)), true)))
                 .collect(),
+            nonces: vec![],
         }
     }
 
     #[test]
-    fn a_nonce_gap_between_sends_and_below_the_open_nonce_are_both_missing() {
+    fn a_nonce_gap_between_sends_and_below_the_open_nonce_are_both_unexplained() {
         let check = send_check(&coverage(
             &[(10, Some(4)), (11, Some(5)), (13, None), (15, Some(7))],
             &[(3, 2), (20, 9)],
@@ -1042,13 +1387,15 @@ mod tests {
             check,
             SendCheck {
                 nonces: vec![4, 5, 7],
-                missing: vec![Missing {
+                unexplained: vec![Unexplained {
                     nonces: (6, 6),
                     between: (11, 15),
                 }],
                 earliest: Some(4),
-                open_nonce: Some((20, 9)),
-                top_gap: Some((8, 8)),
+                top: TopEnd::Checked {
+                    open: (20, 9),
+                    unexplained: Some((8, 8)),
+                },
             }
         );
     }
@@ -1061,10 +1408,95 @@ mod tests {
             check,
             SendCheck {
                 nonces: vec![4, 5],
-                missing: vec![],
+                unexplained: vec![],
                 earliest: Some(4),
-                open_nonce: Some((20, 6)),
-                top_gap: None,
+                top: TopEnd::Checked {
+                    open: (20, 6),
+                    unexplained: None,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn without_an_open_state_the_top_end_is_unchecked() {
+        let check = send_check(&coverage(&[(10, Some(4)), (11, Some(5))], &[]));
+
+        assert_eq!(check.top, TopEnd::Unchecked);
+        assert_eq!(check.unexplained, []);
+    }
+
+    #[test]
+    fn self_sponsored_and_relayed_authorizations_explain_their_nonces() {
+        let stored = |number: u64, sender: Address, raw: Bytes| {
+            (
+                number,
+                TxRow {
+                    hash: hash(u8::try_from(number).unwrap()),
+                    ..tx(0, sender, Some(raw), true)
+                },
+            )
+        };
+        let coverage = Coverage {
+            account: me(),
+            ranges: vec![],
+            settled: None,
+            opens: vec![OpenState {
+                account: me(),
+                ..open(20, 10)
+            }],
+            txs: vec![
+                stored(10, me(), eip7702(3, me(), vec![authorization(4, TOKEN)])),
+                stored(11, B, eip7702(0, C, vec![authorization(5, TOKEN)])),
+                stored(12, me(), legacy(6, B, 3)),
+                stored(14, me(), legacy(9, B, 3)),
+            ],
+            nonces: vec![],
+        };
+
+        assert_eq!(
+            send_check(&coverage),
+            SendCheck {
+                nonces: vec![3, 4, 5, 6, 9],
+                unexplained: vec![Unexplained {
+                    nonces: (7, 8),
+                    between: (12, 14),
+                }],
+                earliest: Some(3),
+                top: TopEnd::Checked {
+                    open: (20, 10),
+                    unexplained: None,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn forward_nonce_changes_explain_every_nonce_since_the_last_known_one() {
+        let change = |number, nonce| NonceChange {
+            number,
+            index: 1,
+            nonce,
+        };
+        let coverage = Coverage {
+            ranges: vec![(Capability::Bal, Ranges::from_iter([(10, 20), (22, 30)]))],
+            nonces: vec![change(12, 5), change(15, 6), change(25, 9)],
+            ..coverage(&[], &[(9, 3)])
+        };
+
+        assert_eq!(
+            send_check(&coverage),
+            SendCheck {
+                nonces: vec![3, 4, 5, 8],
+                unexplained: vec![Unexplained {
+                    nonces: (6, 7),
+                    between: (15, 25),
+                }],
+                earliest: Some(3),
+                top: TopEnd::Checked {
+                    open: (9, 3),
+                    unexplained: None,
+                },
             }
         );
     }

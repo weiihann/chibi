@@ -21,13 +21,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::Address;
-use chibi_core::history::{Activity, Coverage, send_check};
+use chibi_core::history::{View, send_check};
 use chibi_node::disk::Holder;
 use chibi_node::{Disk, History, Network, NodeError, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 use eyre::WrapErr;
 
-use crate::activity::{ETH_DECIMALS, activity_line, coverage_line, format_units, recent, unix_now};
+use crate::activity::{ETH_DECIMALS, activity_line, coverage_line, format_units, unix_now};
 use crate::config::{absolute_path, default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::names::printable;
@@ -148,27 +148,19 @@ fn status(target: &Target, path: &Path, named: bool) -> eyre::Result<()> {
     }
 }
 
-/// What history holds for one watched account: its coverage and its newest activities.
-struct AccountHistory {
-    coverage: Coverage,
-    recent: Vec<Activity>,
-}
-
 /// The history of each account in `snapshot`, read beside any running node. Empty when the
 /// data directory has no history or no account has coverage yet, so status reads as it did
 /// before history.
 fn read_histories(
     data_dir: &Path,
     snapshot: &Snapshot,
-) -> Result<BTreeMap<Address, AccountHistory>, NodeError> {
+) -> Result<BTreeMap<Address, View>, NodeError> {
     let Some(history) = History::open(data_dir)? else {
         return Ok(BTreeMap::new());
     };
     let mut histories = BTreeMap::new();
     for holding in &snapshot.holdings {
-        let coverage = history.coverage(holding.address)?;
-        let recent = recent(&history, holding.address, RECENT)?;
-        histories.insert(holding.address, AccountHistory { coverage, recent });
+        histories.insert(holding.address, history.view(holding.address, RECENT)?);
     }
     let covered = histories.values().any(|account| {
         account
@@ -187,7 +179,7 @@ fn write_full_status<W: Write>(
     output: &mut W,
     running: Option<&Holder>,
     snapshot: Option<&Snapshot>,
-    histories: &BTreeMap<Address, AccountHistory>,
+    histories: &BTreeMap<Address, View>,
     network: Network,
 ) -> io::Result<()> {
     write_running(output, running)?;
@@ -226,7 +218,7 @@ fn write_running<W: Write>(output: &mut W, running: Option<&Holder>) -> io::Resu
 fn write_status<W: Write>(
     output: &mut W,
     snapshot: &Snapshot,
-    histories: &BTreeMap<Address, AccountHistory>,
+    histories: &BTreeMap<Address, View>,
     registry: &[Token],
     now: u64,
 ) -> io::Result<()> {
@@ -263,7 +255,7 @@ fn write_status<W: Write>(
         if let Some(history) = histories.get(&holding.address) {
             let check = send_check(&history.coverage);
             writeln!(output, "  {}", coverage_line(&history.coverage, &check))?;
-            for activity in &history.recent {
+            for activity in &history.activities {
                 writeln!(
                     output,
                     "  {}",
