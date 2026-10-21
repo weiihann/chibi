@@ -10,8 +10,8 @@ use chibi_node::{Explorer, Network, Startup, Token};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::activity::format_units;
 use crate::config::{AddressError, parse_address};
-use crate::format_units;
 use crate::tui::cat::Pose;
 use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
 use crate::tui::wallet::{self, SECRET_BYTES, Secret};

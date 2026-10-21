@@ -526,3 +526,13 @@ impl Peers for FixturePeers {
         }
     }
 }
+
+/// Writes forward history into `disk` the way the follower does, for tests outside this crate
+/// that read history back through the CLI.
+pub fn record_history(
+    disk: &crate::disk::Disk,
+    parent: alloy_eips::BlockNumHash,
+    blocks: &[chibi_core::history::ScannedBlock],
+) -> Result<(), crate::node::NodeError> {
+    disk.record_head(parent, blocks)
+}

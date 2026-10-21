@@ -62,7 +62,7 @@ impl Asset {
     /// Decimal places of one whole unit.
     pub const fn decimals(self) -> u8 {
         match self {
-            Self::Eth => crate::ETH_DECIMALS,
+            Self::Eth => crate::activity::ETH_DECIMALS,
             Self::Token(token) => token.decimals,
         }
     }

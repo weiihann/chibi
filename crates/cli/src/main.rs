@@ -6,6 +6,7 @@
     reason = "the CLI's user-facing output belongs on the terminal"
 )]
 
+mod activity;
 mod config;
 mod init;
 mod names;
@@ -13,25 +14,29 @@ mod rpc;
 mod run;
 mod tui;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::U256;
+use alloy_primitives::Address;
+use chibi_core::history::{Activity, Coverage, decode, send_check};
 use chibi_node::disk::Holder;
-use chibi_node::{Disk, Network, Snapshot, Token, read_snapshot};
+use chibi_node::{Disk, History, Network, NodeError, Snapshot, Token, read_snapshot};
 use clap::{Parser, Subcommand};
 use eyre::WrapErr;
 
+use crate::activity::{ETH_DECIMALS, activity_line, coverage_line, format_units};
 use crate::config::{absolute_path, default_config_path, process_env};
 use crate::init::InitArgs;
 use crate::names::printable;
 use crate::run::{NodeArgs, WalletArgs};
 
-/// Decimal places of one ether.
-const ETH_DECIMALS: u8 = 18;
+/// Activities `chibi status` shows per account.
+const RECENT: usize = 5;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -128,10 +133,15 @@ fn status(target: &Target, path: &Path, named: bool) -> eyre::Result<()> {
     let (network, data_dir) = target_dir(target, path, named)?;
     let running = Disk::running(&data_dir)?;
     let snapshot = read_snapshot(&data_dir)?;
+    let histories = match &snapshot {
+        Some(snapshot) => read_histories(&data_dir, snapshot)?,
+        None => BTreeMap::new(),
+    };
     let written = write_full_status(
         &mut io::stdout().lock(),
         running.as_ref(),
         snapshot.as_ref(),
+        &histories,
         network,
     );
     match written {
@@ -140,15 +150,74 @@ fn status(target: &Target, path: &Path, named: bool) -> eyre::Result<()> {
     }
 }
 
+/// What history holds for one watched account: its coverage and its newest activities.
+struct AccountHistory {
+    coverage: Coverage,
+    recent: Vec<Activity>,
+}
+
+/// The history of each account in `snapshot`, read beside any running node. Empty when the
+/// data directory has no history or no account has coverage yet, so status reads as it did
+/// before history.
+fn read_histories(
+    data_dir: &Path,
+    snapshot: &Snapshot,
+) -> Result<BTreeMap<Address, AccountHistory>, NodeError> {
+    let Some(history) = History::open(data_dir)? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut histories = BTreeMap::new();
+    for holding in &snapshot.holdings {
+        let coverage = history.coverage(holding.address)?;
+        let recent = recent(&history, holding.address)?;
+        histories.insert(holding.address, AccountHistory { coverage, recent });
+    }
+    let covered = histories.values().any(|account| {
+        account
+            .coverage
+            .ranges
+            .iter()
+            .any(|(_, ranges)| ranges.first().is_some())
+    });
+    if !covered {
+        histories.clear();
+    }
+    Ok(histories)
+}
+
+/// The account's newest [`RECENT`] activities, newest first.
+fn recent(history: &History, account: Address) -> Result<Vec<Activity>, NodeError> {
+    let rows = NonZeroUsize::MIN.saturating_add(RECENT - 1);
+    let mut found = Vec::with_capacity(RECENT);
+    let mut before = None;
+    while found.len() < RECENT {
+        let page = history.page(account, before, rows)?;
+        found.extend(decode(&page));
+        match page.next {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+    found.truncate(RECENT);
+    Ok(found)
+}
+
 fn write_full_status<W: Write>(
     output: &mut W,
     running: Option<&Holder>,
     snapshot: Option<&Snapshot>,
+    histories: &BTreeMap<Address, AccountHistory>,
     network: Network,
 ) -> io::Result<()> {
     write_running(output, running)?;
     match snapshot {
-        Some(snapshot) => write_status(output, snapshot, network.spec().tokens, unix_now()),
+        Some(snapshot) => write_status(
+            output,
+            snapshot,
+            histories,
+            network.spec().tokens,
+            unix_now(),
+        ),
         None => writeln!(
             output,
             "no snapshot for {network} yet; it is saved once `chibi node` or `chibi wallet` verifies its first head"
@@ -182,6 +251,7 @@ fn write_running<W: Write>(output: &mut W, running: Option<&Holder>) -> io::Resu
 fn write_status<W: Write>(
     output: &mut W,
     snapshot: &Snapshot,
+    histories: &BTreeMap<Address, AccountHistory>,
     registry: &[Token],
     now: u64,
 ) -> io::Result<()> {
@@ -215,6 +285,17 @@ fn write_status<W: Write>(
             }
         }
         writeln!(output)?;
+        if let Some(history) = histories.get(&holding.address) {
+            let check = send_check(&history.coverage);
+            writeln!(output, "  {}", coverage_line(&history.coverage, &check))?;
+            for activity in &history.recent {
+                writeln!(
+                    output,
+                    "  {}",
+                    activity_line(activity, holding.address, registry, now)
+                )?;
+            }
+        }
     }
     if !snapshot.contracts.is_empty() {
         writeln!(output, "contracts")?;
@@ -229,23 +310,6 @@ fn write_status<W: Write>(
         }
     }
     Ok(())
-}
-
-/// `value` base units as a decimal with `decimals` places, trailing zeros trimmed to two.
-fn format_units(value: U256, decimals: u8) -> String {
-    let digits = value.to_string();
-    let decimals = usize::from(decimals);
-    if decimals == 0 {
-        return digits;
-    }
-    let padded = if digits.len() <= decimals {
-        format!("{}{digits}", "0".repeat(decimals + 1 - digits.len()))
-    } else {
-        digits
-    };
-    let (whole, fraction) = padded.split_at(padded.len() - decimals);
-    let keep = fraction.trim_end_matches('0').len().max(decimals.min(2));
-    format!("{whole}.{}", &fraction[..keep])
 }
 
 /// A duration in seconds, shown in its largest whole unit.
@@ -266,7 +330,10 @@ impl fmt::Display for Age {
 #[cfg(test)]
 mod tests {
     use alloy_eips::BlockNumHash;
-    use alloy_primitives::{Address, B256, address};
+    use alloy_primitives::{B256, Bytes, Log, U256, address, b256};
+    use chibi_core::history::{
+        At, BlockFacts, BlockRow, Capability, LogRow, ScannedBlock, Touch, TxRow, WithdrawalRow,
+    };
     use chibi_node::{ContractSnapshot, Holding};
 
     use crate::config::Config;
@@ -300,14 +367,161 @@ mod tests {
         assert_eq!(line(None), "not running\n");
     }
 
+    fn hash(number: u64) -> B256 {
+        B256::left_padding_from(&number.to_be_bytes())
+    }
+
+    /// Block `number` scanned forward for alice: a withdrawal to her, or with `eth_from` an
+    /// incoming ETH transfer from that sender.
+    fn scanned(number: u64, eth_from: Option<Address>) -> ScannedBlock {
+        let block = BlockRow {
+            number,
+            hash: hash(number),
+            timestamp: number * 12,
+            beneficiary: Address::repeat_byte(0xfe),
+            base_fee: Some(7),
+            excess_blob_gas: None,
+            tx_count: u32::from(eth_from.is_some()),
+        };
+        let balance = Some(U256::from(number));
+        let facts = match eth_from {
+            Some(from) => BlockFacts {
+                block,
+                txs: vec![TxRow {
+                    index: 0,
+                    hash: B256::repeat_byte(0xee),
+                    sender: from,
+                    raw: None,
+                    success: true,
+                    cumulative_gas: 21_000,
+                    gas_used: 21_000,
+                    first_log_index: 0,
+                    log_count: 1,
+                }],
+                logs: vec![LogRow {
+                    index: 0,
+                    log: Log::new_unchecked(
+                        address!("0xfffffffffffffffffffffffffffffffffffffffe"),
+                        vec![
+                            b256!(
+                                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                            ),
+                            from.into_word(),
+                            ALICE.into_word(),
+                        ],
+                        Bytes::from(U256::from(1_000_000_000_000_000u64).to_be_bytes_vec()),
+                    ),
+                }],
+                touches: vec![Touch {
+                    account: ALICE,
+                    at: At::Tx(0),
+                    balance,
+                    nonce: None,
+                    code: None,
+                }],
+                slots: Vec::new(),
+                withdrawals: Vec::new(),
+            },
+            None => BlockFacts {
+                block,
+                txs: Vec::new(),
+                logs: Vec::new(),
+                touches: vec![Touch {
+                    account: ALICE,
+                    at: At::Post,
+                    balance,
+                    nonce: None,
+                    code: None,
+                }],
+                slots: Vec::new(),
+                withdrawals: vec![WithdrawalRow {
+                    index: number,
+                    validator: number,
+                    address: ALICE,
+                    amount_gwei: 500_000_000,
+                }],
+            },
+        };
+        ScannedBlock {
+            number,
+            hash: hash(number),
+            parent_hash: hash(number - 1),
+            accounts: vec![ALICE],
+            capabilities: vec![Capability::Bal, Capability::Logs],
+            facts: Some(facts),
+        }
+    }
+
+    fn watching_alice_and_bob() -> Snapshot {
+        Snapshot {
+            network: Network::Sepolia,
+            block: BlockNumHash::new(107, hash(107)),
+            saved_at: 10_000,
+            holdings: vec![
+                Holding {
+                    address: ALICE,
+                    name: None,
+                    balance: Some(U256::from(1_000_000_000_000_000_000u128)),
+                    nonce: Some(0),
+                    tokens: Vec::new(),
+                },
+                Holding {
+                    address: BOB,
+                    name: None,
+                    balance: None,
+                    nonce: None,
+                    tokens: Vec::new(),
+                },
+            ],
+            contracts: Vec::new(),
+        }
+    }
+
+    fn status_of(dir: &Path, snapshot: &Snapshot) -> String {
+        let histories = read_histories(dir, snapshot).unwrap();
+        let mut output = Vec::new();
+        write_status(&mut output, snapshot, &histories, &[], 10_008).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
     #[test]
-    fn units_keep_full_precision() {
-        let eth = |wei: u128| format_units(U256::from(wei), ETH_DECIMALS);
-        assert_eq!(eth(1_203_400_000_000_000_000), "1.2034");
-        assert_eq!(eth(1), "0.000000000000000001");
-        assert_eq!(eth(0), "0.00");
-        assert_eq!(format_units(U256::from(250_000_000u64), 6), "250.00");
-        assert_eq!(format_units(U256::from(12u64), 0), "12");
+    fn status_shows_coverage_and_the_newest_activities_under_each_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Disk::open(dir.path()).unwrap();
+        let mut blocks: Vec<ScannedBlock> = (101..=106).map(|n| scanned(n, None)).collect();
+        blocks.push(scanned(107, Some(BOB)));
+        chibi_node::fixture::record_history(&disk, BlockNumHash::new(100, hash(100)), &blocks)
+            .unwrap();
+        let snapshot = watching_alice_and_bob();
+        assert_eq!(
+            status_of(dir.path(), &snapshot),
+            format!(
+                "sepolia head 107 (saved 8s ago, not re-verified)\n\
+                 {ALICE}   1.00 ETH\n\
+                 \x20 history since block 101 · gaps: none · no sends found\n\
+                 \x20 107  2 h ago  +0.001 ETH from 0x0000…00B0\n\
+                 \x20 106  2 h ago  +0.50 ETH withdrawal (validator 106)\n\
+                 \x20 105  2 h ago  +0.50 ETH withdrawal (validator 105)\n\
+                 \x20 104  2 h ago  +0.50 ETH withdrawal (validator 104)\n\
+                 \x20 103  2 h ago  +0.50 ETH withdrawal (validator 103)\n\
+                 {BOB}   ? ETH\n\
+                 \x20 no history yet\n"
+            )
+        );
+    }
+
+    #[test]
+    fn status_without_history_prints_only_the_snapshot() {
+        let before = format!(
+            "sepolia head 107 (saved 8s ago, not re-verified)\n\
+             {ALICE}   1.00 ETH\n\
+             {BOB}   ? ETH\n"
+        );
+        let snapshot = watching_alice_and_bob();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(status_of(dir.path(), &snapshot), before);
+        drop(Disk::open(dir.path()).unwrap());
+        assert_eq!(status_of(dir.path(), &snapshot), before);
     }
 
     #[test]
@@ -341,6 +555,7 @@ mod tests {
         write_status(
             &mut output,
             &snapshot,
+            &BTreeMap::new(),
             Network::Sepolia.spec().tokens,
             1_008,
         )
@@ -372,7 +587,7 @@ mod tests {
                 contracts: Vec::new(),
             };
             let mut output = Vec::new();
-            write_status(&mut output, &snapshot, &[], 1_000).unwrap();
+            write_status(&mut output, &snapshot, &BTreeMap::new(), &[], 1_000).unwrap();
             let output = String::from_utf8(output).unwrap();
             output.lines().nth(1).unwrap().to_owned()
         };
@@ -426,6 +641,7 @@ mod tests {
         write_status(
             &mut output,
             &snapshot,
+            &BTreeMap::new(),
             Network::Mainnet.spec().tokens,
             1_000,
         )
@@ -461,7 +677,7 @@ mod tests {
             ],
         };
         let mut output = Vec::new();
-        write_status(&mut output, &snapshot, &[], 1_000).unwrap();
+        write_status(&mut output, &snapshot, &BTreeMap::new(), &[], 1_000).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             format!(

@@ -53,7 +53,7 @@ From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs
 | `chibi init` | Choose the network, the addresses to watch, and the RPC host and port (optional) |
 | `chibi node` | Sync and serve JSON-RPC; `-b` runs it in the background |
 | `chibi wallet` | The same node under a terminal wallet |
-| `chibi status` | Whether chibi runs, and the last proven balances |
+| `chibi status` | Whether chibi runs, the last proven balances, and recent account history when recorded |
 | `chibi stop` | Stop a background chibi |
 
 `chibi <command> --help` lists every option. The config lives in `~/.config/chibi/`, the data in `~/.local/share/chibi/<network>/`.

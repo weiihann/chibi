@@ -17,7 +17,7 @@ use super::app::{
 };
 use super::cat::{self, Pose};
 use super::transfer::{Asset, Fee};
-use crate::format_units;
+use crate::activity::format_units;
 
 /// Log lines the log pane shows at most.
 pub const LOG_PANE_LINES: u16 = 10;
