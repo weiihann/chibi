@@ -6,6 +6,7 @@
 //! and [`tx`] tracks submitted transactions, their receipts, and fee data.
 
 pub mod exec;
+pub mod history;
 pub mod state;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testing;
