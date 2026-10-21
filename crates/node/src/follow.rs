@@ -302,8 +302,8 @@ impl Recorder {
 
 impl Backfill {
     /// Scans settled blocks below the anchor, newest first, within one step's budget, and
-    /// writes what completed in one write. Blocks above the settled mark are left to forward
-    /// recording, so nothing is walked before history settles.
+    /// writes what completed in one write. Covered blocks above the settled mark are left to
+    /// forward recording; the walk waits at an uncovered one until history settles there.
     async fn step<P: Peers>(&mut self, shared: &Arc<Shared<P>>) {
         let watched = &shared.watch.addresses;
         if watched.is_empty() || self.done && self.retry.is_empty() {
@@ -375,7 +375,11 @@ impl Backfill {
                 break;
             }
             let number = header.number();
-            if number <= settled && !covered.iter().all(|ranges| ranges.contains(number)) {
+            if !covered.iter().all(|ranges| ranges.contains(number)) {
+                if number > settled {
+                    self.ahead.push_front(header);
+                    break;
+                }
                 match history::scan_backward(watched, &header) {
                     Scan::Done(block) => ready.push(block),
                     Scan::NeedsContents(_) if contents_left == 0 => {

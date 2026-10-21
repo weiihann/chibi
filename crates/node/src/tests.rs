@@ -2492,3 +2492,35 @@ async fn a_walk_longer_than_one_steps_budget_spans_steps_while_forward_recording
         logs_only(&[(settled, second)], &[(genesis, second)])
     );
 }
+
+#[tokio::test]
+async fn blocks_missed_while_down_are_walked_back_once_finality_passes_them() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let genesis = genesis_number(&fixture);
+    let dir = tempfile::tempdir().unwrap();
+    let first = {
+        let (_node, _follower, settled) = settle_after_start(&fixture, dir.path()).await;
+        settled
+    };
+    fixture.mine(BlockWrites::default());
+    let paid = number(&fixture, fixture.mine(payment(0, eth(3))));
+    fixture.mine(BlockWrites::default());
+
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    let head = fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+
+    fixture.finalize(head);
+    let head = number(&fixture, head);
+    for _ in 0..3 {
+        follower.step().await.unwrap();
+    }
+
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid]);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        logs_only(&[(first, first), (head, head)], &[(genesis, head)])
+    );
+}
