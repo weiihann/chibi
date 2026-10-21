@@ -1,23 +1,25 @@
 #!/bin/sh
 # Builds chibi, starts one isolated instance, and waits until its JSON-RPC answers.
-# Usage: launch.sh [--network sepolia|mainnet] [--port N] [--timeout SECONDS] ADDRESS...
+# Usage: launch.sh [--network sepolia|mainnet] [--port N] [--timeout SECONDS] [--history] ADDRESS...
 # Prints the run directory on the last line of stdout. Every other helper takes it.
 set -eu
 
 network=sepolia
 port=8645
 timeout=900
+history=""
 while [ $# -gt 0 ]; do
     case $1 in
         --network) network=$2; shift 2 ;;
         --port) port=$2; shift 2 ;;
         --timeout) timeout=$2; shift 2 ;;
+        --history) history=--history; shift ;;
         --) shift; break ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) break ;;
     esac
 done
-[ $# -ge 1 ] || { echo "usage: $0 [--network N] [--port N] [--timeout S] ADDRESS..." >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: $0 [--network N] [--port N] [--timeout S] [--history] ADDRESS..." >&2; exit 2; }
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 if lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
@@ -53,11 +55,13 @@ for address in "$@"; do
     addresses="$addresses --address $address"
 done
 # shellcheck disable=SC2086
-"$run_dir/bin/chibi" init --network "$network" $addresses \
+"$run_dir/bin/chibi" init --network "$network" $addresses $history \
     --rpc-host 127.0.0.1 --rpc-port "$port" </dev/null >"$run_dir/evidence/init.txt"
 
+log_filter=${CHIBI_VERIFY_LOG:-info,chibi::devp2p=debug}
+[ -z "$history" ] || log_filter="$log_filter,chibi::history=debug"
 # env and nohup exec in place, so $! is chibi's own pid.
-env RUST_LOG="${CHIBI_VERIFY_LOG:-info,chibi::devp2p=debug}" \
+env RUST_LOG="$log_filter" \
     nohup "$run_dir/bin/chibi" node --rpc-host 127.0.0.1 --rpc-port "$port" >"$run_dir/chibi.log" 2>&1 &
 echo $! >"$run_dir/chibi.pid"
 

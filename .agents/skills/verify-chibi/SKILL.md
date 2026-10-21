@@ -63,10 +63,11 @@ Sends SIGINT to the pid this run started (never by process name), waits, then sa
 
 | Script | Use |
 |---|---|
-| `scripts/launch.sh [--network N] [--port N] [--timeout S] ADDRESS...` | build, isolate, start, wait; last stdout line is `RUN_DIR` |
+| `scripts/launch.sh [--network N] [--port N] [--timeout S] [--history] ADDRESS...` | build, isolate, start, wait; `--history` keeps account history; last stdout line is `RUN_DIR` |
 | `scripts/doctor.sh RUN_DIR` | read-only health check, exit 0 when healthy |
 | `scripts/rpc.sh RUN_DIR METHOD [PARAMS_JSON]` | one JSON-RPC call, logged to evidence |
 | `scripts/log.sh RUN_DIR` | the node log without colour codes, live or after cleanup |
 | `scripts/cleanup.sh RUN_DIR` | stop what this run started, keep evidence |
 | `scripts/wallet-check.sh RUN_DIR ADDRESS NAME [OPTIONS]` | MetaMask's network client and balance code against the run; exit 0 when the balance loads with no failed read |
+| `scripts/history-check.py RUN_DIR ADDRESS [ORACLE]` | recorded history vs the oracle's logs over every covered range; exit 0 when they match |
 | `scripts/oracle-check.sh ADDRESS...` (repo root) | chibi vs public RPC at chibi's head; set `CHIBI` to the run's URL |
