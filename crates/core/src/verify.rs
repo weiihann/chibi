@@ -12,7 +12,7 @@ use alloy_consensus::{
     proofs::{calculate_ommers_root, calculate_transaction_root, calculate_withdrawals_root},
 };
 use alloy_eip7928::{AccountChanges, compute_block_access_list_hash};
-use alloy_eips::BlockNumHash;
+use alloy_eips::{BlockNumHash, eip4895::Withdrawal};
 use alloy_primitives::{Address, B256, BlockNumber, Bloom, Bytes, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable};
 use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount};
@@ -467,6 +467,12 @@ impl VerifiedBody {
     /// The block's transactions in order.
     pub fn transactions(&self) -> &[wire::Transaction] {
         &self.body.transactions
+    }
+
+    /// The block's withdrawals in order, empty when the body has none. [`body`] checked them
+    /// against the header's withdrawals root.
+    pub fn withdrawals(&self) -> &[Withdrawal] {
+        self.body.withdrawals.as_ref().map_or(&[], |w| w.as_slice())
     }
 }
 

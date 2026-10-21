@@ -1855,6 +1855,8 @@ dependencies = [
  "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-signer",
+ "alloy-signer-local",
  "alloy-trie",
  "proptest",
  "reth-chainspec",

@@ -3,13 +3,13 @@
 //! [`World`] holds full state, computes real state and storage roots, serves single-key snap
 //! replies with real range proofs at any root it has produced, and mines child blocks from
 //! explicit [`BlockWrites`], producing headers whose BAL hash, transaction root, receipts root,
-//! and logs bloom all match what it serves.
+//! logs bloom, and withdrawals root all match what it serves.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use alloy_consensus::{
-    Header, Signed, Transaction as _, TxLegacy, TxReceipt, TxType,
+    Header, SignableTransaction as _, Signed, Transaction as _, TxLegacy, TxReceipt,
     constants::EMPTY_OMMER_ROOT_HASH,
     proofs::{calculate_transaction_root, calculate_withdrawals_root},
 };
@@ -17,10 +17,13 @@ use alloy_eip7928::{
     AccountChanges, BalanceChange, BlockAccessIndex, CodeChange, NonceChange, SlotChanges,
     StorageChange, compute_block_access_list_hash,
 };
+use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{
     Address, B256, Bloom, Bytes, KECCAK256_EMPTY, Log, Signature, TxKind, U256, keccak256,
 };
+use alloy_signer::SignerSync as _;
+use alloy_signer_local::PrivateKeySigner;
 use alloy_trie::{EMPTY_ROOT_HASH, HashBuilder, Nibbles, TrieAccount, proof::ProofRetainer};
 use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks, MAINNET, SEPOLIA};
 
@@ -67,6 +70,42 @@ pub fn legacy_transfer(nonce: u64, to: Address, value: U256) -> wire::Transactio
     };
     let signature = Signature::new(U256::from(1u64), U256::from(1u64), false);
     wire::Transaction::Legacy(Signed::new_unhashed(tx, signature))
+}
+
+/// A legacy value transfer from the account of secret `key`, signed for `chain_id`, so sender
+/// recovery yields [`key_address`] of `key`.
+pub fn signed_transfer(
+    key: B256,
+    chain_id: u64,
+    nonce: u64,
+    to: Address,
+    value: U256,
+) -> wire::Transaction {
+    let tx = TxLegacy {
+        chain_id: Some(chain_id),
+        nonce,
+        gas_price: u128::from(GAS_PRICE),
+        gas_limit: 21_000,
+        to: TxKind::Call(to),
+        value,
+        input: Bytes::new(),
+    };
+    match signer(key).sign_hash_sync(&tx.signature_hash()) {
+        Ok(signature) => wire::Transaction::Legacy(tx.into_signed(signature)),
+        Err(error) => panic!("cannot sign with test key {key}: {error}"),
+    }
+}
+
+/// The address of the account whose secret is `key`.
+pub fn key_address(key: B256) -> Address {
+    signer(key).address()
+}
+
+fn signer(key: B256) -> PrivateKeySigner {
+    match PrivateKeySigner::from_bytes(&key) {
+        Ok(signer) => signer,
+        Err(error) => panic!("{key} is not a secp256k1 secret key: {error}"),
+    }
 }
 
 /// One account of the world.
@@ -155,52 +194,105 @@ enum Write {
     Read(Address, U256),
 }
 
-/// The state writes and transactions of one mined block.
+/// How an included transaction ended, as its receipt records it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// Whether the transaction succeeded.
+    pub success: bool,
+    /// Gas the transaction used.
+    pub gas_used: u64,
+    /// The logs it emitted, in order.
+    pub logs: Vec<Log>,
+}
+
+/// The state writes, transactions, and withdrawals of one mined block.
 ///
-/// Writes apply in order, and each gets its own block access index, so writing a field twice
-/// records two changes and the later one wins.
+/// Writes apply in order. Each gets block access index position + 1 unless placed with
+/// [`BlockWrites::at`], so writing a field twice records two changes and the later one wins.
+/// Placed writes of one field must come in ascending index order for the BAL to be canonical.
 #[derive(Clone, Debug, Default)]
 pub struct BlockWrites {
-    writes: Vec<Write>,
-    codes: Vec<(usize, Address, Bytes)>,
-    txs: Vec<(wire::Transaction, u64, usize)>,
+    writes: Vec<(Option<u64>, Write)>,
+    codes: Vec<(usize, Option<u64>, Address, Bytes)>,
+    at: Option<u64>,
+    txs: Vec<(wire::Transaction, Outcome)>,
+    withdrawals: Vec<Withdrawal>,
 }
 
 impl BlockWrites {
+    /// Places the writes after this call at block access index `index` until the next call:
+    /// 0 before the first transaction, n + 1 for transaction n, and the transaction count + 1
+    /// after the last one.
+    pub const fn at(mut self, index: u64) -> Self {
+        self.at = Some(index);
+        self
+    }
+
     /// Sets a balance.
     pub fn balance(mut self, address: Address, balance: U256) -> Self {
-        self.writes.push(Write::Balance(address, balance));
+        self.writes
+            .push((self.at, Write::Balance(address, balance)));
         self
     }
 
     /// Sets a nonce.
     pub fn nonce(mut self, address: Address, nonce: u64) -> Self {
-        self.writes.push(Write::Nonce(address, nonce));
+        self.writes.push((self.at, Write::Nonce(address, nonce)));
         self
     }
 
     /// Sets a slot; zero clears it.
     pub fn slot(mut self, address: Address, slot: U256, value: U256) -> Self {
-        self.writes.push(Write::Slot(address, slot, value));
+        self.writes
+            .push((self.at, Write::Slot(address, slot, value)));
         self
     }
 
     /// Sets the code.
     pub fn code(mut self, address: Address, code: impl Into<Bytes>) -> Self {
-        self.codes.push((self.writes.len(), address, code.into()));
+        self.codes
+            .push((self.writes.len(), self.at, address, code.into()));
         self
     }
 
     /// Records a read-only slot access, which changes nothing.
     pub fn read(mut self, address: Address, slot: U256) -> Self {
-        self.writes.push(Write::Read(address, slot));
+        self.writes.push((self.at, Write::Read(address, slot)));
         self
     }
 
-    /// Includes `tx` with a receipt using `gas_used` and emitting `logs` logs. Transactions do
-    /// not execute; state changes come from the explicit writes.
-    pub fn tx(mut self, tx: wire::Transaction, gas_used: u64, logs: usize) -> Self {
-        self.txs.push((tx, gas_used, logs));
+    /// Includes `tx` with a successful receipt using `gas_used` and emitting `logs` logs from
+    /// its recipient, each with one made-up topic. Transactions do not execute; state changes
+    /// come from the explicit writes.
+    pub fn tx(self, tx: wire::Transaction, gas_used: u64, logs: usize) -> Self {
+        let emitter = match tx.kind() {
+            TxKind::Call(to) => to,
+            TxKind::Create => Address::ZERO,
+        };
+        let logs = (0..logs)
+            .map(|i| Log::new_unchecked(emitter, vec![B256::with_last_byte(i as u8)], Bytes::new()))
+            .collect();
+        self.tx_with(
+            tx,
+            Outcome {
+                success: true,
+                gas_used,
+                logs,
+            },
+        )
+    }
+
+    /// Includes `tx` with a receipt recording `outcome` exactly. Transactions do not execute;
+    /// state changes come from the explicit writes.
+    pub fn tx_with(mut self, tx: wire::Transaction, outcome: Outcome) -> Self {
+        self.txs.push((tx, outcome));
+        self
+    }
+
+    /// Includes `withdrawal` in the body. It credits nothing: write the balance explicitly,
+    /// normally at the post index.
+    pub fn withdrawal(mut self, withdrawal: Withdrawal) -> Self {
+        self.withdrawals.push(withdrawal);
         self
     }
 }
@@ -260,7 +352,7 @@ impl World {
             blocks: HashMap::new(),
             head: B256::ZERO,
         };
-        world.head = world.seal(None, Vec::new(), Some(&[]));
+        world.head = world.seal(None, BlockWrites::default(), Some(&[]));
         world
     }
 
@@ -322,7 +414,7 @@ impl World {
     /// Applies `writes` and mines a child of the head with a BAL. Returns its hash.
     pub fn mine(&mut self, writes: BlockWrites) -> B256 {
         let bal = self.apply(&writes);
-        self.head = self.seal(Some(self.head), writes.txs, Some(&bal));
+        self.head = self.seal(Some(self.head), writes, Some(&bal));
         self.head
     }
 
@@ -330,7 +422,7 @@ impl World {
     /// Glamsterdam.
     pub fn mine_without_bal(&mut self, writes: BlockWrites) -> B256 {
         self.apply(&writes);
-        self.head = self.seal(Some(self.head), writes.txs, None);
+        self.head = self.seal(Some(self.head), writes, None);
         self.head
     }
 
@@ -339,7 +431,7 @@ impl World {
     pub fn fork_head(&mut self, writes: BlockWrites) -> B256 {
         let parent = self.block(self.head).header.parent_hash;
         let bal = self.apply(&writes);
-        self.head = self.seal(Some(parent), writes.txs, Some(&bal));
+        self.head = self.seal(Some(parent), writes, Some(&bal));
         self.head
     }
 
@@ -441,11 +533,16 @@ impl World {
     fn apply(&mut self, writes: &BlockWrites) -> Vec<AccountChanges> {
         let mut changes: BTreeMap<Address, AccountChanges> = BTreeMap::new();
         let mut codes = writes.codes.iter().peekable();
-        for (position, write) in writes.writes.iter().enumerate() {
-            while let Some((_, address, code)) = codes.next_if(|(at, ..)| *at == position) {
-                self.set_code(&mut changes, position, *address, code);
+        for (position, (at, write)) in writes.writes.iter().enumerate() {
+            while let Some((_, at, address, code)) = codes.next_if(|(p, ..)| *p == position) {
+                self.set_code(
+                    &mut changes,
+                    at.unwrap_or(position as u64 + 1),
+                    *address,
+                    code,
+                );
             }
-            let index = BlockAccessIndex(position as u64 + 1);
+            let index = BlockAccessIndex(at.unwrap_or(position as u64 + 1));
             match *write {
                 Write::Balance(address, balance) => {
                     self.accounts.entry(address).or_default().balance = balance;
@@ -484,8 +581,13 @@ impl World {
                 }
             }
         }
-        for (position, address, code) in codes {
-            self.set_code(&mut changes, *position, *address, code);
+        for (position, at, address, code) in codes {
+            self.set_code(
+                &mut changes,
+                at.unwrap_or(*position as u64 + 1),
+                *address,
+                code,
+            );
         }
         self.accounts.retain(|_, account| !account.is_empty());
         changes
@@ -502,12 +604,12 @@ impl World {
     fn set_code(
         &mut self,
         changes: &mut BTreeMap<Address, AccountChanges>,
-        position: usize,
+        index: u64,
         address: Address,
         code: &Bytes,
     ) {
         self.accounts.entry(address).or_default().code = code.clone();
-        let index = BlockAccessIndex(position as u64 + 1);
+        let index = BlockAccessIndex(index);
         entry(changes, address)
             .code_changes
             .push(CodeChange::new(index, code.clone()));
@@ -516,7 +618,7 @@ impl World {
     fn seal(
         &mut self,
         parent: Option<B256>,
-        txs: Vec<(wire::Transaction, u64, usize)>,
+        writes: BlockWrites,
         bal: Option<&[AccountChanges]>,
     ) -> B256 {
         for account in self
@@ -530,24 +632,15 @@ impl World {
         self.states.insert(state_root, self.accounts.clone());
 
         let mut cumulative = 0;
-        let mut transactions = Vec::with_capacity(txs.len());
-        let mut receipts = Vec::with_capacity(txs.len());
-        for (tx, gas_used, logs) in txs {
-            cumulative += gas_used;
-            let emitter = match tx.kind() {
-                TxKind::Call(to) => to,
-                TxKind::Create => Address::ZERO,
-            };
-            let logs = (0..logs)
-                .map(|i| {
-                    Log::new_unchecked(emitter, vec![B256::with_last_byte(i as u8)], Bytes::new())
-                })
-                .collect();
+        let mut transactions = Vec::with_capacity(writes.txs.len());
+        let mut receipts = Vec::with_capacity(writes.txs.len());
+        for (tx, outcome) in writes.txs {
+            cumulative += outcome.gas_used;
             receipts.push(wire::Receipt {
-                tx_type: TxType::Legacy,
-                success: true,
+                tx_type: tx.tx_type(),
+                success: outcome.success,
                 cumulative_gas_used: cumulative,
-                logs,
+                logs: outcome.logs,
             });
             transactions.push(tx);
         }
@@ -555,10 +648,11 @@ impl World {
             acc.accrue_bloom(&receipt.bloom());
             acc
         });
+        let withdrawals_root = calculate_withdrawals_root(&writes.withdrawals);
         let body = wire::Body {
             transactions,
             ommers: Vec::new(),
-            withdrawals: Some(Default::default()),
+            withdrawals: Some(Withdrawals::new(writes.withdrawals)),
         };
 
         let (parent_hash, number) = match parent {
@@ -588,7 +682,7 @@ impl World {
             gas_used: cumulative,
             timestamp,
             base_fee_per_gas: Some(BASE_FEE),
-            withdrawals_root: Some(calculate_withdrawals_root(&[])),
+            withdrawals_root: Some(withdrawals_root),
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::ZERO),
@@ -778,7 +872,12 @@ pub fn transfer_calldata(to: Address, amount: U256) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_consensus::transaction::SignerRecoverable as _;
+    use alloy_primitives::{BloomInput, address, b256, bytes};
+
+    const ALICE: Address = address!("0x00000000000000000000000000000000000a11ce");
+    const BOB: Address = address!("0x0000000000000000000000000000000000000b0b");
+    const TOKEN: Address = address!("0x00000000000000000000000000000000000070c3");
 
     #[test]
     fn mined_header_commits_to_served_data() {
@@ -800,5 +899,138 @@ mod tests {
                 WorldAccount::eoa(eth(2)).trie_account()
             )])
         );
+    }
+
+    #[test]
+    fn writes_placed_at_a_transaction_or_the_post_index_carry_that_index_in_the_bal() {
+        let mut world = World::genesis([(ALICE, WorldAccount::eoa(eth(3)))]);
+        let hash = world.mine(
+            BlockWrites::default()
+                .tx(legacy_transfer(0, BOB, eth(1)), 21_000, 0)
+                .tx(legacy_transfer(1, BOB, eth(1)), 21_000, 0)
+                .slot(TOKEN, U256::from(7), U256::from(9))
+                .at(1)
+                .nonce(ALICE, 1)
+                .code(TOKEN, mapping_token_code())
+                .at(3)
+                .balance(BOB, eth(2)),
+        );
+        let block = verify::bal(world.verified(hash), world.bal(hash)).unwrap();
+        let changes = |address: Address| {
+            block
+                .bal()
+                .iter()
+                .find(|changes| changes.address == address)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            changes(ALICE).nonce_changes,
+            [NonceChange::new(BlockAccessIndex(1), 1)]
+        );
+        assert_eq!(
+            changes(BOB).balance_changes,
+            [BalanceChange::new(BlockAccessIndex(3), eth(2))]
+        );
+        let token = changes(TOKEN);
+        assert_eq!(
+            token.storage_changes,
+            [SlotChanges::new(
+                U256::from(7),
+                vec![StorageChange::new(BlockAccessIndex(1), U256::from(9))]
+            )]
+        );
+        assert_eq!(
+            token.code_changes,
+            [CodeChange::new(BlockAccessIndex(1), mapping_token_code())]
+        );
+    }
+
+    #[test]
+    fn a_failed_transaction_keeps_its_exact_logs_in_receipts_the_header_commits_to() {
+        let transfer = b256!("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
+        let logs = vec![
+            Log::new_unchecked(
+                TOKEN,
+                vec![
+                    transfer,
+                    B256::left_padding_from(ALICE.as_slice()),
+                    B256::left_padding_from(BOB.as_slice()),
+                ],
+                bytes!("0x00000000000000000000000000000000000000000000000000000000000003e8"),
+            ),
+            Log::new_unchecked(BOB, vec![], Bytes::new()),
+        ];
+        let mut world = World::genesis([(ALICE, WorldAccount::eoa(eth(3)))]);
+        let hash = world.mine(
+            BlockWrites::default()
+                .tx(legacy_transfer(0, BOB, eth(1)), 21_000, 0)
+                .tx_with(
+                    legacy_transfer(1, TOKEN, U256::ZERO),
+                    Outcome {
+                        success: false,
+                        gas_used: 30_000,
+                        logs: logs.clone(),
+                    },
+                ),
+        );
+        let header = world.verified(hash);
+        assert!(verify::body(header.clone(), world.body(hash)).is_ok());
+        let receipts = verify::receipts(header, world.receipts(hash)).unwrap();
+        let failed = &receipts.receipts()[1];
+        assert!(!failed.success);
+        assert_eq!(failed.cumulative_gas_used, 51_000);
+        assert_eq!(failed.logs, logs);
+        let bloom = world.header(hash).logs_bloom;
+        for input in [
+            TOKEN.as_slice(),
+            BOB.as_slice(),
+            transfer.as_slice(),
+            B256::left_padding_from(ALICE.as_slice()).as_slice(),
+            B256::left_padding_from(BOB.as_slice()).as_slice(),
+        ] {
+            assert!(bloom.contains_input(BloomInput::Raw(input)));
+        }
+    }
+
+    #[test]
+    fn a_block_with_withdrawals_serves_them_in_its_verified_body() {
+        let withdrawals = [
+            Withdrawal {
+                index: 7,
+                validator_index: 42,
+                address: ALICE,
+                amount: 32_000_000_000,
+            },
+            Withdrawal {
+                index: 8,
+                validator_index: 43,
+                address: BOB,
+                amount: 5,
+            },
+        ];
+        let mut world = World::genesis([(ALICE, WorldAccount::eoa(eth(3)))]);
+        let genesis = world.head();
+        let hash = world.mine(
+            BlockWrites::default()
+                .withdrawal(withdrawals[0])
+                .withdrawal(withdrawals[1]),
+        );
+        let body = verify::body(world.verified(hash), world.body(hash)).unwrap();
+        assert_eq!(body.withdrawals(), withdrawals);
+        let empty = verify::body(world.verified(genesis), world.body(genesis)).unwrap();
+        assert_eq!(empty.withdrawals(), []);
+    }
+
+    #[test]
+    fn a_signed_transfer_recovers_to_its_signer() {
+        let key = B256::with_last_byte(1);
+        let signer = address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
+        let tx = signed_transfer(key, 11_155_111, 5, BOB, eth(1));
+        assert_eq!(tx.recover_signer().unwrap(), signer);
+        assert_eq!(key_address(key), signer);
+        assert_eq!(tx.chain_id(), Some(11_155_111));
+        assert_eq!(tx.nonce(), 5);
+        assert_eq!(tx.value(), eth(1));
     }
 }

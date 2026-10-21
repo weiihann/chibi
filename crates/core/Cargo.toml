@@ -10,7 +10,7 @@ license.workspace = true
 workspace = true
 
 [features]
-test-utils = []
+test-utils = ["dep:alloy-signer", "dep:alloy-signer-local"]
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -24,6 +24,10 @@ revm = { workspace = true, features = ["optional_block_gas_limit"] }
 reth-chainspec.workspace = true
 reth-trie-common.workspace = true
 thiserror.workspace = true
+alloy-signer = { version = "2.5", optional = true }
+alloy-signer-local = { version = "2.5", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+alloy-signer = "2.5"
+alloy-signer-local = "2.5"
