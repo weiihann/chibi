@@ -3,8 +3,10 @@
 //!
 //! History is display-only. Its rows never answer an RPC request and never enter a `Store`.
 
+mod decode;
 mod scan;
 
+pub use decode::{Activity, Effect, Missing, SendCheck, decode, send_check};
 pub use scan::{Pending, Scan, ScanError, scan_backward, scan_forward};
 
 use alloy_primitives::{Address, B256, Bytes, Log, TxHash, U256};
