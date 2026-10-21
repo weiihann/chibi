@@ -33,8 +33,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_STATE_FILE: &str = "state.json";
 const KEY_FILE: &str = "devp2p.key";
 
-/// The schema version recorded in `PRAGMA user_version`; 0 means no schema yet.
-const SCHEMA_VERSION: i32 = 2;
+/// The schema version recorded in `PRAGMA user_version`; 0 means no schema yet. Versions
+/// 3..=99 only add to earlier ones, so a reader of older tables reads them all.
+const SCHEMA_VERSION: i32 = 3;
+/// The first version a reader cannot read: a breaking change.
+const BREAKING_VERSION: i32 = 100;
 const SCHEMA_V1: &str = "
 CREATE TABLE snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -60,6 +63,70 @@ CREATE TABLE keys (
     slot BLOB
 );
 ";
+/// What version 3 adds: the account history, permanent across resets. Each later version
+/// only adds tables or columns.
+const SCHEMA_V3: &str = "
+CREATE TABLE history_block (
+    number INTEGER PRIMARY KEY, hash BLOB NOT NULL CHECK (length(hash) = 32),
+    timestamp INTEGER NOT NULL, beneficiary BLOB NOT NULL CHECK (length(beneficiary) = 20),
+    base_fee INTEGER, excess_blob_gas INTEGER, tx_count INTEGER NOT NULL) STRICT;
+CREATE TABLE history_tx (
+    number INTEGER NOT NULL, tx_index INTEGER NOT NULL,
+    hash BLOB NOT NULL UNIQUE CHECK (length(hash) = 32),
+    sender BLOB NOT NULL CHECK (length(sender) = 20),
+    raw BLOB,
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    cumulative_gas INTEGER NOT NULL, gas_used INTEGER NOT NULL,
+    first_log_index INTEGER NOT NULL, log_count INTEGER NOT NULL,
+    PRIMARY KEY (number, tx_index)) STRICT, WITHOUT ROWID;
+CREATE INDEX history_tx_sender ON history_tx (sender, number);
+CREATE TABLE history_log (
+    number INTEGER NOT NULL, log_index INTEGER NOT NULL,
+    address BLOB NOT NULL CHECK (length(address) = 20),
+    topic0 BLOB CHECK (length(topic0) = 32), topic1 BLOB CHECK (length(topic1) = 32),
+    topic2 BLOB CHECK (length(topic2) = 32), topic3 BLOB CHECK (length(topic3) = 32),
+    data BLOB NOT NULL, PRIMARY KEY (number, log_index)) STRICT, WITHOUT ROWID;
+CREATE TABLE history_touch (
+    account BLOB NOT NULL CHECK (length(account) = 20),
+    number INTEGER NOT NULL, access_index INTEGER NOT NULL,
+    balance BLOB CHECK (length(balance) = 32), nonce INTEGER, code BLOB,
+    PRIMARY KEY (account, number, access_index)) STRICT, WITHOUT ROWID;
+CREATE INDEX history_touch_number ON history_touch (number);
+CREATE TABLE history_slot (
+    account BLOB NOT NULL CHECK (length(account) = 20),
+    number INTEGER NOT NULL, access_index INTEGER NOT NULL,
+    contract BLOB NOT NULL CHECK (length(contract) = 20),
+    slot BLOB NOT NULL CHECK (length(slot) = 32),
+    value BLOB NOT NULL CHECK (length(value) = 32),
+    PRIMARY KEY (account, number, access_index, contract, slot)) STRICT, WITHOUT ROWID;
+CREATE TABLE history_withdrawal (
+    number INTEGER NOT NULL, withdrawal_index INTEGER NOT NULL,
+    validator INTEGER NOT NULL, address BLOB NOT NULL CHECK (length(address) = 20),
+    amount_gwei INTEGER NOT NULL, PRIMARY KEY (number, withdrawal_index)) STRICT, WITHOUT ROWID;
+CREATE TABLE history_open (
+    account BLOB NOT NULL CHECK (length(account) = 20),
+    number INTEGER NOT NULL, hash BLOB NOT NULL CHECK (length(hash) = 32),
+    balance BLOB NOT NULL CHECK (length(balance) = 32), nonce INTEGER NOT NULL,
+    PRIMARY KEY (account, number)) STRICT, WITHOUT ROWID;
+CREATE TABLE history_open_slot (
+    account BLOB NOT NULL CHECK (length(account) = 20), number INTEGER NOT NULL,
+    contract BLOB NOT NULL CHECK (length(contract) = 20),
+    slot BLOB NOT NULL CHECK (length(slot) = 32), value BLOB NOT NULL CHECK (length(value) = 32),
+    PRIMARY KEY (account, number, contract, slot)) STRICT, WITHOUT ROWID;
+CREATE TABLE history_coverage (
+    account BLOB NOT NULL CHECK (length(account) = 20),
+    capability INTEGER NOT NULL CHECK (capability > 0),
+    first INTEGER NOT NULL, last INTEGER NOT NULL, CHECK (first <= last),
+    PRIMARY KEY (account, capability, first)) STRICT, WITHOUT ROWID;
+CREATE TABLE history_unsettled (number INTEGER PRIMARY KEY,
+    hash BLOB NOT NULL CHECK (length(hash) = 32)) STRICT;
+CREATE TABLE history_settled (id INTEGER PRIMARY KEY CHECK (id = 0), number INTEGER NOT NULL,
+    hash BLOB NOT NULL CHECK (length(hash) = 32)) STRICT;
+CREATE TABLE history_backfill (id INTEGER PRIMARY KEY CHECK (id = 0),
+    number INTEGER NOT NULL, hash BLOB NOT NULL CHECK (length(hash) = 32)) STRICT;
+";
+/// Each version's additions, in order: version `n` is the first `n` of them.
+const SCHEMAS: [&str; SCHEMA_VERSION as usize] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 /// Most state peers remembered across restarts.
 const REMEMBERED_PEERS: usize = 16;
@@ -223,9 +290,9 @@ impl Lock {
     }
 
     /// Deletes the user state saved in the directory's database: the snapshot, the outbox
-    /// and the learned keys, in one transaction. Remembered state peers, the light-client
-    /// checkpoint and the devp2p key stay. `None` when there is no database, which is left
-    /// uncreated.
+    /// and the learned keys, in one transaction. Remembered state peers, the account
+    /// history, the light-client checkpoint and the devp2p key stay. `None` when there is
+    /// no database, which is left uncreated.
     pub fn reset(&self) -> Result<Option<Reset>, NodeError> {
         let path = self.dir.join(DB_FILE);
         if !path.try_exists().map_err(|err| io_error(&path, &err))? {
@@ -421,16 +488,22 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
     let tx = conn.transaction().map_err(fail)?;
     match schema_version(&tx).map_err(fail)? {
         0 => read_legacy(dir),
-        1 | SCHEMA_VERSION => load(&tx).map(Some).map_err(fail),
+        1..BREAKING_VERSION => load(&tx).map(Some).map_err(fail),
         newer => Err(newer_schema(&path, newer)),
     }
 }
 
-/// Opens the writer's connection to `dir`'s database. A new database gets the schema and
-/// the contents of a legacy state file if there is one.
+/// Opens the writer's connection to `dir`'s database. A new database is owner-only and gets
+/// the schema and the contents of a legacy state file if there is one; an older one is
+/// upgraded.
 fn open_db(dir: &Path) -> Result<Db, NodeError> {
     let path = dir.join(DB_FILE);
     let fail = |err| db_error(&path, &err);
+    match private_file(&path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(io_error(&path, &err)),
+    }
     let mut conn = Connection::open(&path).map_err(fail)?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
     // The rollback journal, so readers create no files.
@@ -449,8 +522,8 @@ fn open_db(dir: &Path) -> Result<Db, NodeError> {
         .map_err(fail)?;
     match schema_version(&conn).map_err(fail)? {
         0 => create(&mut conn, dir).map_err(fail)?,
-        1 => upgrade_from_v1(&mut conn).map_err(fail)?,
         SCHEMA_VERSION => {}
+        older @ 1..SCHEMA_VERSION => upgrade(&mut conn, &path, older)?,
         newer => return Err(newer_schema(&path, newer)),
     }
     let saved = load(&conn).map_err(fail)?;
@@ -465,8 +538,9 @@ fn create(conn: &mut Connection, dir: &Path) -> rusqlite::Result<()> {
         None
     });
     let tx = conn.transaction()?;
-    tx.execute_batch(SCHEMA_V1)?;
-    tx.execute_batch(SCHEMA_V2)?;
+    for schema in SCHEMAS {
+        tx.execute_batch(schema)?;
+    }
     if let Some(legacy) = &legacy {
         write_tables(&tx, &Saved::default(), legacy)?;
     }
@@ -481,12 +555,24 @@ fn create(conn: &mut Connection, dir: &Path) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Adds the keys table to a version 1 database in one transaction.
-fn upgrade_from_v1(conn: &mut Connection) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    tx.execute_batch(SCHEMA_V2)?;
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    tx.commit()
+/// Adds every later version's tables to a database at version `from` in one transaction,
+/// making the file owner-only as it reaches version 3: earlier versions created it with the
+/// default mode, and later opens leave whatever mode the user sets.
+fn upgrade(conn: &mut Connection, path: &Path, from: i32) -> Result<(), NodeError> {
+    let fail = |err| db_error(path, &err);
+    let tx = conn.transaction().map_err(fail)?;
+    for schema in &SCHEMAS[from as usize..] {
+        tx.execute_batch(schema).map_err(fail)?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(fail)?;
+    #[cfg(unix)]
+    if from < 3 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| io_error(path, &err))?;
+    }
+    tx.commit().map_err(fail)
 }
 
 /// Reads the legacy state file in `dir`. `None` if there is none.
@@ -1128,8 +1214,50 @@ mod tests {
         assert_eq!(file.peers(), many[..REMEMBERED_PEERS].to_vec());
     }
 
+    const HISTORY_TABLES: [&str; 12] = [
+        "history_backfill",
+        "history_block",
+        "history_coverage",
+        "history_log",
+        "history_open",
+        "history_open_slot",
+        "history_settled",
+        "history_slot",
+        "history_touch",
+        "history_tx",
+        "history_unsettled",
+        "history_withdrawal",
+    ];
+
+    fn history_tables(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 'history_%' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Rewrites `dir`'s database as the given older version would have left it.
+    fn downgrade(dir: &Path, version: i32) {
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        for table in HISTORY_TABLES {
+            conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
+        if version == 1 {
+            conn.execute_batch("DROP TABLE keys").unwrap();
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
+    fn set_version(dir: &Path, version: i32) {
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
     #[test]
-    fn a_new_database_is_at_version_2_and_keeps_learned_keys_in_order() {
+    fn a_new_database_is_at_version_3_and_keeps_learned_keys_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let keys = [
             Key::Slot(Address::repeat_byte(2), U256::from(7)),
@@ -1143,32 +1271,175 @@ mod tests {
         }
         let disk = Disk::open(dir.path()).unwrap();
         assert_eq!(disk.load_keys().unwrap(), keys);
-        assert_eq!(schema_version(&disk.db.lock().conn).unwrap(), 2);
+        assert_eq!(schema_version(&disk.db.lock().conn).unwrap(), 3);
     }
 
     #[test]
-    fn a_version_1_database_gains_the_keys_table_and_keeps_its_state() {
+    fn a_new_database_has_every_history_table_and_they_are_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Disk::open(dir.path()).unwrap();
+        let db = disk.db.lock();
+        assert_eq!(history_tables(&db.conn), HISTORY_TABLES);
+        let text_number = db.conn.execute(
+            "INSERT INTO history_unsettled (number, hash) VALUES ('ten', zeroblob(32))",
+            [],
+        );
+        assert!(text_number.is_err(), "a STRICT table rejects a text number");
+    }
+
+    #[test]
+    fn a_version_1_database_upgrades_to_version_3_and_keeps_its_state() {
         let dir = tempfile::tempdir().unwrap();
         {
             let disk = Disk::open(dir.path()).unwrap();
-            disk.save(|saved| saved.set_outbox(vec![queued(1, 9)]))
-                .unwrap();
-        }
-        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
-        conn.execute_batch("DROP TABLE keys; PRAGMA user_version = 1;")
+            disk.save(|saved| {
+                saved.set_outbox(vec![queued(1, 9)]);
+                saved.remember_peers(&[record(1, 30303)]);
+            })
             .unwrap();
-        drop(conn);
+        }
+        downgrade(dir.path(), 1);
         assert!(
             read_state(dir.path()).unwrap().is_some(),
             "status reads version 1"
         );
 
         let disk = Disk::open(dir.path()).unwrap();
-        disk.read(|saved| assert_eq!(saved.outbox(), &[queued(1, 9)]));
+        disk.read(|saved| {
+            assert_eq!(saved.outbox(), &[queued(1, 9)]);
+            assert_eq!(saved.peers(), vec![record(1, 30303)]);
+        });
         assert_eq!(disk.load_keys().unwrap(), vec![]);
         disk.save_keys(&[Key::Account(Address::repeat_byte(1))])
             .unwrap();
-        assert_eq!(schema_version(&disk.db.lock().conn).unwrap(), 2);
+        let db = disk.db.lock();
+        assert_eq!(schema_version(&db.conn).unwrap(), 3);
+        assert_eq!(history_tables(&db.conn), HISTORY_TABLES);
+    }
+
+    #[test]
+    fn a_version_2_database_upgrades_to_version_3_and_keeps_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot: Snapshot = serde_json::from_str(&pre_contracts_snapshot_json()).unwrap();
+        let keys = [Key::Account(Address::repeat_byte(4))];
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            disk.save(|saved| {
+                saved.set_outbox(vec![queued(1, 9)]);
+                saved.set_snapshot(snapshot);
+                saved.remember_peers(&[record(1, 30303)]);
+            })
+            .unwrap();
+            disk.save_keys(&keys).unwrap();
+        }
+        downgrade(dir.path(), 2);
+
+        let disk = Disk::open(dir.path()).unwrap();
+        disk.read(|saved| {
+            assert_eq!(saved.outbox(), &[queued(1, 9)]);
+            assert_eq!(saved.peers(), vec![record(1, 30303)]);
+            assert_pre_contracts_snapshot(saved.snapshot().unwrap());
+        });
+        assert_eq!(disk.load_keys().unwrap(), keys);
+        let db = disk.db.lock();
+        assert_eq!(schema_version(&db.conn).unwrap(), 3);
+        assert_eq!(history_tables(&db.conn), HISTORY_TABLES);
+    }
+
+    #[test]
+    fn the_writer_refuses_version_4_and_status_reads_it_until_version_100() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            disk.save(|saved| saved.set_outbox(vec![queued(1, 9)]))
+                .unwrap();
+        }
+        set_version(dir.path(), 4);
+        match Disk::open(dir.path()) {
+            Err(NodeError::Disk(message)) => assert!(
+                message.ends_with("schema version 4 is newer than this chibi's 3; upgrade chibi"),
+                "{message}"
+            ),
+            Err(err) => panic!("{err}"),
+            Ok(_) => panic!("opened a version 4 database"),
+        }
+        let saved = read_state(dir.path()).unwrap().unwrap();
+        assert_eq!(saved.outbox(), &[queued(1, 9)]);
+
+        set_version(dir.path(), 100);
+        match read_state(dir.path()) {
+            Err(NodeError::Disk(message)) => assert!(
+                message.ends_with("schema version 100 is newer than this chibi's 3; upgrade chibi"),
+                "{message}"
+            ),
+            Err(err) => panic!("{err}"),
+            Ok(_) => panic!("read a version 100 database"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_database_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Disk::open(dir.path()).unwrap());
+        assert_eq!(mode(&dir.path().join(DB_FILE)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_upgrade_to_version_3_makes_the_database_owner_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DB_FILE);
+        drop(Disk::open(dir.path()).unwrap());
+        downgrade(dir.path(), 2);
+        set_mode(&path, 0o644);
+        drop(Disk::open(dir.path()).unwrap());
+        assert_eq!(mode(&path), 0o600);
+
+        set_mode(&path, 0o640);
+        drop(Disk::open(dir.path()).unwrap());
+        assert_eq!(mode(&path), 0o640);
+        read_state(dir.path()).unwrap();
+        assert_eq!(mode(&path), 0o640);
+    }
+
+    #[test]
+    fn reset_keeps_the_account_history() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let disk = Disk::open(dir.path()).unwrap();
+            let db = disk.db.lock();
+            db.conn
+                .execute_batch(
+                    "INSERT INTO history_coverage (account, capability, first, last)
+                         VALUES (zeroblob(20), 1, 5, 9);
+                     INSERT INTO history_tx (number, tx_index, hash, sender, raw, success,
+                         cumulative_gas, gas_used, first_log_index, log_count)
+                         VALUES (5, 0, zeroblob(32), zeroblob(20), NULL, 1, 21000, 21000, 0, 0);",
+                )
+                .unwrap();
+        }
+        Lock::take(dir.path()).unwrap().reset().unwrap();
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!((count("history_coverage"), count("history_tx")), (1, 1));
     }
 
     #[test]
