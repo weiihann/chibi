@@ -5,6 +5,7 @@ use std::cmp::Reverse;
 
 use alloy_consensus::Transaction as _;
 use alloy_eips::eip2718::Decodable2718 as _;
+use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, B256, Log, TxHash, U256, address, b256};
 
 use super::{At, BlockFacts, Capability, Coverage, Page, Touch};
@@ -172,6 +173,9 @@ pub enum Effect {
     Delegated {
         /// The code the account now delegates to, `None` when the delegation was cleared.
         to: Option<Address>,
+        /// Whether a recorded code change shows it. An authorization in a block without Bal
+        /// coverage is unconfirmed: it may have been skipped as stale.
+        confirmed: bool,
     },
     /// A log naming the account that none of the known shapes match.
     Other {
@@ -182,9 +186,9 @@ pub enum Effect {
     },
 }
 
-/// The account's activity on `page`, newest first: by block, then position in the block, then
-/// log index.
-pub fn decode(page: &Page) -> Vec<Activity> {
+/// The account's activity on `page` on the chain with id `chain_id`, newest first: by block,
+/// then position in the block, then log index.
+pub fn decode(page: &Page, chain_id: u64) -> Vec<Activity> {
     let mut found = Vec::new();
     // Balance deltas need the balance before each touch, so blocks are walked oldest first
     // and the result is ordered afterwards. The balance is known as of the end of a block.
@@ -203,7 +207,15 @@ pub fn decode(page: &Page) -> Vec<Activity> {
         let mut balance = known
             .filter(|&(since, _)| page.bal.gaps(since.saturating_add(1), number).is_empty())
             .map(|(_, balance)| balance);
-        decode_block(page.account, facts, &mut balance, &mut found);
+        let covered = page.bal.contains(number);
+        decode_block(
+            page.account,
+            chain_id,
+            covered,
+            facts,
+            &mut balance,
+            &mut found,
+        );
         known = balance.map(|balance| (number, balance));
     }
     // Stable, so the items of one ERC-1155 batch keep their order.
@@ -220,8 +232,12 @@ struct Found {
 
 const GWEI: u64 = 1_000_000_000;
 
+/// Decodes one block. In a block with Bal coverage (`covered`), delegations come only from
+/// recorded code changes: an authorization there without one was skipped.
 fn decode_block(
     account: Address,
+    chain_id: u64,
+    covered: bool,
     facts: &BlockFacts,
     balance: &mut Option<U256>,
     found: &mut Vec<Found>,
@@ -267,7 +283,15 @@ fn decode_block(
         let tx = tx_at(touch.at);
         if let Some(to) = touch.code.as_ref().and_then(|code| delegation(code)) {
             code_changed.push(touch.at);
-            push(touch.at, 0, tx.map(|tx| tx.hash), Effect::Delegated { to });
+            push(
+                touch.at,
+                0,
+                tx.map(|tx| tx.hash),
+                Effect::Delegated {
+                    to,
+                    confirmed: true,
+                },
+            );
         }
         let effect = match touch.at {
             At::Tx(_) if tx.is_some() => None,
@@ -323,12 +347,21 @@ fn decode_block(
             }
         }
         let to = decoded.as_ref().and_then(|decoded| decoded.to());
-        if !code_changed.contains(&at)
+        if !covered
+            && !code_changed.contains(&at)
             && let Some(to) = decoded
                 .as_ref()
-                .and_then(|decoded| authorized(decoded, account))
+                .and_then(|decoded| authorized(decoded, account, chain_id))
         {
-            push(at, 0, Some(tx.hash), Effect::Delegated { to });
+            push(
+                at,
+                0,
+                Some(tx.hash),
+                Effect::Delegated {
+                    to,
+                    confirmed: false,
+                },
+            );
         }
         if tx.sender == account {
             let effect = Effect::Sent {
@@ -362,14 +395,22 @@ fn delegation(code: &[u8]) -> Option<Option<Address>> {
     }
 }
 
-/// The delegation the last of `account`'s EIP-7702 authorizations in `tx` sets: `Some(None)`
-/// when it clears the delegation, `None` when `tx` carries none of the account's. An
-/// authorization whose signature does not recover delegates nobody.
-fn authorized(tx: &wire::Transaction, account: Address) -> Option<Option<Address>> {
+/// The delegation the last of `account`'s EIP-7702 authorizations for the chain with id
+/// `chain_id` in `tx` sets: `Some(None)` when it clears the delegation, `None` when `tx`
+/// carries none of the account's. An authorization whose signature does not recover
+/// delegates nobody.
+fn authorized(tx: &wire::Transaction, account: Address, chain_id: u64) -> Option<Option<Address>> {
     tx.authorization_list()?
         .iter()
-        .rfind(|authorization| authorization.recover_authority().ok() == Some(account))
+        .rfind(|authorization| counts(authorization, account, chain_id))
         .map(|authorization| Some(authorization.address).filter(|to| !to.is_zero()))
+}
+
+/// Whether `authorization` is `account`'s and valid on the chain with id `chain_id`: for it
+/// or for any chain (0).
+fn counts(authorization: &SignedAuthorization, account: Address, chain_id: u64) -> bool {
+    (authorization.chain_id.is_zero() || authorization.chain_id == U256::from(chain_id))
+        && authorization.recover_authority().ok() == Some(account)
 }
 
 /// Gas used times the effective gas price. A dynamic-fee price needs the block's base fee.
@@ -549,7 +590,7 @@ pub enum TopEnd {
 
 /// What stored history proves about the account's nonces: which nonces nothing explains, and
 /// where. A nonce is explained by a stored send, an EIP-7702 authorization of the account in a
-/// stored transaction, or a nonce change in a forward-covered block.
+/// stored transaction that was not skipped, or a nonce change in a forward-covered block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendCheck {
     /// The explained nonces, ascending.
@@ -563,12 +604,18 @@ pub struct SendCheck {
 }
 
 /// Checks the nonces stored history explains against each other and against the newest open
-/// state. A nonce is explained by the account's stored send, by its EIP-7702 authorization in
-/// any stored transaction, or by a nonce change in a forward-covered block, which explains
-/// every nonce since the last known one when no Bal gap lies between them. Transactions whose
-/// encoding is not stored carry no nonce and are skipped.
-pub fn send_check(coverage: &Coverage) -> SendCheck {
+/// state on the chain with id `chain_id`. A nonce is explained by the account's stored send,
+/// by its EIP-7702 authorization for that chain or any in a stored transaction, in a
+/// Bal-covered block only when its nonce changed there, or by a nonce change in a
+/// forward-covered block, which explains every nonce since the last known one when no Bal gap
+/// lies between them. Transactions whose encoding is not stored carry no nonce and are skipped.
+pub fn send_check(coverage: &Coverage, chain_id: u64) -> SendCheck {
     let account = coverage.account;
+    let bal = coverage
+        .ranges
+        .iter()
+        .find(|(capability, _)| *capability == Capability::Bal)
+        .map(|(_, ranges)| ranges);
     // `(nonce, block number)` of every nonce something stored explains.
     let mut explained: Vec<(u64, u64)> = Vec::new();
     for (number, tx) in &coverage.txs {
@@ -582,21 +629,25 @@ pub fn send_check(coverage: &Coverage) -> SendCheck {
         if tx.sender == account {
             explained.push((decoded.nonce(), *number));
         }
-        // An authorization raises its authority's nonce whoever sends the transaction.
+        // An authorization raises its authority's nonce whoever sends the transaction, unless
+        // it is skipped as stale. A covered block shows whether the nonce moved.
+        let skipped = bal.is_some_and(|bal| bal.contains(*number))
+            && !coverage
+                .nonces
+                .iter()
+                .any(|change| change.number == *number);
+        if skipped {
+            continue;
+        }
         explained.extend(
             decoded
                 .authorization_list()
                 .unwrap_or_default()
                 .iter()
-                .filter(|authorization| authorization.recover_authority().ok() == Some(account))
+                .filter(|authorization| counts(authorization, account, chain_id))
                 .map(|authorization| (authorization.nonce, *number)),
         );
     }
-    let bal = coverage
-        .ranges
-        .iter()
-        .find(|(capability, _)| *capability == Capability::Bal)
-        .map(|(_, ranges)| ranges);
     let mut opens = coverage.opens.iter().peekable();
     let mut last: Option<(u64, u64)> = None;
     for change in &coverage.nonces {
@@ -658,7 +709,7 @@ pub fn send_check(coverage: &Coverage) -> SendCheck {
 mod tests {
     use alloy_consensus::{SignableTransaction as _, Signed, TxEip1559, TxEip7702, TxLegacy};
     use alloy_eips::eip2718::Encodable2718 as _;
-    use alloy_eips::eip7702::{Authorization, SignedAuthorization};
+    use alloy_eips::eip7702::Authorization;
     use alloy_primitives::{Bytes, Log, Signature, TxKind, keccak256};
     use alloy_signer::SignerSync as _;
     use alloy_signer_local::PrivateKeySigner;
@@ -673,6 +724,7 @@ mod tests {
     const A: Address = address!("0x00000000000000000000000000000000000000aa");
     const B: Address = address!("0x00000000000000000000000000000000000000bb");
     const C: Address = address!("0x00000000000000000000000000000000000000cc");
+    const CHAIN: u64 = 11_155_111;
     const TOKEN: Address = address!("0x0000000000000000000000000000000000007070");
 
     fn hash(n: u8) -> TxHash {
@@ -745,8 +797,13 @@ mod tests {
 
     /// My authorization at `nonce` to delegate to `to`.
     fn authorization(nonce: u64, to: Address) -> SignedAuthorization {
+        authorization_on(CHAIN, nonce, to)
+    }
+
+    /// My authorization on chain `chain_id` at `nonce` to delegate to `to`.
+    fn authorization_on(chain_id: u64, nonce: u64, to: Address) -> SignedAuthorization {
         let authorization = Authorization {
-            chain_id: U256::from(11_155_111u64),
+            chain_id: U256::from(chain_id),
             address: to,
             nonce,
         };
@@ -875,7 +932,10 @@ mod tests {
         ];
 
         assert_eq!(
-            decode(&page(vec![block], Some((99, U256::from(1_000_000u64))))),
+            decode(
+                &page(vec![block], Some((99, U256::from(1_000_000u64)))),
+                CHAIN
+            ),
             [
                 sent(activity(
                     100,
@@ -940,7 +1000,7 @@ mod tests {
         block.touches = vec![touch(At::Tx(0), None)];
 
         assert_eq!(
-            decode(&page(vec![block], None)),
+            decode(&page(vec![block], None), CHAIN),
             [
                 activity(
                     100,
@@ -1005,7 +1065,7 @@ mod tests {
         };
 
         assert_eq!(
-            decode(&page(vec![block], None)),
+            decode(&page(vec![block], None), CHAIN),
             [
                 activity(
                     100,
@@ -1029,7 +1089,10 @@ mod tests {
         block.touches = vec![touch(At::Tx(0), Some(937_000))];
 
         assert_eq!(
-            decode(&page(vec![block], Some((99, U256::from(1_000_000u64))))),
+            decode(
+                &page(vec![block], Some((99, U256::from(1_000_000u64)))),
+                CHAIN
+            ),
             [sent(activity(
                 100,
                 At::Tx(0),
@@ -1070,7 +1133,10 @@ mod tests {
         newer.touches = vec![touch(At::System, Some(4)), touch(At::Post, Some(5))];
 
         assert_eq!(
-            decode(&page(vec![newer, older], Some((90, U256::from(1_000u64))))),
+            decode(
+                &page(vec![newer, older], Some((90, U256::from(1_000u64)))),
+                CHAIN
+            ),
             [
                 activity(
                     101,
@@ -1153,7 +1219,7 @@ mod tests {
         let at = |effect| sent(activity(100, At::Tx(0), Some(hash(1)), effect));
 
         assert_eq!(
-            decode(&page(vec![block], None)),
+            decode(&page(vec![block], None), CHAIN),
             [
                 at(Effect::Other {
                     emitter: C,
@@ -1195,7 +1261,7 @@ mod tests {
         block.touches = vec![touch(At::Tx(0), None)];
 
         assert_eq!(
-            decode(&page(vec![block], None)),
+            decode(&page(vec![block], None), CHAIN),
             [activity(
                 100,
                 At::Tx(0),
@@ -1238,7 +1304,7 @@ mod tests {
     fn a_fee_credit_after_a_gap_counts_from_the_new_opening_balance() {
         let page = credits_across_a_gap(vec![(199, U256::from(5_000u64))]);
         assert_eq!(
-            decode(&page),
+            decode(&page, CHAIN),
             [credit(200, Some(200)), credit(100, Some(300))]
         );
     }
@@ -1246,7 +1312,10 @@ mod tests {
     #[test]
     fn a_fee_credit_after_a_gap_with_no_opening_state_has_no_amount() {
         let page = credits_across_a_gap(vec![]);
-        assert_eq!(decode(&page), [credit(200, None), credit(100, Some(300))]);
+        assert_eq!(
+            decode(&page, CHAIN),
+            [credit(200, None), credit(100, Some(300))]
+        );
     }
 
     /// `code` for a delegation to `to`: the EIP-7702 designator.
@@ -1255,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relayed_authorization_shows_a_delegation_and_a_cleared_one_shows_none() {
+    fn a_relayed_authorization_without_bal_coverage_shows_an_unconfirmed_delegation() {
         let mut block = facts(100, 2, Some(7));
         block.txs = vec![
             tx(
@@ -1283,25 +1352,88 @@ mod tests {
         ];
         let page = Page {
             account: me(),
+            bal: Ranges::default(),
             ..page(vec![block], None)
         };
 
         assert_eq!(
-            decode(&page),
+            decode(&page, CHAIN),
             [
                 activity(
                     100,
                     At::Tx(1),
                     Some(hash(2)),
-                    Effect::Delegated { to: None }
+                    Effect::Delegated {
+                        to: None,
+                        confirmed: false
+                    }
                 ),
                 activity(
                     100,
                     At::Tx(0),
                     Some(hash(1)),
-                    Effect::Delegated { to: Some(TOKEN) }
+                    Effect::Delegated {
+                        to: Some(TOKEN),
+                        confirmed: false
+                    }
                 ),
             ]
+        );
+    }
+
+    /// Block 100 holding B's type-4 transaction with my `authorizations`, and my touch there
+    /// with no code change.
+    fn relayed(authorizations: Vec<SignedAuthorization>, bal: Ranges) -> Page {
+        let mut block = facts(100, 1, Some(7));
+        block.txs = vec![tx(0, B, Some(eip7702(0, C, authorizations)), true)];
+        block.touches = vec![Touch {
+            account: me(),
+            ..touch(At::Tx(0), None)
+        }];
+        Page {
+            account: me(),
+            bal,
+            ..page(vec![block], None)
+        }
+    }
+
+    #[test]
+    fn a_relayed_authorization_with_no_code_change_in_a_covered_block_shows_nothing() {
+        let page = relayed(
+            vec![authorization(4, TOKEN)],
+            Ranges::from_iter([(100, 100)]),
+        );
+
+        assert_eq!(decode(&page, CHAIN), []);
+    }
+
+    #[test]
+    fn an_authorization_for_another_chain_never_shows_a_delegation() {
+        for bal in [Ranges::default(), Ranges::from_iter([(100, 100)])] {
+            let page = relayed(vec![authorization_on(1, 4, TOKEN)], bal);
+
+            assert_eq!(decode(&page, CHAIN), []);
+        }
+    }
+
+    #[test]
+    fn the_last_authorization_for_this_chain_or_any_shows_unconfirmed_without_coverage() {
+        let page = relayed(
+            vec![authorization_on(0, 4, C), authorization_on(1, 5, TOKEN)],
+            Ranges::default(),
+        );
+
+        assert_eq!(
+            decode(&page, CHAIN),
+            [activity(
+                100,
+                At::Tx(0),
+                Some(hash(1)),
+                Effect::Delegated {
+                    to: Some(C),
+                    confirmed: false
+                }
+            )]
         );
     }
 
@@ -1336,13 +1468,16 @@ mod tests {
         };
 
         assert_eq!(
-            decode(&page),
+            decode(&page, CHAIN),
             [
                 sent(activity(
                     100,
                     At::Tx(1),
                     Some(hash(2)),
-                    Effect::Delegated { to: None }
+                    Effect::Delegated {
+                        to: None,
+                        confirmed: true
+                    }
                 )),
                 sent(activity(
                     100,
@@ -1360,7 +1495,10 @@ mod tests {
                     100,
                     At::Tx(0),
                     Some(hash(1)),
-                    Effect::Delegated { to: Some(TOKEN) }
+                    Effect::Delegated {
+                        to: Some(TOKEN),
+                        confirmed: true
+                    }
                 ),
             ]
         );
@@ -1396,10 +1534,13 @@ mod tests {
 
     #[test]
     fn a_nonce_gap_between_sends_and_below_the_open_nonce_are_both_unexplained() {
-        let check = send_check(&coverage(
-            &[(10, Some(4)), (11, Some(5)), (13, None), (15, Some(7))],
-            &[(3, 2), (20, 9)],
-        ));
+        let check = send_check(
+            &coverage(
+                &[(10, Some(4)), (11, Some(5)), (13, None), (15, Some(7))],
+                &[(3, 2), (20, 9)],
+            ),
+            CHAIN,
+        );
 
         assert_eq!(
             check,
@@ -1420,7 +1561,10 @@ mod tests {
 
     #[test]
     fn contiguous_sends_up_to_the_open_nonce_have_no_gaps() {
-        let check = send_check(&coverage(&[(10, Some(4)), (11, Some(5))], &[(20, 6)]));
+        let check = send_check(
+            &coverage(&[(10, Some(4)), (11, Some(5))], &[(20, 6)]),
+            CHAIN,
+        );
 
         assert_eq!(
             check,
@@ -1438,7 +1582,7 @@ mod tests {
 
     #[test]
     fn without_an_open_state_the_top_end_is_unchecked() {
-        let check = send_check(&coverage(&[(10, Some(4)), (11, Some(5))], &[]));
+        let check = send_check(&coverage(&[(10, Some(4)), (11, Some(5))], &[]), CHAIN);
 
         assert_eq!(check.top, TopEnd::Unchecked);
         assert_eq!(check.unexplained, []);
@@ -1473,7 +1617,7 @@ mod tests {
         };
 
         assert_eq!(
-            send_check(&coverage),
+            send_check(&coverage, CHAIN),
             SendCheck {
                 nonces: vec![3, 4, 5, 6, 9],
                 unexplained: vec![Unexplained {
@@ -1503,7 +1647,7 @@ mod tests {
         };
 
         assert_eq!(
-            send_check(&coverage),
+            send_check(&coverage, CHAIN),
             SendCheck {
                 nonces: vec![3, 4, 5, 8],
                 unexplained: vec![Unexplained {
@@ -1517,5 +1661,37 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn covered_authorizations_without_a_nonce_change_and_foreign_ones_explain_nothing() {
+        let relayed = |number: u64, authorization: SignedAuthorization| {
+            (
+                number,
+                TxRow {
+                    hash: hash(u8::try_from(number).unwrap()),
+                    ..tx(0, B, Some(eip7702(0, C, vec![authorization])), true)
+                },
+            )
+        };
+        let coverage = Coverage {
+            account: me(),
+            ranges: vec![(Capability::Bal, Ranges::from_iter([(11, 11), (13, 13)]))],
+            settled: None,
+            opens: vec![],
+            txs: vec![
+                relayed(11, authorization(5, TOKEN)),
+                relayed(12, authorization_on(1, 6, TOKEN)),
+                relayed(13, authorization(7, TOKEN)),
+                relayed(14, authorization(8, TOKEN)),
+            ],
+            nonces: vec![NonceChange {
+                number: 13,
+                index: 1,
+                nonce: 8,
+            }],
+        };
+
+        assert_eq!(send_check(&coverage, CHAIN).nonces, [7, 8]);
     }
 }

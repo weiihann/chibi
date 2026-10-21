@@ -241,8 +241,17 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
             before: None,
             after,
         } => format!("balance now {}", eth(*after)),
-        Effect::Delegated { to: Some(to) } => format!("delegated to {to}"),
-        Effect::Delegated { to: None } => "delegation cleared".to_owned(),
+        Effect::Delegated { to, confirmed } => {
+            let text = match to {
+                Some(to) => format!("delegated to {to}"),
+                None => "delegation cleared".to_owned(),
+            };
+            if *confirmed {
+                text
+            } else {
+                format!("{text} (not confirmed: no state change recorded for this block)")
+            }
+        }
         Effect::Other { emitter, .. } => format!("event from {}", short(*emitter)),
     }
 }
@@ -512,10 +521,33 @@ mod tests {
                 "failed send to 0x1111000000000000000000000000000000002222 (nonce 43)",
             ),
             (
-                Effect::Delegated { to: Some(ODD) },
+                Effect::Delegated {
+                    to: Some(ODD),
+                    confirmed: true,
+                },
                 "delegated to 0x7070000000000000000000000000000000007070",
             ),
-            (Effect::Delegated { to: None }, "delegation cleared"),
+            (
+                Effect::Delegated {
+                    to: None,
+                    confirmed: true,
+                },
+                "delegation cleared",
+            ),
+            (
+                Effect::Delegated {
+                    to: Some(ODD),
+                    confirmed: false,
+                },
+                "delegated to 0x7070000000000000000000000000000000007070 (not confirmed: no state change recorded for this block)",
+            ),
+            (
+                Effect::Delegated {
+                    to: None,
+                    confirmed: false,
+                },
+                "delegation cleared (not confirmed: no state change recorded for this block)",
+            ),
             (
                 Effect::Nft {
                     token: ODD,
@@ -668,7 +700,7 @@ mod tests {
             txs,
             nonces: Vec::new(),
         };
-        coverage_line(&coverage, &send_check(&coverage))
+        coverage_line(&coverage, &send_check(&coverage, 11_155_111))
     }
 
     /// My proven state at block `number` with nonce `nonce`.

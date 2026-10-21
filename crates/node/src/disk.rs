@@ -790,10 +790,15 @@ impl History {
     }
 
     /// The account's coverage, with the send check's input, and its newest `activities`
-    /// activities, newest first, read in one transaction so a writer between them cannot make
-    /// them disagree.
-    pub fn view(&self, account: Address, activities: usize) -> Result<View, NodeError> {
-        self.view_between(account, activities, || {})
+    /// activities on the chain with id `chain_id`, newest first, read in one transaction so a
+    /// writer between them cannot make them disagree.
+    pub fn view(
+        &self,
+        account: Address,
+        activities: usize,
+        chain_id: u64,
+    ) -> Result<View, NodeError> {
+        self.view_between(account, activities, chain_id, || {})
     }
 
     /// [`History::view`], running `between` after the coverage is read and before the
@@ -802,12 +807,13 @@ impl History {
         &self,
         account: Address,
         activities: usize,
+        chain_id: u64,
         between: impl FnOnce(),
     ) -> Result<View, NodeError> {
         self.read(|conn| {
             let coverage = read_coverage(conn, account)?;
             between();
-            let activities = read_activities(conn, account, activities)?;
+            let activities = read_activities(conn, account, activities, chain_id)?;
             Ok(View {
                 coverage,
                 activities,
@@ -828,19 +834,20 @@ impl History {
     }
 }
 
-/// The newest `count` activities of `account`, newest first, decoded from as many pages as
-/// hold them.
+/// The newest `count` activities of `account` on the chain with id `chain_id`, newest first,
+/// decoded from as many pages as hold them.
 fn read_activities(
     conn: &Connection,
     account: Address,
     count: usize,
+    chain_id: u64,
 ) -> rusqlite::Result<Vec<Activity>> {
     let rows = NonZeroUsize::MIN.saturating_add(count.saturating_sub(1));
     let mut found = Vec::with_capacity(count);
     let mut before = None;
     while found.len() < count {
         let page = read_page(conn, account, before, rows)?;
-        found.extend(decode(&page));
+        found.extend(decode(&page, chain_id));
         match page.next {
             Some(next) => before = Some(next),
             None => break,
@@ -3379,7 +3386,7 @@ mod tests {
                 .unwrap();
 
             let view = history
-                .view_between(alice(), 1, || {
+                .view_between(alice(), 1, 11_155_111, || {
                     // Refused while the view's snapshot is open; accepted between two reads.
                     let _ = disk.record_head(at(11, 1), &chain(at(11, 1), 1, 1));
                 })

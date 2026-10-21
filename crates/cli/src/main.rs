@@ -160,7 +160,10 @@ fn read_histories(
     };
     let mut histories = BTreeMap::new();
     for holding in &snapshot.holdings {
-        histories.insert(holding.address, history.view(holding.address, RECENT)?);
+        histories.insert(
+            holding.address,
+            history.view(holding.address, RECENT, snapshot.network.spec().chain_id())?,
+        );
     }
     let covered = histories.values().any(|account| {
         account
@@ -253,7 +256,7 @@ fn write_status<W: Write>(
         }
         writeln!(output)?;
         if let Some(history) = histories.get(&holding.address) {
-            let check = send_check(&history.coverage);
+            let check = send_check(&history.coverage, snapshot.network.spec().chain_id());
             writeln!(output, "  {}", coverage_line(&history.coverage, &check))?;
             for activity in &history.activities {
                 writeln!(

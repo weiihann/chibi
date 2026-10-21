@@ -615,7 +615,13 @@ impl Ui<'_> {
                                 refresh_balances(node, self.app.registry, &mut tasks);
                             }
                             if let Some(account) = self.app.history_request(due) {
-                                refresh_history(data_dir, account, self.app.registry, &mut tasks);
+                                refresh_history(
+                                    data_dir,
+                                    account,
+                                    self.app.chain_id,
+                                    self.app.registry,
+                                    &mut tasks,
+                                );
                             }
                             if let Some(hash) = self.app.tracking()
                                 && let Some(tracked) = transfer::track(node, hash)
@@ -691,12 +697,13 @@ fn refresh_balances<P: Peers>(
 fn refresh_history(
     data_dir: &Path,
     account: Address,
+    chain_id: u64,
     registry: &'static [Token],
     tasks: &mut JoinSet<Done>,
 ) {
     let data_dir = data_dir.to_owned();
     tasks.spawn_blocking(move || {
-        let lines = read_history(&data_dir, account, registry, unix_now())
+        let lines = read_history(&data_dir, account, chain_id, registry, unix_now())
             .inspect_err(|err| tracing::warn!(%err, %account, "cannot read the account history"))
             .ok();
         Done::History(account, lines)
@@ -707,6 +714,7 @@ fn refresh_history(
 fn read_history(
     data_dir: &Path,
     account: Address,
+    chain_id: u64,
     registry: &[Token],
     now: u64,
 ) -> Result<HistoryLines, NodeError> {
@@ -716,14 +724,14 @@ fn read_history(
             activities: Vec::new(),
         });
     };
-    let view = history.view(account, HISTORY_ACTIVITIES)?;
+    let view = history.view(account, HISTORY_ACTIVITIES, chain_id)?;
     let activities = view
         .activities
         .iter()
         .map(|activity| activity_line(activity, account, registry, now))
         .collect();
     Ok(HistoryLines {
-        coverage: coverage_line(&view.coverage, &send_check(&view.coverage)),
+        coverage: coverage_line(&view.coverage, &send_check(&view.coverage, chain_id)),
         activities,
     })
 }
@@ -1106,8 +1114,14 @@ mod tests {
             activities: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_history(dir.path(), account, &[], 0).unwrap(), empty);
+        assert_eq!(
+            read_history(dir.path(), account, 11_155_111, &[], 0).unwrap(),
+            empty
+        );
         drop(Disk::open(dir.path()).unwrap());
-        assert_eq!(read_history(dir.path(), account, &[], 0).unwrap(), empty);
+        assert_eq!(
+            read_history(dir.path(), account, 11_155_111, &[], 0).unwrap(),
+            empty
+        );
     }
 }
