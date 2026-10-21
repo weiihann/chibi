@@ -40,6 +40,7 @@ From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs
 - **Current every block.** Block access lists (EIP-7928) update the state you hold without re-executing anything.
 - **Direct sends.** Signed transactions go straight to Ethereum peers, and their receipts are proven too.
 - **A terminal wallet.** `chibi wallet` sends ETH and tokens, resolves ENS names, watches balances read-only, and has cats.
+- **Account history, if you want it.** Answer yes in `chibi init` and chibi keeps your accounts' sends, transfers, approvals and delegations, each checked against a verified block, and fills them in back to the Glamsterdam fork. `chibi status` and `h` in `chibi wallet` show them.
 
 <p align="center">
   <a href="assets/chibi-wallet.mp4"><img alt="chibi wallet unlocking a keystore, finding a state peer, and sending 1 USDC on Sepolia with a verified receipt" src="assets/chibi-wallet.gif" width="900"></a>
@@ -50,7 +51,7 @@ From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs
 
 | Command | |
 |---|---|
-| `chibi init` | Choose the network, the addresses to watch, and the RPC host and port (optional) |
+| `chibi init` | Choose the network, the addresses to watch, whether to keep account history, and the RPC host and port (optional) |
 | `chibi node` | Sync and serve JSON-RPC; `-b` runs it in the background |
 | `chibi wallet` | The same node under a terminal wallet |
 | `chibi status` | Whether chibi runs, the last proven balances, and recent account history when recorded |
@@ -75,7 +76,7 @@ cargo install --locked --git https://github.com/weiihann/chibi chibi
 
 - **Proven:** every account, balance, nonce, code, storage value and receipt is checked against a header whose hash the light client verified. A lying peer can stall chibi but cannot make it serve a wrong value.
 - **Trusted:** the Ethereum sync committee, read through a beacon API (`beacon_url`, with a public default). On the first run a public checkpoint service picks the starting checkpoint unless you set `checkpoint`.
-- **Seen by peers:** the peers that serve proofs see which accounts you query, and the network sees what you send. Add your own node to `trusted_peers` with `trusted_only = true` to keep queries private.
+- **Seen by peers:** the peers that serve proofs see which accounts you query, and the network sees what you send. With account history on, peers also see which blocks chibi fetches receipts for, the blocks that may involve your accounts. Add your own node to `trusted_peers` with `trusted_only = true` to keep queries private.
 
 ## Status
 

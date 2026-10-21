@@ -14,13 +14,14 @@ Dependencies point one way: `cli -> node -> core`.
   - `working.rs`: the keys chibi keeps proven (pins plus learned keys, capped).
   - `exec.rs`: the local EVM over a pinned store. `tx.rs`: submitted transactions and receipts.
   - `wire.rs`: untrusted requests and replies in chibi's own shapes. `testing.rs`: an in-process chain with real tries.
+  - `history/`: account history. `mod.rs` holds the stored fact rows and coverage ranges, `scan.rs` decides what a verified block stores for the watched accounts, and `decode.rs` turns stored facts into activity when read.
 - `crates/node` (`chibi-node`): the async shell. reth-network and helios compile only here.
-  - `node.rs`: the request-side API. `follow.rs`: the one head follower. `fetch.rs`: verified fetches.
+  - `node.rs`: the request-side API. `follow.rs`: the one head follower, and the history task it hands each step to. `fetch.rs`: verified fetches.
   - `devp2p.rs`, `snap1.rs`, `peers.rs`: peers and snap. `beacon.rs`, `heads.rs`: the light client.
-  - `disk.rs`: the data directory, its lock and `chibi.db`. `network.rs`: every per-chain fact.
+  - `disk.rs`: the data directory, its lock and `chibi.db`, including the account history tables and their read-only `History` reader. `network.rs`: every per-chain fact.
   - `fixture.rs`: the offline test chain, with faults. `tests.rs`: node tests over it.
   - `examples/`: live Sepolia probes (`live_probe`, `live_node`) and the token registry printer.
-- `crates/cli` (`chibi` binary): `main.rs` (commands), `init.rs`, `run.rs` (`node`, `wallet`, `stop`), `config.rs`, `rpc.rs` (the only place JSON-RPC types and error codes live), `names.rs`.
+- `crates/cli` (`chibi` binary): `main.rs` (commands), `init.rs`, `run.rs` (`node`, `wallet`, `stop`), `config.rs`, `rpc.rs` (the only place JSON-RPC types and error codes live), `names.rs`, `activity.rs` (how history reads in `chibi status` and the wallet).
   - `tui/mod.rs`: the render thread and the control loop. `tui/app.rs`: the screens as a pure state machine.
   - `tui/view.rs`: `App` to `View` and drawing. `tui/transfer.rs`: unlock, name resolution, build and send.
   - `tui/wallet.rs`: create or import a wallet and write the keystore. `tui/cat.rs`: the pixel cats.
@@ -50,6 +51,7 @@ Do not break these. A change that needs to is a design change: say so first.
 - Proof requests go to state peers: snap/2 sessions at once, snap/1 sessions once connected 3 s (`SNAP1_SETTLE`). BAL requests go only to snap/2, then eth/71, never snap/1.
 - chibi never contacts a third-party RPC or gateway and never follows CCIP-read. It has two outside dependencies: the beacon API (`beacon_url`, a public default) for sync-committee data and, on the first run without `checkpoint`, a public checkpoint service. A public RPC is only a test oracle.
 - The TUI's `View` never holds a password or a typed secret: they are masked before the view is built. The only secret it carries is a new recovery phrase on the Backup screen.
+- Account history is display-only: its rows never answer RPC and never enter a `Store`. Only a reconcile after a re-anchor deletes history, and `chibi init` never clears it. Recording history never stops or delays following beyond `HISTORY_BUDGET`. The backward walk starts from a header the follower verified, never from a hash read off disk.
 - Sepolia first. Mainnet is untested, and sending on mainnet stays disabled.
 
 ## Workflow
