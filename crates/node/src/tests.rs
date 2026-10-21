@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,21 +7,22 @@ use std::time::Duration;
 use alloy_consensus::{SignableTransaction as _, TxEip4844, TxLegacy};
 use alloy_eips::eip1559::BaseFeeParams;
 use alloy_eips::eip2718::Encodable2718 as _;
-use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, keccak256};
+use alloy_primitives::{Address, B256, Bytes, Log as EvmLog, TxKind, U256, address, keccak256};
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolValue as _;
 use chibi_core::exec::{CallRequest, ExecutionResult};
+use chibi_core::history::{At, Capability, LogRow, OpenState, Touch, TxRow};
 use chibi_core::state::{HEADER_WINDOW, Key};
 use chibi_core::testing::{
-    BASE_FEE, BlockWrites, EIP1967_IMPLEMENTATION_SLOT, GAS_PRICE, PAUSED_SLOT, WorldAccount,
-    balance_of_calldata, delegating_proxy_code, eth, legacy_transfer, mapping_reader_code,
-    mapping_slot, pausable_token_code, transfer_calldata,
+    BASE_FEE, BlockWrites, EIP1967_IMPLEMENTATION_SLOT, GAS_PRICE, Outcome, PAUSED_SLOT,
+    WorldAccount, balance_of_calldata, delegating_proxy_code, eth, key_address, legacy_transfer,
+    mapping_reader_code, mapping_slot, pausable_token_code, transfer_calldata,
 };
 use chibi_core::verify::VerifyError;
 use chibi_core::wire::Transaction;
 
-use crate::disk::{Disk, read_state};
+use crate::disk::{Disk, History, read_state};
 use crate::fixture::{Fault, Fixture, FixturePeers, LIAR, Log};
 use crate::network::{MAINNET_ENS_RESOLVER, Token};
 use crate::node::{
@@ -71,6 +73,7 @@ fn watchlist(addresses: &[Address]) -> Watchlist {
     Watchlist {
         addresses: addresses.to_vec(),
         contracts: Vec::new(),
+        history: false,
     }
 }
 
@@ -584,6 +587,7 @@ async fn a_configured_contract_slot_is_pinned_and_follows_bal_writes() {
             address: IMPL,
             slots: vec![set, unset],
         }],
+        history: false,
     };
     let (node, mut follower) = start_with(&fixture, dir.path(), &[], &watch).await;
     assert_eq!(
@@ -1359,6 +1363,7 @@ fn reader_slots() -> Watchlist {
             address: READER,
             slots: (0..6u64).map(U256::from).collect(),
         }],
+        history: false,
     }
 }
 
@@ -1974,4 +1979,326 @@ async fn a_reverting_resolver_gives_no_name_and_seeding_still_completes() {
     let proofs = fixture.log().proofs;
     assert_eq!(follower.step().await.unwrap(), Stepped::Current);
     assert_eq!(fixture.log().proofs, proofs, "seeding is no longer due");
+}
+
+const PAYER_KEY: B256 = B256::repeat_byte(0x42);
+
+/// The emitter of EIP-7708 ETH transfer logs.
+const ETH_LOGS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
+
+fn history_watch(addresses: &[Address]) -> Watchlist {
+    Watchlist {
+        history: true,
+        ..watchlist(addresses)
+    }
+}
+
+fn payment_tx(nonce: u64) -> Transaction {
+    chibi_core::testing::signed_transfer(PAYER_KEY, 1, nonce, ALICE, eth(1))
+}
+
+fn payment_log() -> EvmLog {
+    EvmLog::new_unchecked(
+        ETH_LOGS,
+        vec![
+            keccak256("Transfer(address,address,uint256)"),
+            key_address(PAYER_KEY).into_word(),
+            ALICE.into_word(),
+        ],
+        Bytes::from(eth(1).to_be_bytes::<32>().to_vec()),
+    )
+}
+
+/// A block whose one transaction pays ALICE an ether: her credit sits at the transaction's
+/// block access index, and the receipt carries the EIP-7708 log.
+fn payment(nonce: u64, alice_after: U256) -> BlockWrites {
+    BlockWrites::default()
+        .tx_with(
+            payment_tx(nonce),
+            Outcome {
+                success: true,
+                gas_used: 21_000,
+                logs: vec![payment_log()],
+            },
+        )
+        .at(1)
+        .balance(ALICE, alice_after)
+}
+
+fn history(dir: &Path) -> History {
+    History::open(dir).unwrap().unwrap()
+}
+
+fn recorded_blocks(dir: &Path, account: Address) -> Vec<u64> {
+    history(dir)
+        .page(account, None, NonZeroUsize::new(100).unwrap())
+        .unwrap()
+        .blocks
+        .iter()
+        .map(|facts| facts.block.number)
+        .collect()
+}
+
+fn covered(dir: &Path, account: Address) -> Vec<(Capability, Vec<(u64, u64)>)> {
+    history(dir)
+        .coverage(account)
+        .unwrap()
+        .ranges
+        .into_iter()
+        .map(|(capability, ranges)| (capability, ranges.iter().collect()))
+        .collect()
+}
+
+fn both(ranges: &[(u64, u64)]) -> Vec<(Capability, Vec<(u64, u64)>)> {
+    vec![
+        (Capability::Bal, ranges.to_vec()),
+        (Capability::Logs, ranges.to_vec()),
+    ]
+}
+
+#[tokio::test]
+async fn with_history_on_a_payment_to_a_watched_account_is_recorded_with_its_coverage() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+
+    let hash = fixture.mine(payment(0, eth(3)));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+
+    let page = history(dir.path())
+        .page(ALICE, None, NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    assert_eq!(page.blocks.len(), 1);
+    let facts = &page.blocks[0];
+    assert_eq!((facts.block.number, facts.block.hash), (head.number, hash));
+    assert_eq!(
+        facts.txs,
+        [TxRow {
+            index: 0,
+            hash: *payment_tx(0).tx_hash(),
+            sender: key_address(PAYER_KEY),
+            raw: Some(Bytes::from(payment_tx(0).encoded_2718())),
+            success: true,
+            cumulative_gas: 21_000,
+            gas_used: 21_000,
+            first_log_index: 0,
+            log_count: 1,
+        }]
+    );
+    assert_eq!(
+        facts.logs,
+        [LogRow {
+            index: 0,
+            log: payment_log(),
+        }]
+    );
+    assert_eq!(
+        facts.touches,
+        [Touch {
+            account: ALICE,
+            at: At::Tx(0),
+            balance: Some(eth(3)),
+            nonce: None,
+            code: None,
+        }]
+    );
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        both(&[(head.number, head.number)])
+    );
+    assert_eq!((fixture.log().bodies, fixture.log().receipts), (1, 1));
+}
+
+#[tokio::test]
+async fn with_history_off_the_same_chain_writes_no_history_and_fetches_no_contents() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) = start(&fixture, dir.path(), &[ALICE], &[]).await;
+
+    let hash = fixture.mine(payment(0, eth(3)));
+    let head = fixture.world(|w| w.verified(hash)).num_hash();
+    assert_eq!(follower.step().await.unwrap(), Stepped::Extended(head));
+
+    assert_eq!((fixture.log().bodies, fixture.log().receipts), (0, 0));
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+    let coverage = history(dir.path()).coverage(ALICE).unwrap();
+    assert!(
+        coverage
+            .ranges
+            .iter()
+            .all(|(_, ranges)| ranges.first().is_none())
+    );
+    assert_eq!((coverage.opens, coverage.settled), (Vec::new(), None));
+}
+
+#[tokio::test]
+async fn the_first_recorded_step_opens_each_watched_account_at_the_anchor_with_its_proven_state() {
+    let fixture = Fixture::genesis([
+        (ALICE, WorldAccount::eoa(eth(2)).with_nonce(5)),
+        (CAROL, WorldAccount::eoa(eth(9))),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE, CAROL])).await;
+    let anchor = node.head();
+
+    fixture.mine(payment(0, eth(3)));
+    follower.step().await.unwrap();
+    fixture.mine(BlockWrites::default().balance(CAROL, eth(8)));
+    follower.step().await.unwrap();
+
+    let open = |account, balance, nonce| OpenState {
+        account,
+        number: anchor.number(),
+        hash: anchor.hash(),
+        balance,
+        nonce,
+        slots: Vec::new(),
+    };
+    let coverage = |account| history(dir.path()).coverage(account).unwrap().opens;
+    assert_eq!(coverage(ALICE), [open(ALICE, eth(2), 5)]);
+    assert_eq!(
+        coverage(CAROL),
+        [open(CAROL, eth(9), 0)],
+        "opened only once"
+    );
+}
+
+#[tokio::test]
+async fn finalizing_a_recorded_block_settles_history_there() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    let paid = fixture.mine(payment(0, eth(3)));
+    follower.step().await.unwrap();
+    fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+
+    fixture.finalize(paid);
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+
+    let number = fixture.world(|w| w.verified(paid)).number();
+    assert_eq!(
+        history(dir.path()).coverage(ALICE).unwrap().settled,
+        Some(number)
+    );
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [number]);
+}
+
+#[tokio::test]
+async fn a_fork_that_reanchors_retracts_the_orphaned_block_and_records_the_new_branch() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    let orphan = fixture.mine(payment(0, eth(3)));
+    let orphan = fixture.world(|w| w.verified(orphan)).num_hash();
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [orphan.number]);
+
+    let sibling = fixture.fork_head(BlockWrites::default().balance(ALICE, eth(5)));
+    let sibling = fixture.world(|w| w.verified(sibling));
+    assert_eq!(
+        follower.step().await.unwrap(),
+        Stepped::Reanchored(sibling.num_hash())
+    );
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+    assert_eq!(covered(dir.path(), ALICE), Vec::new());
+
+    let child = fixture.mine(payment(0, eth(6)));
+    let child = fixture.world(|w| w.verified(child));
+    assert_eq!(
+        follower.step().await.unwrap(),
+        Stepped::Extended(child.num_hash())
+    );
+    let page = history(dir.path())
+        .page(ALICE, None, NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    let blocks: Vec<_> = page
+        .blocks
+        .iter()
+        .map(|facts| (facts.block.number, facts.block.hash))
+        .collect();
+    assert_eq!(blocks, [(child.number(), child.hash())]);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        both(&[(child.number(), child.number())])
+    );
+    let opens = history(dir.path()).coverage(ALICE).unwrap().opens;
+    let opened: Vec<_> = opens.iter().map(|open| (open.number, open.hash)).collect();
+    assert_eq!(opened, [(sibling.number(), sibling.hash())]);
+}
+
+#[tokio::test]
+async fn contents_that_cannot_be_fetched_wait_for_a_later_head_and_are_recorded_in_order() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+
+    fixture.fault(Fault::WithholdBodies);
+    let paid = fixture.mine(payment(0, eth(3)));
+    let paid = fixture.world(|w| w.verified(paid)).number();
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+
+    fixture.heal();
+    fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid]);
+    assert_eq!(covered(dir.path(), ALICE), both(&[(paid, paid + 1)]));
+}
+
+#[tokio::test]
+async fn a_restart_keeps_the_earlier_history_and_covers_all_but_the_blocks_it_missed() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let watch = history_watch(&[ALICE]);
+    let first = {
+        let (_node, mut follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+        let paid = fixture.mine(payment(0, eth(3)));
+        follower.step().await.unwrap();
+        fixture.mine(BlockWrites::default());
+        follower.step().await.unwrap();
+        fixture.world(|w| w.verified(paid)).number()
+    };
+    fixture.mine_unseen(BlockWrites::default());
+    fixture.mine(BlockWrites::default());
+
+    let (_node, mut follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+    let paid = fixture.mine(payment(1, eth(4)));
+    let paid = fixture.world(|w| w.verified(paid)).number();
+    follower.step().await.unwrap();
+
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid, first]);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        both(&[(first, first + 1), (paid, paid)])
+    );
+}
+
+#[tokio::test]
+async fn a_restart_after_a_fork_retracts_only_the_orphaned_block() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let dir = tempfile::tempdir().unwrap();
+    let watch = history_watch(&[ALICE]);
+    let first = {
+        let (_node, mut follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+        let first = fixture.mine(payment(0, eth(3)));
+        follower.step().await.unwrap();
+        fixture.mine(payment(1, eth(4)));
+        follower.step().await.unwrap();
+        fixture.world(|w| w.verified(first)).number()
+    };
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [first + 1, first]);
+    fixture.fork_head(BlockWrites::default());
+    fixture.mine(BlockWrites::default());
+
+    let (_node, _follower) = start_with(&fixture, dir.path(), &[], &watch).await;
+
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [first]);
+    assert_eq!(covered(dir.path(), ALICE), both(&[(first, first)]));
 }

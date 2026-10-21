@@ -37,7 +37,7 @@ use crate::beacon::{self, Beacon, BeaconConfig, BeaconError};
 use crate::devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, Sessions, sessions_changed};
 use crate::disk::{Disk, OutboxTx, Saved};
 use crate::fetch::{self, Fetched};
-use crate::follow::Search;
+use crate::follow::{Recorder, Search};
 use crate::heads::Heads;
 use crate::network::{BlockClock, Network, NetworkSpec, Token};
 use crate::peers::{NetError, Paced, Peers, REQUEST_TIMEOUT};
@@ -128,6 +128,9 @@ pub struct Watchlist {
     pub addresses: Vec<Address>,
     /// Contract accounts and raw storage slots kept proven.
     pub contracts: Vec<TrackedContract>,
+    /// Record the watched accounts' activity as account history. Off means no extra fetches
+    /// and no history writes.
+    pub history: bool,
 }
 
 impl Watchlist {
@@ -228,6 +231,8 @@ pub struct Follower<P: Peers = Devp2p> {
     pub(crate) seed_due: bool,
     /// When seeding last ran.
     pub(crate) seeded_at: tokio::time::Instant,
+    /// Forward account history recording, `None` when history is off.
+    pub(crate) history: Option<Recorder>,
 }
 
 /// Fee data for `eth_feeHistory`, oldest block first.
@@ -674,6 +679,7 @@ impl<P: Peers> Node<P> {
                 unreceipted: Vec::new(),
                 seed_due: true,
                 seeded_at: tokio::time::Instant::now(),
+                history: watch.history.then(Recorder::new),
             },
         ))
     }
@@ -1564,7 +1570,7 @@ fn outbox<'a>(pending: impl IntoIterator<Item = &'a PendingTx>) -> Vec<OutboxTx>
 }
 
 /// Runs blocking disk work off the async workers.
-async fn blocking<R: Send + 'static>(
+pub(crate) async fn blocking<R: Send + 'static>(
     work: impl FnOnce() -> Result<R, NodeError> + Send + 'static,
 ) -> Result<R, NodeError> {
     tokio::task::spawn_blocking(work)
@@ -1711,6 +1717,13 @@ pub enum NodeError {
     /// The light client has not produced a head yet.
     #[error("no verified head yet")]
     NotReady,
+    /// A forward history write forks from the stored history, which needs a reconcile against
+    /// the followed chain first.
+    #[error("history above block {above} needs a reconcile")]
+    HistoryReconcile {
+        /// The highest block the stored history may still agree on.
+        above: u64,
+    },
 }
 
 #[cfg(test)]

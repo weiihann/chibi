@@ -472,18 +472,30 @@ impl Disk {
 
 /// Account history writes. Each is one transaction on the writer's connection, so a failed
 /// write leaves nothing behind. Blocks on fsync; call them off the async workers.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the history follower that calls these lands in a later unit"
-    )
-)]
 impl Disk {
     /// The highest block history holds on the followed chain: the newest unsettled block, else
     /// the settled mark. `None` before history records anything.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only tests read the tip until the backward walk lands"
+        )
+    )]
     pub(crate) fn history_tip(&self) -> Result<Option<BlockNumHash>, NodeError> {
         self.history(|conn| Ok(history_tip(conn)?))
+    }
+
+    /// The lowest block a reconcile may still retract: the oldest unsettled block. `None` when
+    /// nothing is unsettled.
+    pub(crate) fn lowest_unsettled(&self) -> Result<Option<u64>, NodeError> {
+        self.history(|conn| {
+            Ok(
+                conn.query_row("SELECT min(number) FROM history_unsettled", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
     }
 
     /// Records consecutive verified blocks on the followed chain after `parent`, the verified
@@ -518,9 +530,7 @@ impl Disk {
                 } else {
                     from.number.saturating_sub(1)
                 };
-                return Err(HistoryError::Refused(format!(
-                    "history above block {agreed} needs a reconcile"
-                )));
+                return Err(HistoryError::Reconcile { above: agreed });
             }
             for block in rest {
                 conn.execute(
@@ -593,6 +603,13 @@ impl Disk {
     /// Adds blocks at or below the settled mark: the backward walk and supplements. Facts
     /// already stored are kept, coverage only grows, and a block whose hash differs from the
     /// one stored at its height is refused. Saves `cursor` as the backward walk's resume point.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the backward walk that calls this lands in a later unit"
+        )
+    )]
     pub(crate) fn augment_history(
         &self,
         blocks: &[ScannedBlock],
@@ -643,6 +660,13 @@ impl Disk {
     }
 
     /// Where the backward walk resumes: the lowest block it scanned. `None` before it starts.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the backward walk that calls this lands in a later unit"
+        )
+    )]
     pub(crate) fn backfill_cursor(&self) -> Result<Option<BlockNumHash>, NodeError> {
         self.history(|conn| {
             Ok(conn
@@ -694,6 +718,7 @@ impl Disk {
             match err {
                 HistoryError::Db(err) => db_error(&path, &err),
                 HistoryError::Refused(why) => NodeError::Disk(format!("{}: {why}", path.display())),
+                HistoryError::Reconcile { above } => NodeError::HistoryReconcile { above },
             }
         })
     }
@@ -1409,9 +1434,11 @@ fn clear(conn: &mut Connection) -> rusqlite::Result<Reset> {
     Ok(reset)
 }
 
-/// Why a history write failed: the database, or a write the stored history refuses.
+/// Why a history write failed: the database, a forward write that forks from the stored
+/// history, or another write the stored history refuses.
 enum HistoryError {
     Db(rusqlite::Error),
+    Reconcile { above: u64 },
     Refused(String),
 }
 
@@ -2729,12 +2756,14 @@ mod tests {
             let before = counts(&disk);
             assert!(matches!(
                 disk.record_head(at(12, 2), &chain(at(12, 2), 2, 1)),
-                Err(NodeError::Disk(_))
+                Err(NodeError::HistoryReconcile { above: 11 })
             ));
             assert_eq!(counts(&disk), before, "nothing is written");
             assert!(
-                disk.record_head(at(10, 1), &chain(at(10, 1), 2, 1))
-                    .is_err(),
+                matches!(
+                    disk.record_head(at(10, 1), &chain(at(10, 1), 2, 1)),
+                    Err(NodeError::HistoryReconcile { above: 10 })
+                ),
                 "a parent below the tip needs a reconcile too"
             );
             assert_eq!(counts(&disk), before);
@@ -2873,6 +2902,18 @@ mod tests {
             disk.record_head(at(12, 1), &chain(at(12, 1), 1, 1))
                 .unwrap();
             assert_eq!(disk.history_tip().unwrap(), Some(at(13, 1)));
+        }
+
+        #[test]
+        fn the_lowest_unsettled_block_rises_as_history_settles() {
+            let (_dir, disk) = fresh();
+            assert_eq!(disk.lowest_unsettled().unwrap(), None);
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
+            assert_eq!(disk.lowest_unsettled().unwrap(), Some(10));
+            disk.settle_history(at(11, 1)).unwrap();
+            assert_eq!(disk.lowest_unsettled().unwrap(), Some(12));
+            disk.settle_history(at(12, 1)).unwrap();
+            assert_eq!(disk.lowest_unsettled().unwrap(), None);
         }
 
         #[test]

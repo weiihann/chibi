@@ -815,7 +815,8 @@ impl From<RpcError> for ErrorObjectOwned {
                 | NodeError::TooManyMissRounds { .. }
                 | NodeError::InvalidTransaction(_)
                 | NodeError::Stopped
-                | NodeError::NotReady,
+                | NodeError::NotReady
+                | NodeError::HistoryReconcile { .. },
             )
             | RpcError::Halted(_)
             | RpcError::MissingTransaction(_) => SERVER_ERROR_CODE,

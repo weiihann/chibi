@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         watch: Watchlist {
             addresses: vec![watched],
             contracts: Vec::new(),
+            history: false,
         },
         net: NetConfig::default(),
     };

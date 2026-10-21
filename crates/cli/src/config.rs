@@ -409,6 +409,7 @@ impl Config {
             watch: Watchlist {
                 addresses: self.addresses.clone(),
                 contracts: self.contracts.clone(),
+                history: false,
             },
             net: NetConfig {
                 ports: Ports {
@@ -1009,6 +1010,7 @@ mod tests {
             Watchlist {
                 addresses: vec![ALICE],
                 contracts: config.contracts,
+                history: false,
             }
         );
     }
@@ -1155,6 +1157,7 @@ mod tests {
                 Watchlist {
                     addresses,
                     contracts: Vec::new(),
+                    history: false,
                 },
                 "{text}"
             );

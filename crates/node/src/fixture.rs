@@ -78,6 +78,8 @@ pub struct Log {
     pub most_in_flight: usize,
     /// Block bodies served.
     pub bodies: usize,
+    /// Block receipt lists served.
+    pub receipts: usize,
     /// Broadcasts, in order.
     pub broadcasts: Vec<Broadcast>,
 }
@@ -485,6 +487,7 @@ impl Peers for FixturePeers {
     }
 
     async fn receipts(&self, block: B256) -> Result<Reply<Vec<Receipt>>, NetError> {
+        self.inner.log.lock().receipts += 1;
         Self::honest(self.inner.world.lock().receipts(block))
     }
 

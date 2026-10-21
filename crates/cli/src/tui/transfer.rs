@@ -489,6 +489,7 @@ mod tests {
             &Watchlist {
                 addresses: vec![sender],
                 contracts: Vec::new(),
+                history: false,
             },
         )
         .await
