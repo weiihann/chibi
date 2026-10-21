@@ -317,6 +317,43 @@ pub struct OpenState {
     pub slots: Vec<(Address, U256, U256)>,
 }
 
+/// One page of an account's history: whole blocks, newest first, holding only what concerns
+/// the account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page {
+    /// The account the page is about.
+    pub account: Address,
+    /// The account's blocks, newest first. Each holds the account's touches, slots and
+    /// withdrawals, the transactions at its touched transaction indices, and the stored logs
+    /// of those transactions, including logs stored for another account.
+    pub blocks: Vec<BlockFacts>,
+    /// The newest known balance strictly below the page's lowest block, as
+    /// `(block number, balance)`, so the page's balance changes have a starting point: the
+    /// newer of the newest balance-bearing touch and the newest proven open state below it,
+    /// the touch when both are at one block.
+    pub opening_balance: Option<(u64, U256)>,
+    /// The cursor for the next older page: the lowest block on this page, when the account has
+    /// blocks below it.
+    pub next: Option<u64>,
+}
+
+/// What history holds for an account overall: where it is complete, how far it is final, and
+/// what the send check needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Coverage {
+    /// The account.
+    pub account: Address,
+    /// The blocks covered for each capability this version knows, by capability code.
+    pub ranges: Vec<(Capability, Ranges)>,
+    /// The highest settled block, below which history no longer changes.
+    pub settled: Option<u64>,
+    /// The proven states where forward coverage opened, oldest first.
+    pub opens: Vec<OpenState>,
+    /// The account's own stored transactions as `(block number, transaction)`, oldest first,
+    /// each with its encoding, which carries the nonce.
+    pub sends: Vec<(u64, TxRow)>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

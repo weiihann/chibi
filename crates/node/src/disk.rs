@@ -8,13 +8,17 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, Bytes, U256, hex};
-use chibi_core::history::{BlockFacts, OpenState, Ranges, ScannedBlock};
+use alloy_primitives::{Address, B256, Bytes, Log, U256, hex};
+use chibi_core::history::{
+    At, BlockFacts, BlockRow, Capability, Coverage, LogRow, OpenState, Page, Ranges, ScannedBlock,
+    SlotChange, Touch, TxRow, WithdrawalRow,
+};
 use chibi_core::state::Key;
 use parking_lot::Mutex;
 use reth_network_peers::NodeRecord;
@@ -703,7 +707,29 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
     if !path.try_exists().map_err(|err| io_error(&path, &err))? {
         return read_legacy(dir);
     }
-    let fail = |err: rusqlite::Error| match err.sqlite_error() {
+    let fail = |err: rusqlite::Error| read_error(&path, &err);
+    let mut conn = open_read_only(&path)?;
+    let tx = conn.transaction().map_err(fail)?;
+    match schema_version(&tx).map_err(fail)? {
+        0 => read_legacy(dir),
+        1..BREAKING_VERSION => load(&tx).map(Some).map_err(fail),
+        newer => Err(newer_schema(&path, newer)),
+    }
+}
+
+/// Opens the database at `path` for reading beside a running writer: read-only, so it never
+/// creates files or changes modes, and waiting for the writer's lock like the writer waits.
+fn open_read_only(path: &Path) -> Result<Connection, NodeError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags).map_err(|err| read_error(path, &err))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|err| read_error(path, &err))?;
+    Ok(conn)
+}
+
+/// A read-only connection's failure, naming the one cause a reader cannot recover from.
+fn read_error(path: &Path, err: &rusqlite::Error) -> NodeError {
+    match err.sqlite_error() {
         // A crashed writer left a hot journal, which a read-only connection cannot roll back.
         Some(failure) if failure.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {
             NodeError::Disk(format!(
@@ -711,17 +737,471 @@ pub(crate) fn read_state(dir: &Path) -> Result<Option<Saved>, NodeError> {
                 path.display()
             ))
         }
-        _ => db_error(&path, &err),
-    };
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let mut conn = Connection::open_with_flags(&path, flags).map_err(fail)?;
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
-    let tx = conn.transaction().map_err(fail)?;
-    match schema_version(&tx).map_err(fail)? {
-        0 => read_legacy(dir),
-        1..BREAKING_VERSION => load(&tx).map(Some).map_err(fail),
-        newer => Err(newer_schema(&path, newer)),
+        _ => db_error(path, err),
     }
+}
+
+/// The first schema version with the account history tables.
+const HISTORY_VERSION: i32 = 3;
+/// The highest block number SQLite can bind: stored numbers are below 2^63.
+const UNBOUNDED: u64 = i64::MAX.unsigned_abs();
+
+/// The account history in a data directory's database, read without taking the lock, beside a
+/// running writer. Each call reads in its own transaction, so a call sees one consistent state
+/// and nothing holds the database between calls.
+#[derive(Debug)]
+pub struct History {
+    conn: Connection,
+    path: PathBuf,
+}
+
+impl History {
+    /// Opens the history in `dir` read-only. `None` when there is no database yet or it
+    /// predates the history tables; an error for a schema newer than this chibi reads.
+    pub fn open(dir: &Path) -> Result<Option<History>, NodeError> {
+        let path = dir.join(DB_FILE);
+        if !path.try_exists().map_err(|err| io_error(&path, &err))? {
+            return Ok(None);
+        }
+        let conn = open_read_only(&path)?;
+        match schema_version(&conn).map_err(|err| read_error(&path, &err))? {
+            i32::MIN..HISTORY_VERSION => Ok(None),
+            HISTORY_VERSION..BREAKING_VERSION => Ok(Some(History { conn, path })),
+            newer => Err(newer_schema(&path, newer)),
+        }
+    }
+
+    /// The account's whole blocks below `before` (from the newest when `None`), newest first,
+    /// adding blocks until the page holds at least `rows` of its touches. A block is never
+    /// split, so a page may hold more.
+    pub fn page(
+        &self,
+        account: Address,
+        before: Option<u64>,
+        rows: NonZeroUsize,
+    ) -> Result<Page, NodeError> {
+        self.read(|conn| read_page(conn, account, before, rows))
+    }
+
+    /// The account's coverage per capability, the settled mark, its open states and its own
+    /// sends.
+    pub fn coverage(&self, account: Address) -> Result<Coverage, NodeError> {
+        self.read(|conn| read_coverage(conn, account))
+    }
+
+    /// Runs `read` in one deferred transaction, ended before returning.
+    fn read<R>(
+        &self,
+        read: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> Result<R, NodeError> {
+        let fail = |err: rusqlite::Error| read_error(&self.path, &err);
+        let tx = self.conn.unchecked_transaction().map_err(fail)?;
+        let result = read(&tx).map_err(fail)?;
+        tx.commit().map_err(fail)?;
+        Ok(result)
+    }
+}
+
+fn read_page(
+    conn: &Connection,
+    account: Address,
+    before: Option<u64>,
+    rows: NonZeroUsize,
+) -> rusqlite::Result<Page> {
+    let below = before.map_or(UNBOUNDED, |number| number.min(UNBOUNDED));
+    let mut numbers = Vec::new();
+    {
+        let mut select = conn.prepare_cached(
+            "SELECT number, count(*) FROM history_touch WHERE account = ?1 AND number < ?2
+             GROUP BY number ORDER BY number DESC",
+        )?;
+        let mut found = select.query(params![account.as_slice(), below])?;
+        let mut touches = 0_usize;
+        while touches < rows.get()
+            && let Some(row) = found.next()?
+        {
+            numbers.push(row.get::<_, u64>(0)?);
+            touches = touches.saturating_add(row.get(1)?);
+        }
+    }
+    let next = match numbers.last() {
+        Some(&lowest) => conn
+            .prepare_cached(
+                "SELECT 1 FROM history_touch WHERE account = ?1 AND number < ?2 LIMIT 1",
+            )?
+            .exists(params![account.as_slice(), lowest])?
+            .then_some(lowest),
+        None => None,
+    };
+    let floor = numbers.last().copied().unwrap_or(below);
+    let mut blocks = Vec::with_capacity(numbers.len());
+    for number in numbers {
+        blocks.extend(read_block(conn, account, number)?);
+    }
+    Ok(Page {
+        account,
+        blocks,
+        opening_balance: opening_balance(conn, account, floor)?,
+        next,
+    })
+}
+
+/// What block `number` holds for `account`: its touches, slots and withdrawals, the
+/// transactions at its touched indices and those transactions' stored logs.
+fn read_block(
+    conn: &Connection,
+    account: Address,
+    number: u64,
+) -> rusqlite::Result<Option<BlockFacts>> {
+    let Some(block) = parsed(
+        conn,
+        "SELECT hash, timestamp, beneficiary, base_fee, excess_blob_gas, tx_count
+         FROM history_block WHERE number = ?1",
+        [number],
+        "history_block",
+        |row| {
+            let (Some(hash), Some(beneficiary)) = (fixed::<32>(row, 0)?, fixed::<20>(row, 2)?)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(BlockRow {
+                number,
+                hash: hash.into(),
+                timestamp: row.get(1)?,
+                beneficiary: beneficiary.into(),
+                base_fee: row.get(3)?,
+                excess_blob_gas: row.get(4)?,
+                tx_count: row.get(5)?,
+            }))
+        },
+    )?
+    .pop() else {
+        warn!(target: "chibi::disk", number, "skipping history touches of a block with no block row");
+        return Ok(None);
+    };
+    let key = params![account.as_slice(), number];
+    let touches = parsed(
+        conn,
+        "SELECT access_index, balance, nonce, code FROM history_touch
+         WHERE account = ?1 AND number = ?2 ORDER BY access_index",
+        key,
+        "history_touch",
+        |row| {
+            let (Some(at), Some(balance)) = (
+                At::from_index(row.get(0)?, block.tx_count),
+                nullable::<32>(row, 1)?,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(Touch {
+                account,
+                at,
+                balance: balance.map(U256::from_be_bytes),
+                nonce: row.get(2)?,
+                code: row.get::<_, Option<Vec<u8>>>(3)?.map(Bytes::from),
+            }))
+        },
+    )?;
+    let slots = parsed(
+        conn,
+        "SELECT access_index, contract, slot, value FROM history_slot
+         WHERE account = ?1 AND number = ?2 ORDER BY access_index, contract, slot",
+        key,
+        "history_slot",
+        |row| {
+            let (Some(at), Some(contract), Some(slot), Some(value)) = (
+                At::from_index(row.get(0)?, block.tx_count),
+                fixed::<20>(row, 1)?,
+                fixed::<32>(row, 2)?,
+                fixed::<32>(row, 3)?,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(SlotChange {
+                account,
+                at,
+                contract: contract.into(),
+                slot: U256::from_be_bytes(slot),
+                value: U256::from_be_bytes(value),
+            }))
+        },
+    )?;
+    let withdrawals = parsed(
+        conn,
+        "SELECT withdrawal_index, validator, amount_gwei FROM history_withdrawal
+         WHERE address = ?1 AND number = ?2 ORDER BY withdrawal_index",
+        key,
+        "history_withdrawal",
+        |row| {
+            Ok(Some(WithdrawalRow {
+                index: row.get(0)?,
+                validator: row.get(1)?,
+                address: account,
+                amount_gwei: row.get(2)?,
+            }))
+        },
+    )?;
+    let mut txs = Vec::new();
+    let mut logs = Vec::new();
+    for touch in &touches {
+        let index = match touch.at {
+            At::Tx(index) => index,
+            At::System | At::Post => continue,
+        };
+        let Some(tx) = parsed(
+            conn,
+            "SELECT tx_index, hash, sender, raw, success, cumulative_gas, gas_used,
+             first_log_index, log_count FROM history_tx WHERE number = ?1 AND tx_index = ?2",
+            params![number, index],
+            "history_tx",
+            tx_row,
+        )?
+        .pop() else {
+            continue;
+        };
+        let end = tx
+            .first_log_index
+            .saturating_add(tx.log_count)
+            .min(UNBOUNDED);
+        logs.extend(parsed(
+            conn,
+            "SELECT log_index, address, topic0, topic1, topic2, topic3, data FROM history_log
+             WHERE number = ?1 AND log_index >= ?2 AND log_index < ?3 ORDER BY log_index",
+            params![number, tx.first_log_index, end],
+            "history_log",
+            log_row,
+        )?);
+        txs.push(tx);
+    }
+    Ok(Some(BlockFacts {
+        block,
+        txs,
+        logs,
+        touches,
+        slots,
+        withdrawals,
+    }))
+}
+
+/// The newest known balance of `account` below block `below`: the newer of its newest
+/// balance-bearing touch and its newest open state, the touch when both are at one block.
+fn opening_balance(
+    conn: &Connection,
+    account: Address,
+    below: u64,
+) -> rusqlite::Result<Option<(u64, U256)>> {
+    let key = params![account.as_slice(), below];
+    let touch = parsed(
+        conn,
+        "SELECT number, balance FROM history_touch
+         WHERE account = ?1 AND number < ?2 AND balance IS NOT NULL
+         ORDER BY number DESC, access_index DESC LIMIT 1",
+        key,
+        "history_touch",
+        number_balance,
+    )?
+    .pop();
+    let open = parsed(
+        conn,
+        "SELECT number, balance FROM history_open WHERE account = ?1 AND number < ?2
+         ORDER BY number DESC LIMIT 1",
+        key,
+        "history_open",
+        number_balance,
+    )?
+    .pop();
+    Ok(match (touch, open) {
+        (Some(touch), Some(open)) if open.0 > touch.0 => Some(open),
+        (touch, open) => touch.or(open),
+    })
+}
+
+fn read_coverage(conn: &Connection, account: Address) -> rusqlite::Result<Coverage> {
+    let mut by_code: BTreeMap<u32, (Capability, Vec<(u64, u64)>)> = BTreeMap::new();
+    {
+        let mut select = conn.prepare_cached(
+            "SELECT capability, first, last FROM history_coverage WHERE account = ?1",
+        )?;
+        let mut rows = select.query([account.as_slice()])?;
+        while let Some(row) = rows.next()? {
+            let code = u32::try_from(row.get::<_, i64>(0)?).ok();
+            // Codes this version does not know belong to a later one and are ignored.
+            let Some(capability) = code.and_then(Capability::from_code) else {
+                continue;
+            };
+            by_code
+                .entry(capability.code())
+                .or_insert_with(|| (capability, Vec::new()))
+                .1
+                .push((row.get(1)?, row.get(2)?));
+        }
+    }
+    let ranges = by_code
+        .into_values()
+        .map(|(capability, rows)| (capability, rows.into_iter().collect()))
+        .collect();
+    let mut opens = parsed(
+        conn,
+        "SELECT number, hash, balance, nonce FROM history_open WHERE account = ?1
+         ORDER BY number",
+        [account.as_slice()],
+        "history_open",
+        |row| {
+            let (Some(hash), Some(balance)) = (fixed::<32>(row, 1)?, fixed::<32>(row, 2)?) else {
+                return Ok(None);
+            };
+            Ok(Some(OpenState {
+                account,
+                number: row.get(0)?,
+                hash: hash.into(),
+                balance: U256::from_be_bytes(balance),
+                nonce: row.get(3)?,
+                slots: Vec::new(),
+            }))
+        },
+    )?;
+    for open in &mut opens {
+        open.slots = parsed(
+            conn,
+            "SELECT contract, slot, value FROM history_open_slot
+             WHERE account = ?1 AND number = ?2 ORDER BY contract, slot",
+            params![account.as_slice(), open.number],
+            "history_open_slot",
+            |row| {
+                let (Some(contract), Some(slot), Some(value)) = (
+                    fixed::<20>(row, 0)?,
+                    fixed::<32>(row, 1)?,
+                    fixed::<32>(row, 2)?,
+                ) else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    contract.into(),
+                    U256::from_be_bytes(slot),
+                    U256::from_be_bytes(value),
+                )))
+            },
+        )?;
+    }
+    let sends = parsed(
+        conn,
+        "SELECT tx_index, hash, sender, raw, success, cumulative_gas, gas_used,
+         first_log_index, log_count, number FROM history_tx WHERE sender = ?1
+         ORDER BY number, tx_index",
+        [account.as_slice()],
+        "history_tx",
+        |row| {
+            let Some(tx) = tx_row(row)? else {
+                return Ok(None);
+            };
+            Ok(Some((row.get(9)?, tx)))
+        },
+    )?;
+    Ok(Coverage {
+        account,
+        ranges,
+        settled: settled(conn)?.map(|mark| mark.number),
+        opens,
+        sends,
+    })
+}
+
+/// Runs `sql` and keeps the rows `parse` reads, warning about each row it cannot: a stored
+/// value of the wrong shape loses that row, not the whole read.
+fn parsed<T>(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    table: &'static str,
+    mut parse: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Option<T>>,
+) -> rusqlite::Result<Vec<T>> {
+    let mut select = conn.prepare_cached(sql)?;
+    let mut rows = select.query(params)?;
+    let mut parsed = Vec::new();
+    while let Some(row) = rows.next()? {
+        match parse(row)? {
+            Some(value) => parsed.push(value),
+            None => {
+                warn!(target: "chibi::disk", table, "skipping a history row that does not parse")
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// Column `column` as a blob of exactly `N` bytes, `None` for any other value.
+fn fixed<const N: usize>(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<[u8; N]>> {
+    Ok(row
+        .get_ref(column)?
+        .as_blob()
+        .ok()
+        .and_then(|blob| blob.try_into().ok()))
+}
+
+/// Column `column` as NULL or a blob of exactly `N` bytes, `None` for any other value.
+fn nullable<const N: usize>(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<Option<[u8; N]>>> {
+    Ok(match row.get_ref(column)?.as_blob_or_null() {
+        Ok(None) => Some(None),
+        Ok(Some(blob)) => <[u8; N]>::try_from(blob).ok().map(Some),
+        Err(_) => None,
+    })
+}
+
+fn number_balance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<(u64, U256)>> {
+    let Some(balance) = fixed::<32>(row, 1)? else {
+        return Ok(None);
+    };
+    Ok(Some((row.get(0)?, U256::from_be_bytes(balance))))
+}
+
+/// A `history_tx` row selected as `tx_index, hash, sender, raw, success, cumulative_gas,
+/// gas_used, first_log_index, log_count`.
+fn tx_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<TxRow>> {
+    let (Some(hash), Some(sender)) = (fixed::<32>(row, 1)?, fixed::<20>(row, 2)?) else {
+        return Ok(None);
+    };
+    Ok(Some(TxRow {
+        index: row.get(0)?,
+        hash: hash.into(),
+        sender: sender.into(),
+        raw: row.get::<_, Option<Vec<u8>>>(3)?.map(Bytes::from),
+        success: row.get(4)?,
+        cumulative_gas: row.get(5)?,
+        gas_used: row.get(6)?,
+        first_log_index: row.get(7)?,
+        log_count: row.get(8)?,
+    }))
+}
+
+/// A `history_log` row selected as `log_index, address, topic0, topic1, topic2, topic3, data`.
+/// Topics are stored from topic0 up, so a topic after a missing one is malformed.
+fn log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<LogRow>> {
+    let Some(address) = fixed::<20>(row, 1)? else {
+        return Ok(None);
+    };
+    let mut topics = Vec::with_capacity(4);
+    let mut ended = false;
+    for column in 2..6 {
+        match nullable::<32>(row, column)? {
+            Some(None) => ended = true,
+            Some(Some(topic)) if !ended => topics.push(B256::from(topic)),
+            Some(Some(_)) | None => return Ok(None),
+        }
+    }
+    Ok(Some(LogRow {
+        index: row.get(0)?,
+        log: Log::new_unchecked(
+            address.into(),
+            topics,
+            Bytes::from(row.get::<_, Vec<u8>>(6)?),
+        ),
+    }))
 }
 
 /// Opens the writer's connection to `dir`'s database. A new database is owner-only and gets
@@ -2015,11 +2495,12 @@ mod tests {
 
     mod history {
         use std::collections::BTreeMap;
+        use std::num::NonZeroUsize;
 
         use alloy_primitives::{Log, TxHash};
         use chibi_core::history::{
-            At, BlockFacts, BlockRow, Capability, LogRow, OpenState, ScannedBlock, SlotChange,
-            Touch, TxRow, WithdrawalRow,
+            At, BlockFacts, BlockRow, Capability, LogRow, OpenState, Page, Ranges, ScannedBlock,
+            SlotChange, Touch, TxRow, WithdrawalRow,
         };
 
         use super::*;
@@ -2551,6 +3032,273 @@ mod tests {
             let counts = counts(&disk);
             assert_eq!(counts[4], ("history_open", 1));
             assert_eq!(counts[5], ("history_open_slot", 2));
+        }
+
+        fn page(history: &History, account: Address, before: Option<u64>, rows: usize) -> Page {
+            history
+                .page(account, before, NonZeroUsize::new(rows).unwrap())
+                .unwrap()
+        }
+
+        fn block_numbers(page: &Page) -> Vec<u64> {
+            page.blocks.iter().map(|facts| facts.block.number).collect()
+        }
+
+        fn reader(dir: &tempfile::TempDir) -> History {
+            History::open(dir.path()).unwrap().unwrap()
+        }
+
+        #[test]
+        fn the_reader_opens_nothing_before_version_3_and_reads_beside_a_writer() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(History::open(dir.path()).unwrap().is_none(), "no database");
+            {
+                let disk = Disk::open(dir.path()).unwrap();
+                disk.record_head(at(9, 1), &chain(at(9, 1), 1, 2)).unwrap();
+                let history = reader(&dir);
+                assert_eq!(block_numbers(&page(&history, alice(), None, 5)), [11, 10]);
+                disk.record_head(at(11, 1), &chain(at(11, 1), 1, 1))
+                    .unwrap();
+                assert_eq!(
+                    block_numbers(&page(&history, alice(), None, 5)),
+                    [12, 11, 10]
+                );
+            }
+            set_version(dir.path(), 100);
+            assert!(History::open(dir.path()).is_err(), "a breaking version");
+            downgrade(dir.path(), 2);
+            assert!(History::open(dir.path()).unwrap().is_none(), "version 2");
+        }
+
+        #[test]
+        fn a_page_holds_whole_blocks_newest_first_and_next_pages_to_the_end() {
+            let (dir, disk) = fresh();
+            let mut step = chain(at(9, 1), 1, 5);
+            step[3].facts.as_mut().unwrap().touches.push(Touch {
+                account: alice(),
+                at: At::Post,
+                balance: Some(U256::from(99)),
+                nonce: None,
+                code: None,
+            });
+            disk.record_head(at(9, 1), &step).unwrap();
+            let history = reader(&dir);
+
+            let first = page(&history, alice(), None, 2);
+            assert_eq!(first.account, alice());
+            assert_eq!(block_numbers(&first), [14, 13]);
+            assert_eq!(first.blocks[1].touches.len(), 2, "block 13 is never split");
+            assert_eq!(first.next, Some(13));
+            let second = page(&history, alice(), first.next, 2);
+            assert_eq!(block_numbers(&second), [12, 11]);
+            assert_eq!(second.next, Some(11));
+            let last = page(&history, alice(), second.next, 2);
+            assert_eq!(last.blocks, [facts(10, hash(10, 1))]);
+            assert_eq!(last.next, None);
+            assert_eq!(page(&history, bob(), None, 2).blocks, []);
+        }
+
+        #[test]
+        fn two_accounts_sharing_a_tx_each_see_it_and_only_their_own_other_txs() {
+            let (dir, disk) = fresh();
+            let block_hash = hash(10, 1);
+            let mut facts = facts(10, block_hash);
+            facts.block.tx_count = 2;
+            facts.txs[0].log_count = 2;
+            let bob_log = |index: u64| LogRow {
+                index,
+                log: Log::new_unchecked(
+                    token(),
+                    vec![B256::repeat_byte(0xdd), bob().into_word()],
+                    Bytes::from_static(&[2]),
+                ),
+            };
+            facts.logs.push(bob_log(1));
+            facts.logs.push(bob_log(2));
+            facts.txs.push(TxRow {
+                index: 1,
+                hash: B256::repeat_byte(0x11),
+                sender: token(),
+                raw: None,
+                success: true,
+                cumulative_gas: 70_000,
+                gas_used: 49_000,
+                first_log_index: 2,
+                log_count: 1,
+            });
+            for index in [0, 1] {
+                facts.touches.push(Touch {
+                    account: bob(),
+                    at: At::Tx(index),
+                    balance: None,
+                    nonce: None,
+                    code: None,
+                });
+            }
+            let block = ScannedBlock {
+                number: 10,
+                hash: block_hash,
+                parent_hash: hash(9, 1),
+                accounts: vec![alice(), bob()],
+                capabilities: vec![Capability::Bal, Capability::Logs],
+                facts: Some(facts.clone()),
+            };
+            disk.record_head(at(9, 1), &[block]).unwrap();
+            let history = reader(&dir);
+
+            let alices = page(&history, alice(), None, 1);
+            let [alices] = &alices.blocks[..] else {
+                panic!("{alices:?}")
+            };
+            assert_eq!(alices.block, facts.block);
+            assert_eq!(alices.txs, facts.txs[..1]);
+            assert_eq!(
+                alices.logs,
+                facts.logs[..2],
+                "bob's log under the shared tx"
+            );
+            assert_eq!(alices.touches, facts.touches[..1]);
+            assert_eq!(alices.slots, facts.slots);
+            assert_eq!(alices.withdrawals, facts.withdrawals);
+
+            let bobs = page(&history, bob(), None, 1);
+            let [bobs] = &bobs.blocks[..] else {
+                panic!("{bobs:?}")
+            };
+            assert_eq!(bobs.txs, facts.txs);
+            assert_eq!(bobs.logs, facts.logs);
+            assert_eq!(bobs.touches, facts.touches[1..]);
+            assert_eq!(bobs.slots, []);
+            assert_eq!(bobs.withdrawals, []);
+        }
+
+        #[test]
+        fn the_opening_balance_is_the_newest_touch_balance_below_else_the_open_state() {
+            let (dir, disk) = fresh();
+            disk.open_history(&OpenState {
+                account: alice(),
+                number: 9,
+                hash: hash(9, 1),
+                balance: U256::from(1_000),
+                nonce: 4,
+                slots: vec![],
+            })
+            .unwrap();
+            let mut step = chain(at(9, 1), 1, 3);
+            step[1].facts.as_mut().unwrap().touches[0].balance = None;
+            disk.record_head(at(9, 1), &step).unwrap();
+            let history = reader(&dir);
+
+            let newest = page(&history, alice(), None, 1);
+            assert_eq!(block_numbers(&newest), [12]);
+            assert_eq!(newest.opening_balance, Some((10, U256::from(10))));
+            let middle = page(&history, alice(), newest.next, 1);
+            assert_eq!(middle.opening_balance, Some((10, U256::from(10))));
+            let oldest = page(&history, alice(), middle.next, 1);
+            assert_eq!(block_numbers(&oldest), [10]);
+            assert_eq!(oldest.opening_balance, Some((9, U256::from(1_000))));
+        }
+
+        #[test]
+        fn rows_that_do_not_parse_are_skipped() {
+            let (dir, disk) = fresh();
+            disk.record_head(at(9, 1), &chain(at(9, 1), 1, 1)).unwrap();
+            disk.db
+                .lock()
+                .conn
+                .execute(
+                    "INSERT INTO history_touch (account, number, access_index) VALUES (?1, 10, 9)",
+                    [alice().as_slice()],
+                )
+                .unwrap();
+            let history = reader(&dir);
+            assert_eq!(
+                page(&history, alice(), None, 1).blocks,
+                [facts(10, hash(10, 1))]
+            );
+        }
+
+        #[test]
+        fn coverage_lists_known_ranges_the_settled_mark_opens_and_own_sends_in_order() {
+            let (dir, disk) = fresh();
+            let mut step = chain(at(9, 1), 1, 3);
+            let facts = step[1].facts.as_mut().unwrap();
+            facts.block.tx_count = 2;
+            facts.txs.push(TxRow {
+                index: 1,
+                hash: B256::repeat_byte(0x22),
+                sender: bob(),
+                raw: Some(Bytes::from_static(&[2, 2])),
+                success: true,
+                cumulative_gas: 42_000,
+                gas_used: 21_000,
+                first_log_index: 1,
+                log_count: 0,
+            });
+            facts.touches.push(Touch {
+                account: bob(),
+                at: At::Tx(1),
+                balance: None,
+                nonce: Some(1),
+                code: None,
+            });
+            step[1].accounts.push(bob());
+            disk.record_head(at(9, 1), &step).unwrap();
+            disk.settle_history(at(11, 1)).unwrap();
+            disk.augment_history(&[backward(5, 1)], None).unwrap();
+            disk.record_head(at(20, 1), &chain(at(20, 1), 1, 2))
+                .unwrap();
+            let open = |number: u64, slots| OpenState {
+                account: alice(),
+                number,
+                hash: hash(number, 1),
+                balance: U256::from(number * 100),
+                nonce: number,
+                slots,
+            };
+            let opens = [
+                open(9, vec![(token(), U256::from(3), U256::from(50))]),
+                open(20, vec![]),
+            ];
+            for state in opens.iter().rev() {
+                disk.open_history(state).unwrap();
+            }
+            disk.open_history(&OpenState {
+                account: bob(),
+                ..open(9, vec![])
+            })
+            .unwrap();
+            disk.db
+                .lock()
+                .conn
+                .execute(
+                    "INSERT INTO history_coverage (account, capability, first, last)
+                     VALUES (?1, 7, 1, 2)",
+                    [alice().as_slice()],
+                )
+                .unwrap();
+
+            let coverage = reader(&dir).coverage(alice()).unwrap();
+            assert_eq!(coverage.account, alice());
+            assert_eq!(
+                coverage.ranges,
+                [
+                    (Capability::Bal, Ranges::from_iter([(10, 12), (21, 22)])),
+                    (
+                        Capability::Logs,
+                        Ranges::from_iter([(5, 5), (10, 12), (21, 22)])
+                    ),
+                ]
+            );
+            assert_eq!(coverage.settled, Some(11));
+            assert_eq!(coverage.opens, opens);
+            let sends: Vec<_> = coverage
+                .sends
+                .iter()
+                .map(|(number, tx)| (*number, tx.index, tx.sender, tx.raw.clone()))
+                .collect();
+            let own = |number| (number, 0, alice(), Some(Bytes::from_static(&[2, 1])));
+            assert_eq!(sends, [own(5), own(10), own(11), own(12), own(21), own(22)]);
         }
     }
 }

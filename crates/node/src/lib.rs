@@ -18,7 +18,7 @@ mod tests;
 
 pub use beacon::{Beacon, BeaconConfig, BeaconError};
 pub use devp2p::{Devp2p, Devp2pError, HeadHint, NetConfig, NodeRecord, Ports};
-pub use disk::Disk;
+pub use disk::{Disk, History};
 pub use heads::{Heads, HeadsSender};
 pub use network::{Explorer, Network, NetworkSpec, Token};
 pub use node::{
