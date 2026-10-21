@@ -1997,32 +1997,42 @@ fn payment_tx(nonce: u64) -> Transaction {
     chibi_core::testing::signed_transfer(PAYER_KEY, 1, nonce, ALICE, eth(1))
 }
 
-fn payment_log() -> EvmLog {
+/// The EIP-7708 log of an ether paid to `to`.
+fn transfer_log(to: Address) -> EvmLog {
     EvmLog::new_unchecked(
         ETH_LOGS,
         vec![
             keccak256("Transfer(address,address,uint256)"),
             key_address(PAYER_KEY).into_word(),
-            ALICE.into_word(),
+            to.into_word(),
         ],
         Bytes::from(eth(1).to_be_bytes::<32>().to_vec()),
     )
 }
 
-/// A block whose one transaction pays ALICE an ether: her credit sits at the transaction's
+fn payment_log() -> EvmLog {
+    transfer_log(ALICE)
+}
+
+/// A block whose one transaction pays `to` an ether: its credit sits at the transaction's
 /// block access index, and the receipt carries the EIP-7708 log.
-fn payment(nonce: u64, alice_after: U256) -> BlockWrites {
+fn transfer(to: Address, nonce: u64, to_after: U256) -> BlockWrites {
     BlockWrites::default()
         .tx_with(
-            payment_tx(nonce),
+            chibi_core::testing::signed_transfer(PAYER_KEY, 1, nonce, to, eth(1)),
             Outcome {
                 success: true,
                 gas_used: 21_000,
-                logs: vec![payment_log()],
+                logs: vec![transfer_log(to)],
             },
         )
         .at(1)
-        .balance(ALICE, alice_after)
+        .balance(to, to_after)
+}
+
+/// A block whose one transaction pays ALICE an ether.
+fn payment(nonce: u64, alice_after: U256) -> BlockWrites {
+    transfer(ALICE, nonce, alice_after)
 }
 
 fn history(dir: &Path) -> History {
@@ -2301,4 +2311,184 @@ async fn a_restart_after_a_fork_retracts_only_the_orphaned_block() {
 
     assert_eq!(recorded_blocks(dir.path(), ALICE), [first]);
     assert_eq!(covered(dir.path(), ALICE), both(&[(first, first)]));
+}
+
+fn number(fixture: &Fixture, hash: B256) -> u64 {
+    fixture.world(|w| w.verified(hash)).number()
+}
+
+fn genesis_number(fixture: &Fixture) -> u64 {
+    fixture.world(|w| w.verified(w.head())).number()
+}
+
+/// Starts at the chain's head with history on for ALICE, follows one empty block and
+/// finalizes it. The step that settles history there also takes the backward walk's first
+/// step. Returns the settled block's number.
+async fn settle_after_start(
+    fixture: &Fixture,
+    dir: &Path,
+) -> (Node<FixturePeers>, Follower<FixturePeers>, u64) {
+    let (node, mut follower) = start_with(fixture, dir, &[], &history_watch(&[ALICE])).await;
+    let settled = fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    fixture.finalize(settled);
+    assert_eq!(follower.step().await.unwrap(), Stepped::Current);
+    (node, follower, number(fixture, settled))
+}
+
+fn logs_only(bal: &[(u64, u64)], logs: &[(u64, u64)]) -> Vec<(Capability, Vec<(u64, u64)>)> {
+    vec![
+        (Capability::Bal, bal.to_vec()),
+        (Capability::Logs, logs.to_vec()),
+    ]
+}
+
+#[tokio::test]
+async fn once_history_settles_the_walk_back_records_an_older_payment_with_logs_coverage_only() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let genesis = genesis_number(&fixture);
+    let paid = fixture.mine(payment(0, eth(3)));
+    let paid = number(&fixture, paid);
+    fixture.mine(BlockWrites::default());
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, _follower, settled) = settle_after_start(&fixture, dir.path()).await;
+
+    let page = history(dir.path())
+        .page(ALICE, None, NonZeroUsize::new(10).unwrap())
+        .unwrap();
+    assert_eq!(page.blocks.len(), 1);
+    let facts = &page.blocks[0];
+    assert_eq!(facts.block.number, paid);
+    assert_eq!(
+        facts.txs,
+        [TxRow {
+            index: 0,
+            hash: *payment_tx(0).tx_hash(),
+            sender: key_address(PAYER_KEY),
+            raw: Some(Bytes::from(payment_tx(0).encoded_2718())),
+            success: true,
+            cumulative_gas: 21_000,
+            gas_used: 21_000,
+            first_log_index: 0,
+            log_count: 1,
+        }]
+    );
+    assert_eq!(
+        facts.logs,
+        [LogRow {
+            index: 0,
+            log: payment_log(),
+        }]
+    );
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        logs_only(&[(settled, settled)], &[(genesis, settled)])
+    );
+    assert_eq!((fixture.log().bodies, fixture.log().receipts), (1, 1));
+}
+
+#[tokio::test]
+async fn the_walk_back_stops_at_the_first_header_without_a_bal_hash() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    fixture.mine_without_bal(payment(0, eth(3)));
+    let floor = fixture.mine_without_bal(BlockWrites::default());
+    let floor = number(&fixture, floor);
+    let paid = fixture.mine(payment(1, eth(4)));
+    let paid = number(&fixture, paid);
+    fixture.mine(BlockWrites::default());
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower, settled) = settle_after_start(&fixture, dir.path()).await;
+    follower.step().await.unwrap();
+    follower.step().await.unwrap();
+
+    assert_eq!(recorded_blocks(dir.path(), ALICE), [paid]);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        logs_only(&[(settled, settled)], &[(floor + 1, settled)])
+    );
+    assert_eq!((fixture.log().bodies, fixture.log().receipts), (1, 1));
+}
+
+#[tokio::test]
+async fn a_block_whose_bloom_cannot_name_a_watched_account_is_covered_without_its_contents() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let genesis = genesis_number(&fixture);
+    fixture.mine(transfer(BOB, 0, eth(1)));
+    fixture.mine(BlockWrites::default());
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, _follower, settled) = settle_after_start(&fixture, dir.path()).await;
+
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        logs_only(&[(settled, settled)], &[(genesis, settled)])
+    );
+    assert_eq!((fixture.log().bodies, fixture.log().receipts), (0, 0));
+}
+
+#[tokio::test]
+async fn receipts_no_peer_has_leave_their_block_a_gap_after_three_steps_and_the_walk_goes_on() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let genesis = genesis_number(&fixture);
+    fixture.mine(BlockWrites::default());
+    let paid = fixture.mine(payment(0, eth(3)));
+    let paid = number(&fixture, paid);
+    fixture.mine(BlockWrites::default());
+    fixture.fault(Fault::EmptyReceipts);
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower, settled) = settle_after_start(&fixture, dir.path()).await;
+
+    let gap = logs_only(
+        &[(settled, settled)],
+        &[(genesis, paid - 1), (paid + 1, settled)],
+    );
+    assert_eq!(covered(dir.path(), ALICE), gap);
+    assert_eq!(fixture.log().receipts, 3, "one fetch, three attempts");
+    follower.step().await.unwrap();
+    follower.step().await.unwrap();
+    assert_eq!(fixture.log().receipts, 9, "retried on each of three steps");
+
+    fixture.heal();
+    follower.step().await.unwrap();
+    assert_eq!(fixture.log().receipts, 9, "left behind after three steps");
+    assert_eq!(covered(dir.path(), ALICE), gap);
+    assert_eq!(recorded_blocks(dir.path(), ALICE), Vec::<u64>::new());
+    assert_eq!(fixture.log().penalized, Vec::new());
+}
+
+#[tokio::test]
+async fn a_walk_longer_than_one_steps_budget_spans_steps_while_forward_recording_goes_on() {
+    let fixture = Fixture::genesis([(ALICE, WorldAccount::eoa(eth(2)))]);
+    let genesis = genesis_number(&fixture);
+    let paid: Vec<u64> = (0..20)
+        .map(|nonce| number(&fixture, fixture.mine(payment(nonce, eth(3 + nonce)))))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, mut follower) =
+        start_with(&fixture, dir.path(), &[], &history_watch(&[ALICE])).await;
+    let settled = fixture.mine(BlockWrites::default());
+    follower.step().await.unwrap();
+    fixture.finalize(settled);
+    let settled = number(&fixture, settled);
+    let newest_first = |blocks: &[u64]| blocks.iter().rev().copied().collect::<Vec<_>>();
+
+    let first = number(&fixture, fixture.mine(payment(20, eth(23))));
+    follower.step().await.unwrap();
+    let mut expected = newest_first(&paid[4..]);
+    expected.insert(0, first);
+    assert_eq!(
+        recorded_blocks(dir.path(), ALICE),
+        expected,
+        "the new block and sixteen older blocks' contents"
+    );
+
+    let second = number(&fixture, fixture.mine(payment(21, eth(24))));
+    follower.step().await.unwrap();
+    let mut expected = newest_first(&paid);
+    expected.splice(0..0, [second, first]);
+    assert_eq!(recorded_blocks(dir.path(), ALICE), expected);
+    assert_eq!(
+        covered(dir.path(), ALICE),
+        logs_only(&[(settled, second)], &[(genesis, second)])
+    );
 }

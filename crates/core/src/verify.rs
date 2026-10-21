@@ -548,11 +548,18 @@ impl VerifiedReceipts {
 }
 
 /// Checks eth/69 receipts against `header`. Blooms are recomputed because eth/69 carries none.
+///
+/// An empty list for a block whose receipts root is not the empty-trie root is how a peer
+/// answers for a block it lacks, reported as [`VerifyError::ReceiptsUnavailable`], which
+/// blames nobody. An empty list for an empty block is its true receipts.
 pub fn receipts(
     header: VerifiedHeader,
     receipts: Vec<wire::Receipt>,
 ) -> Result<VerifiedReceipts, VerifyError> {
     let block = header.hash();
+    if receipts.is_empty() && header.header().receipts_root != EMPTY_ROOT_HASH {
+        return Err(VerifyError::ReceiptsUnavailable { block });
+    }
     if wire::Receipt::calculate_receipt_root_no_memo(&receipts) != header.header().receipts_root {
         return Err(VerifyError::Root {
             block,
@@ -660,6 +667,12 @@ pub enum VerifyError {
         /// Block hash.
         block: B256,
     },
+    /// The peer answered an empty receipt list for a block that has receipts.
+    #[error("peer has no receipts for {block}")]
+    ReceiptsUnavailable {
+        /// Block hash.
+        block: B256,
+    },
     /// The block access list does not hash to the header's commitment.
     #[error("block access list hashes to {got}, expected {expected}")]
     BalHash {
@@ -689,6 +702,7 @@ impl VerifyError {
             Self::RootUnavailable { .. }
             | Self::CodeUnavailable { .. }
             | Self::BalUnavailable { .. }
+            | Self::ReceiptsUnavailable { .. }
             | Self::NoBalHash { .. }
             | Self::ChainBreak { .. } => false,
             Self::HeaderHash { .. }
@@ -1004,5 +1018,19 @@ mod tests {
                 part: BlockPart::Receipts
             }
         );
+    }
+
+    #[test]
+    fn an_empty_receipt_list_is_unavailable_under_a_non_empty_root_and_valid_for_an_empty_block() {
+        let mut world = world();
+        let tx = crate::testing::legacy_transfer(7, NOBODY, eth(1));
+        let full = world.mine(BlockWrites::default().tx(tx, 21_000, 2));
+        let error = super::receipts(world.verified(full), Vec::new()).unwrap_err();
+        assert_eq!(error, VerifyError::ReceiptsUnavailable { block: full });
+        assert!(!error.blames_peer());
+
+        let empty = world.mine(BlockWrites::default());
+        let verified = super::receipts(world.verified(empty), Vec::new()).unwrap();
+        assert!(verified.receipts().is_empty());
     }
 }

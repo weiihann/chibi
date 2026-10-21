@@ -43,6 +43,9 @@ pub enum Fault {
     WithholdBals,
     /// Body requests fail.
     WithholdBodies,
+    /// Receipt requests get an empty list: for a block with transactions, the answer of a peer
+    /// that lacks them.
+    EmptyReceipts,
     /// The next account reply for this address claims this balance, sent by [`LIAR`].
     LieAboutBalance(Address, U256),
     /// The census counts no state peer.
@@ -100,6 +103,7 @@ struct Faults {
     withheld_slots: HashSet<(B256, B256)>,
     withhold_bals: bool,
     withhold_bodies: bool,
+    empty_receipts: bool,
     lie: Option<(B256, U256)>,
     no_state_peers: bool,
     rejected_headers: u32,
@@ -238,6 +242,7 @@ impl Fixture {
             }
             Fault::WithholdBals => faults.withhold_bals = true,
             Fault::WithholdBodies => faults.withhold_bodies = true,
+            Fault::EmptyReceipts => faults.empty_receipts = true,
             Fault::NoStatePeers => faults.no_state_peers = true,
             Fault::RejectHeaders(count) => faults.rejected_headers = count,
             Fault::StopHeaders => faults.stop_headers = true,
@@ -488,6 +493,9 @@ impl Peers for FixturePeers {
 
     async fn receipts(&self, block: B256) -> Result<Reply<Vec<Receipt>>, NetError> {
         self.inner.log.lock().receipts += 1;
+        if self.inner.faults.lock().empty_receipts {
+            return Self::honest(Vec::new());
+        }
         Self::honest(self.inner.world.lock().receipts(block))
     }
 

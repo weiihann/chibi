@@ -70,7 +70,8 @@ CREATE TABLE keys (
 );
 ";
 /// What version 3 adds: the account history, permanent across resets. Each later version
-/// only adds tables or columns.
+/// only adds tables or columns. `history_backfill` is reserved and unused: the backward walk
+/// restarts from a verified anchor instead of resuming from a hash read off disk.
 const SCHEMA_V3: &str = "
 CREATE TABLE history_block (
     number INTEGER PRIMARY KEY, hash BLOB NOT NULL CHECK (length(hash) = 32),
@@ -473,17 +474,29 @@ impl Disk {
 /// Account history writes. Each is one transaction on the writer's connection, so a failed
 /// write leaves nothing behind. Blocks on fsync; call them off the async workers.
 impl Disk {
-    /// The highest block history holds on the followed chain: the newest unsettled block, else
-    /// the settled mark. `None` before history records anything.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only tests read the tip until the backward walk lands"
-        )
-    )]
-    pub(crate) fn history_tip(&self) -> Result<Option<BlockNumHash>, NodeError> {
-        self.history(|conn| Ok(history_tip(conn)?))
+    /// The settled mark's height: history at or below it no longer changes. `None` before
+    /// history settles.
+    pub(crate) fn history_settled(&self) -> Result<Option<u64>, NodeError> {
+        self.history(|conn| Ok(settled(conn)?.map(|mark| mark.number)))
+    }
+
+    /// The blocks covered for `account` with `capability`.
+    pub(crate) fn history_ranges(
+        &self,
+        account: Address,
+        capability: Capability,
+    ) -> Result<Ranges, NodeError> {
+        self.history(|conn| {
+            let mut select = conn.prepare_cached(
+                "SELECT first, last FROM history_coverage WHERE account = ?1 AND capability = ?2",
+            )?;
+            let ranges = select
+                .query_map(params![account.as_slice(), capability.code()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<rusqlite::Result<Ranges>>()?;
+            Ok(ranges)
+        })
     }
 
     /// The lowest block a reconcile may still retract: the oldest unsettled block. `None` when
@@ -601,20 +614,10 @@ impl Disk {
     }
 
     /// Adds blocks at or below the settled mark: the backward walk and supplements. Facts
-    /// already stored are kept, coverage only grows, and a block whose hash differs from the
-    /// one stored at its height is refused. Saves `cursor` as the backward walk's resume point.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the backward walk that calls this lands in a later unit"
-        )
-    )]
-    pub(crate) fn augment_history(
-        &self,
-        blocks: &[ScannedBlock],
-        cursor: Option<BlockNumHash>,
-    ) -> Result<(), NodeError> {
+    /// already stored are kept, except that a transaction stored without its bytes gets them
+    /// once it is found to be an account's own. Coverage only grows, and a block whose hash
+    /// differs from the one stored at its height is refused.
+    pub(crate) fn augment_history(&self, blocks: &[ScannedBlock]) -> Result<(), NodeError> {
         self.history(|conn| {
             let settled = settled(conn)?;
             for block in blocks {
@@ -648,30 +651,7 @@ impl Disk {
                 }
             }
             union_coverage(conn, blocks)?;
-            if let Some(cursor) = cursor {
-                conn.execute(
-                    "INSERT INTO history_backfill (id, number, hash) VALUES (0, ?1, ?2)
-                     ON CONFLICT (id) DO UPDATE SET number = excluded.number, hash = excluded.hash",
-                    params![cursor.number, cursor.hash.as_slice()],
-                )?;
-            }
             Ok(())
-        })
-    }
-
-    /// Where the backward walk resumes: the lowest block it scanned. `None` before it starts.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the backward walk that calls this lands in a later unit"
-        )
-    )]
-    pub(crate) fn backfill_cursor(&self) -> Result<Option<BlockNumHash>, NodeError> {
-        self.history(|conn| {
-            Ok(conn
-                .query_row("SELECT number, hash FROM history_backfill", [], num_hash)
-                .optional()?)
         })
     }
 
@@ -1561,7 +1541,7 @@ struct FactSql {
 }
 
 macro_rules! fact_sql {
-    ($insert:literal) => {
+    ($insert:literal, $tx_insert:literal, $tx_conflict:literal) => {
         FactSql {
             block: concat!(
                 $insert,
@@ -1569,10 +1549,11 @@ macro_rules! fact_sql {
                  excess_blob_gas, tx_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             ),
             tx: concat!(
-                $insert,
+                $tx_insert,
                 " INTO history_tx (number, tx_index, hash, sender, raw, success, cumulative_gas,
                  gas_used, first_log_index, log_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                $tx_conflict
             ),
             log: concat!(
                 $insert,
@@ -1599,9 +1580,14 @@ macro_rules! fact_sql {
 }
 
 /// Forward writes: blocks above the tip hold no facts yet, so a conflict is a bug to surface.
-const RECORD: FactSql = fact_sql!("INSERT");
-/// Backward writes and supplements keep the facts already stored.
-const AUGMENT: FactSql = fact_sql!("INSERT OR IGNORE");
+const RECORD: FactSql = fact_sql!("INSERT", "INSERT", "");
+/// Backward writes and supplements keep the facts already stored. A transaction first stored
+/// for an account it only mentions has no bytes; storing it as another account's own adds them.
+const AUGMENT: FactSql = fact_sql!(
+    "INSERT OR IGNORE",
+    "INSERT",
+    " ON CONFLICT DO UPDATE SET raw = COALESCE(history_tx.raw, excluded.raw)"
+);
 
 fn insert_facts(conn: &Connection, facts: &BlockFacts, sql: &FactSql) -> rusqlite::Result<()> {
     let block = &facts.block;
@@ -2704,6 +2690,10 @@ mod tests {
             settled(&disk.db.lock().conn).unwrap()
         }
 
+        fn tip(disk: &Disk) -> Option<BlockNumHash> {
+            history_tip(&disk.db.lock().conn).unwrap()
+        }
+
         fn fresh() -> (tempfile::TempDir, Disk) {
             let dir = tempfile::tempdir().unwrap();
             let disk = Disk::open(dir.path()).unwrap();
@@ -2735,7 +2725,7 @@ mod tests {
             );
             disk.record_head(at(9, 1), &step).unwrap();
             assert_eq!(counts(&disk), once);
-            assert_eq!(disk.history_tip().unwrap(), Some(at(12, 1)));
+            assert_eq!(tip(&disk), Some(at(12, 1)));
         }
 
         #[test]
@@ -2767,7 +2757,7 @@ mod tests {
                 "a parent below the tip needs a reconcile too"
             );
             assert_eq!(counts(&disk), before);
-            assert_eq!(disk.history_tip().unwrap(), Some(at(12, 1)));
+            assert_eq!(tip(&disk), Some(at(12, 1)));
         }
 
         #[test]
@@ -2777,7 +2767,7 @@ mod tests {
             step[1].parent_hash = hash(10, 2);
             assert!(disk.record_head(at(9, 1), &step).is_err());
             assert!(disk.record_head(at(8, 1), &chain(at(9, 1), 1, 2)).is_err());
-            assert_eq!(disk.history_tip().unwrap(), None);
+            assert_eq!(tip(&disk), None);
         }
 
         #[test]
@@ -2786,7 +2776,7 @@ mod tests {
             disk.record_head(at(9, 1), &chain(at(9, 1), 1, 2)).unwrap();
             disk.record_head(at(20, 1), &chain(at(20, 1), 1, 2))
                 .unwrap();
-            assert_eq!(disk.history_tip().unwrap(), Some(at(22, 1)));
+            assert_eq!(tip(&disk), Some(at(22, 1)));
             assert_eq!(
                 coverage(&disk, alice(), Capability::Bal),
                 [(10, 11), (21, 22)]
@@ -2833,7 +2823,7 @@ mod tests {
             assert_eq!(coverage(&disk, alice(), Capability::Logs), [(10, 12)]);
             disk.record_head(at(12, 1), &chain(at(12, 1), 2, 2))
                 .unwrap();
-            assert_eq!(disk.history_tip().unwrap(), Some(at(14, 2)));
+            assert_eq!(tip(&disk), Some(at(14, 2)));
         }
 
         #[test]
@@ -2841,7 +2831,7 @@ mod tests {
             let (_dir, disk) = fresh();
             disk.record_head(at(9, 1), &chain(at(9, 1), 1, 5)).unwrap();
             disk.settle_history(at(11, 1)).unwrap();
-            disk.augment_history(&[backward(5, 1)], None).unwrap();
+            disk.augment_history(&[backward(5, 1)]).unwrap();
             let ancestry = BTreeMap::from([(13, hash(13, 2)), (12, hash(12, 2))]);
             assert_eq!(disk.reconcile_history(&ancestry).unwrap(), Some(at(11, 1)));
             assert_eq!(numbers(&disk, "history_unsettled"), Vec::<u64>::new());
@@ -2877,7 +2867,7 @@ mod tests {
             assert_eq!(settled_mark(&disk), Some(at(12, 1)));
             assert_eq!(numbers(&disk, "history_unsettled"), [13, 14]);
             assert_eq!(numbers(&disk, "history_block"), [10, 11, 12, 13, 14]);
-            assert_eq!(disk.history_tip().unwrap(), Some(at(14, 1)));
+            assert_eq!(tip(&disk), Some(at(14, 1)));
 
             disk.settle_history(at(13, 2)).unwrap();
             disk.settle_history(at(11, 1)).unwrap();
@@ -2898,10 +2888,10 @@ mod tests {
             disk.settle_history(at(20, 7)).unwrap();
             assert_eq!(settled_mark(&disk), Some(at(12, 1)));
             assert_eq!(numbers(&disk, "history_unsettled"), Vec::<u64>::new());
-            assert_eq!(disk.history_tip().unwrap(), Some(at(12, 1)));
+            assert_eq!(tip(&disk), Some(at(12, 1)));
             disk.record_head(at(12, 1), &chain(at(12, 1), 1, 1))
                 .unwrap();
-            assert_eq!(disk.history_tip().unwrap(), Some(at(13, 1)));
+            assert_eq!(tip(&disk), Some(at(13, 1)));
         }
 
         #[test]
@@ -2921,15 +2911,15 @@ mod tests {
             let (_dir, disk) = fresh();
             disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
             disk.settle_history(at(12, 1)).unwrap();
-            disk.augment_history(&[backward(5, 1), backward(6, 1)], None)
+            disk.augment_history(&[backward(5, 1), backward(6, 1)])
                 .unwrap();
             assert_eq!(
                 coverage(&disk, alice(), Capability::Logs),
                 [(5, 6), (10, 12)]
             );
-            disk.augment_history(&[backward(6, 1), backward(7, 1)], None)
+            disk.augment_history(&[backward(6, 1), backward(7, 1)])
                 .unwrap();
-            disk.augment_history(&[backward(10, 1)], None).unwrap();
+            disk.augment_history(&[backward(10, 1)]).unwrap();
             assert_eq!(
                 coverage(&disk, alice(), Capability::Logs),
                 [(5, 7), (10, 12)]
@@ -2964,15 +2954,15 @@ mod tests {
             disk.settle_history(at(12, 1)).unwrap();
             let before = counts(&disk);
             assert!(
-                disk.augment_history(&[backward(11, 2)], None).is_err(),
+                disk.augment_history(&[backward(11, 2)]).is_err(),
                 "a stored block row has another hash"
             );
             assert!(
-                disk.augment_history(&[backward(12, 2)], None).is_err(),
+                disk.augment_history(&[backward(12, 2)]).is_err(),
                 "the settled mark has another hash"
             );
             assert!(
-                disk.augment_history(&[backward(5, 1), backward(11, 2)], Some(at(5, 1)))
+                disk.augment_history(&[backward(5, 1), backward(11, 2)])
                     .is_err()
             );
             assert_eq!(counts(&disk), before, "nothing is written");
@@ -2981,22 +2971,40 @@ mod tests {
         #[test]
         fn augmenting_above_settled_or_before_anything_settles_is_refused() {
             let (_dir, disk) = fresh();
-            assert!(disk.augment_history(&[backward(5, 1)], None).is_err());
+            assert!(disk.augment_history(&[backward(5, 1)]).is_err());
             disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
-            assert!(disk.augment_history(&[backward(5, 1)], None).is_err());
+            assert!(disk.augment_history(&[backward(5, 1)]).is_err());
             disk.settle_history(at(11, 1)).unwrap();
-            assert!(disk.augment_history(&[backward(12, 1)], None).is_err());
+            assert!(disk.augment_history(&[backward(12, 1)]).is_err());
             assert_eq!(numbers(&disk, "history_block"), [10, 11, 12]);
         }
 
         #[test]
-        fn the_backfill_cursor_round_trips() {
+        fn a_tx_stored_without_its_bytes_gets_them_when_augmented_as_an_accounts_own() {
             let (_dir, disk) = fresh();
-            assert_eq!(disk.backfill_cursor().unwrap(), None);
-            disk.augment_history(&[], Some(at(5, 1))).unwrap();
-            assert_eq!(disk.backfill_cursor().unwrap(), Some(at(5, 1)));
-            disk.augment_history(&[], Some(at(4, 1))).unwrap();
-            assert_eq!(disk.backfill_cursor().unwrap(), Some(at(4, 1)));
+            let mut step = chain(at(9, 1), 1, 1);
+            step[0].facts.as_mut().unwrap().txs[0].raw = None;
+            disk.record_head(at(9, 1), &step).unwrap();
+            disk.settle_history(at(10, 1)).unwrap();
+            let raw = |disk: &Disk| -> Option<Vec<u8>> {
+                disk.db
+                    .lock()
+                    .conn
+                    .query_row("SELECT raw FROM history_tx WHERE number = 10", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            };
+            assert_eq!(raw(&disk), None);
+
+            disk.augment_history(&[backward(10, 1)]).unwrap();
+            assert_eq!(raw(&disk), Some(vec![2, 1]));
+
+            let mut other = backward(10, 1);
+            other.facts.as_mut().unwrap().txs[0].raw = Some(Bytes::from_static(&[9]));
+            disk.augment_history(&[other]).unwrap();
+            assert_eq!(raw(&disk), Some(vec![2, 1]), "stored bytes are kept");
+            assert_eq!(numbers(&disk, "history_tx"), [10]);
         }
 
         #[test]
@@ -3286,7 +3294,7 @@ mod tests {
             step[1].accounts.push(bob());
             disk.record_head(at(9, 1), &step).unwrap();
             disk.settle_history(at(11, 1)).unwrap();
-            disk.augment_history(&[backward(5, 1)], None).unwrap();
+            disk.augment_history(&[backward(5, 1)]).unwrap();
             disk.record_head(at(20, 1), &chain(at(20, 1), 1, 2))
                 .unwrap();
             let open = |number: u64, slots| OpenState {

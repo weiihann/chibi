@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, TxHash, U256};
-use chibi_core::history::{self, OpenState, Scan, ScannedBlock};
+use chibi_core::history::{self, Capability, OpenState, Pending, Scan, ScannedBlock};
 use chibi_core::state::{HEADER_WINDOW, Key, Plan, State, Store};
 use chibi_core::tx::Lookup;
 use chibi_core::verify::{VerifiedBody, VerifiedReceipts};
@@ -46,6 +46,16 @@ const RECONCILE_CAP: u64 = 4096;
 /// Most blocks waiting for their contents. Past it the oldest are dropped and become a
 /// coverage gap, so peers that withhold contents cannot grow the queue without bound.
 const HISTORY_QUEUE: usize = 64;
+
+/// Most headers the backward walk fetches in one follower step.
+const BACKFILL_HEADERS: u64 = 512;
+
+/// Most blocks whose contents the backward walk fetches in one follower step.
+const BACKFILL_CONTENTS: usize = 16;
+
+/// Follower steps in which a block's contents may fail to arrive before the backward walk
+/// leaves the block uncovered.
+const BACKFILL_ATTEMPTS: u32 = 3;
 
 /// Which blocks have been searched for pending transactions.
 ///
@@ -114,8 +124,9 @@ pub(crate) struct Extension {
     opens: Vec<OpenState>,
 }
 
-/// Forward account history: the follower records each extended block once its scan is
-/// complete, reconciling after a re-anchor. It exists only while history is on.
+/// Account history: the follower records each extended block once its scan is complete,
+/// reconciling after a re-anchor, then walks back to fill older blocks. It exists only while
+/// history is on.
 #[derive(Debug)]
 pub(crate) struct Recorder {
     /// Scans waiting for their block's contents, oldest first, consecutive.
@@ -126,6 +137,25 @@ pub(crate) struct Recorder {
     /// Stored history may hold blocks off the followed chain: at start, after a re-anchor that
     /// could not reconcile yet, and after a write was refused as forking.
     reconcile_due: bool,
+    /// The backward walk of this session.
+    backfill: Backfill,
+}
+
+/// The backward walk: settled blocks below the anchor scanned from their header blooms alone,
+/// newest first, down to the first header without a BAL hash. It is kept only in memory and
+/// starts again at the anchor after a restart or a re-anchor, so gaps left by downtime fill
+/// newest first.
+#[derive(Debug, Default)]
+struct Backfill {
+    /// The lowest header the walk has passed; it goes on with that header's parent. `None`
+    /// until it starts at the anchor.
+    reached: Option<VerifiedHeader>,
+    /// Verified headers below `reached` not yet scanned, newest first.
+    ahead: VecDeque<VerifiedHeader>,
+    /// Scans whose contents did not arrive, with the steps they failed in.
+    retry: Vec<(Pending, u32)>,
+    /// The walk met the fork or the chain's first block.
+    done: bool,
 }
 
 impl Recorder {
@@ -135,12 +165,27 @@ impl Recorder {
             queue: VecDeque::new(),
             open_due: true,
             reconcile_due: true,
+            backfill: Backfill::default(),
         }
     }
 
-    /// Records what this step extended, after a reconcile when one is due, then settles.
-    /// Failures are logged and retried on a later step; they never stop following.
+    /// Records forward, then takes one bounded step of the backward walk. Failures are logged
+    /// and retried on a later step; they never stop following.
     async fn step<P: Peers>(
+        &mut self,
+        shared: &Arc<Shared<P>>,
+        reanchored: bool,
+        extension: Option<Extension>,
+    ) {
+        if reanchored {
+            self.backfill = Backfill::default();
+        }
+        self.forward(shared, reanchored, extension).await;
+        self.backfill.step(shared).await;
+    }
+
+    /// Records what this step extended, after a reconcile when one is due, then settles.
+    async fn forward<P: Peers>(
         &mut self,
         shared: &Arc<Shared<P>>,
         reanchored: bool,
@@ -252,6 +297,141 @@ impl Recorder {
             }
         }
         false
+    }
+}
+
+impl Backfill {
+    /// Scans settled blocks below the anchor, newest first, within one step's budget, and
+    /// writes what completed in one write. Blocks above the settled mark are left to forward
+    /// recording, so nothing is walked before history settles.
+    async fn step<P: Peers>(&mut self, shared: &Arc<Shared<P>>) {
+        let watched = &shared.watch.addresses;
+        if watched.is_empty() || self.done && self.retry.is_empty() {
+            return;
+        }
+        let reader = Arc::clone(shared);
+        let known = blocking(move || {
+            let settled = reader.disk.history_settled()?;
+            let covered = reader
+                .watch
+                .addresses
+                .iter()
+                .map(|&account| reader.disk.history_ranges(account, Capability::Logs))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((settled, covered))
+        })
+        .await;
+        let (settled, covered) = match known {
+            Ok((Some(settled), covered)) => (settled, covered),
+            Ok((None, _)) => return,
+            Err(err) => {
+                warn!(target: "chibi::history", %err, "cannot read history coverage; walking back next head");
+                return;
+            }
+        };
+        let mut ready = Vec::new();
+        let mut contents_left = BACKFILL_CONTENTS;
+        for (pending, failed) in std::mem::take(&mut self.retry) {
+            if contents_left == 0 {
+                self.retry.push((pending, failed));
+                continue;
+            }
+            contents_left -= 1;
+            self.complete(&shared.peers, pending, failed, &mut ready)
+                .await;
+        }
+        let mut fetched = 0;
+        while !self.done {
+            let header = match self.ahead.pop_front() {
+                Some(header) => header,
+                None => match &self.reached {
+                    None => shared.read(|s| s.anchor().clone()),
+                    Some(reached) if reached.header().parent_hash == B256::ZERO => {
+                        self.done = true;
+                        break;
+                    }
+                    Some(_) if fetched >= BACKFILL_HEADERS => break,
+                    Some(reached) => {
+                        let count = BACKFILL_HEADERS - fetched;
+                        match fetch::ancestors(&shared.peers, reached, count).await {
+                            Ok(ancestors) if !ancestors.is_empty() => {
+                                fetched += ancestors.len() as u64;
+                                self.ahead.extend(ancestors.into_iter().rev());
+                                continue;
+                            }
+                            Ok(_) => break,
+                            Err(err) => {
+                                warn!(target: "chibi::history", block = reached.number(), %err, "ancestor headers unavailable; walking back next head");
+                                break;
+                            }
+                        }
+                    }
+                },
+            };
+            if header.header().block_access_list_hash.is_none() {
+                debug!(target: "chibi::history", block = header.number(), "history walked back to the fork");
+                self.done = true;
+                self.ahead.clear();
+                break;
+            }
+            let number = header.number();
+            if number <= settled && !covered.iter().all(|ranges| ranges.contains(number)) {
+                match history::scan_backward(watched, &header) {
+                    Scan::Done(block) => ready.push(block),
+                    Scan::NeedsContents(_) if contents_left == 0 => {
+                        self.ahead.push_front(header);
+                        break;
+                    }
+                    Scan::NeedsContents(pending) => {
+                        contents_left -= 1;
+                        self.complete(&shared.peers, pending, 0, &mut ready).await;
+                    }
+                }
+            }
+            self.reached = Some(header);
+        }
+        if ready.is_empty() {
+            return;
+        }
+        let blocks = ready.len();
+        let writer = Arc::clone(shared);
+        match blocking(move || writer.disk.augment_history(&ready)).await {
+            Ok(()) => {
+                let reached = self.reached.as_ref().map(VerifiedHeader::number);
+                debug!(target: "chibi::history", blocks, reached, "older history added");
+            }
+            Err(err) => {
+                warn!(target: "chibi::history", %err, blocks, "cannot add older history; leaving a history gap");
+            }
+        }
+    }
+
+    /// Completes `pending` with its block's contents into `ready`. A block whose contents do
+    /// not arrive is retried next step until it has failed in [`BACKFILL_ATTEMPTS`] steps;
+    /// then, or when its contents cannot complete the scan, it is left uncovered.
+    async fn complete<P: Peers>(
+        &mut self,
+        peers: &Paced<P>,
+        pending: Pending,
+        failed: u32,
+        ready: &mut Vec<ScannedBlock>,
+    ) {
+        let block = pending.header().number();
+        match contents(peers, pending.header()).await {
+            Ok((body, receipts)) => match pending.complete(&body, &receipts) {
+                Ok(scanned) => ready.push(scanned),
+                Err(err) => {
+                    warn!(target: "chibi::history", block, %err, "block contents do not complete its scan; leaving a history gap");
+                }
+            },
+            Err(err) if failed + 1 < BACKFILL_ATTEMPTS => {
+                warn!(target: "chibi::history", block, %err, "block contents unavailable; retrying next head");
+                self.retry.push((pending, failed + 1));
+            }
+            Err(err) => {
+                warn!(target: "chibi::history", block, %err, "block contents unavailable; leaving a history gap");
+            }
+        }
     }
 }
 
