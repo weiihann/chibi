@@ -92,6 +92,9 @@ pub struct Config {
     /// Absolute path of the encrypted keystore `chibi wallet` sends from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keystore: Option<PathBuf>,
+    /// Record the watched accounts' transaction history.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub history: bool,
 }
 
 /// Config keys given on the command line: `chibi init` writes them into the config, and
@@ -248,6 +251,8 @@ struct ConfigFile {
     contracts: Vec<ContractEntry>,
     #[serde(default)]
     keystore: Option<PathBuf>,
+    #[serde(default)]
+    history: bool,
 }
 
 /// One `[[contracts]]` table as written.
@@ -295,6 +300,7 @@ impl TryFrom<ConfigFile> for Config {
             max_inbound_peers: file.max_inbound_peers,
             disable_discovery: file.disable_discovery,
             keystore: file.keystore,
+            history: file.history,
         };
         config.validate()?;
         Ok(config)
@@ -324,6 +330,7 @@ impl Config {
             disable_discovery: false,
             contracts: Vec::new(),
             keystore: None,
+            history: false,
         }
     }
 
@@ -409,7 +416,7 @@ impl Config {
             watch: Watchlist {
                 addresses: self.addresses.clone(),
                 contracts: self.contracts.clone(),
-                history: false,
+                history: self.history,
             },
             net: NetConfig {
                 ports: Ports {
@@ -945,6 +952,7 @@ mod tests {
             max_outbound_peers = 5
             max_inbound_peers = 0
             disable_discovery = true
+            history = true
             keystore = "/keys/chibi.json"
 
             [[contracts]]
@@ -987,6 +995,7 @@ mod tests {
                     slots: vec![U256::from(1)],
                 }],
                 keystore: Some(PathBuf::from("/keys/chibi.json")),
+                history: true,
             }
         );
         let node = config.node_config(PathBuf::from("/data"));
@@ -1010,7 +1019,7 @@ mod tests {
             Watchlist {
                 addresses: vec![ALICE],
                 contracts: config.contracts,
-                history: false,
+                history: true,
             }
         );
     }
@@ -1069,6 +1078,17 @@ mod tests {
         for key in ["trusted", "boot_nodes", "max_", "discovery"] {
             assert!(!text.contains(key), "{key} in {text}");
         }
+        assert!(!text.contains("history"), "{text}");
+    }
+
+    #[test]
+    fn history_is_off_unless_the_file_turns_it_on() {
+        let config = Config::parse("").unwrap();
+        assert!(!config.history);
+        assert!(!config.node_config(PathBuf::from("/data")).watch.history);
+        let config = Config::parse("history = true").unwrap();
+        assert!(config.history);
+        assert!(config.node_config(PathBuf::from("/data")).watch.history);
     }
 
     #[test]

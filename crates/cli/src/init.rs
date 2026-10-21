@@ -24,6 +24,8 @@ use crate::config::{
 /// How long the port check waits for a listener to accept.
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+const HISTORY_QUESTION: &str = "Keep a transaction history for watched accounts?";
+
 /// Answers given on the command line; whatever is left out is asked for.
 #[derive(Debug, Default, Args)]
 pub struct InitArgs {
@@ -44,6 +46,12 @@ pub struct InitArgs {
     /// Encrypted JSON keystore `chibi wallet` sends from.
     #[arg(long, value_name = "PATH", value_parser = absolute_path)]
     pub keystore: Option<PathBuf>,
+    /// Keep a transaction history for the watched accounts.
+    #[arg(long, conflicts_with = "no_history")]
+    pub history: bool,
+    /// Keep no transaction history.
+    #[arg(long)]
+    pub no_history: bool,
 }
 
 /// Why `chibi init` wrote nothing.
@@ -80,6 +88,7 @@ trait Ask {
     fn overwrite(&mut self, path: &Path) -> Result<bool, InitError>;
     fn network(&mut self) -> Result<Network, InitError>;
     fn addresses(&mut self) -> Result<Vec<Address>, InitError>;
+    fn history(&mut self, default: bool) -> Result<bool, InitError>;
     fn rpc_host(&mut self) -> Result<RpcHost, InitError>;
     fn rpc_port(&mut self, host: &RpcHost) -> Result<NonZeroU16, InitError>;
 }
@@ -204,6 +213,11 @@ fn collect<A: Ask>(
     } else {
         unique(args.addresses)
     };
+    let history = if args.history || args.no_history {
+        args.history
+    } else {
+        ask.history(existing.as_ref().is_some_and(|existing| existing.history))?
+    };
     let rpc_host = match args.rpc_host {
         Some(host) => host,
         None => ask.rpc_host()?,
@@ -215,6 +229,7 @@ fn collect<A: Ask>(
     let mut config = Config::new(network, addresses);
     config.rpc_host = rpc_host;
     config.rpc_port = rpc_port;
+    config.history = history;
     args.keys.apply(&mut config);
     if let Some(keystore) = &args.keystore {
         config.keystore = Some(keystore.clone());
@@ -239,6 +254,12 @@ impl Ask for Screens {
     fn overwrite(&mut self, path: &Path) -> Result<bool, InitError> {
         let question = format!("{} already exists. Overwrite it?", path.display());
         Ok(Confirm::new(&question).with_default(false).prompt()?)
+    }
+
+    fn history(&mut self, default: bool) -> Result<bool, InitError> {
+        Ok(Confirm::new(HISTORY_QUESTION)
+            .with_default(default)
+            .prompt()?)
     }
 
     fn network(&mut self) -> Result<Network, InitError> {
@@ -324,7 +345,21 @@ struct Lines<R, W> {
 impl<R: BufRead, W: Write> Ask for Lines<R, W> {
     fn overwrite(&mut self, path: &Path) -> Result<bool, InitError> {
         let question = format!("{} already exists. Overwrite it?", path.display());
-        Ok(confirm(&mut self.input, &mut self.output, &question)?)
+        Ok(confirm(
+            &mut self.input,
+            &mut self.output,
+            &question,
+            false,
+        )?)
+    }
+
+    fn history(&mut self, default: bool) -> Result<bool, InitError> {
+        Ok(confirm(
+            &mut self.input,
+            &mut self.output,
+            HISTORY_QUESTION,
+            default,
+        )?)
     }
 
     fn network(&mut self) -> Result<Network, InitError> {
@@ -460,15 +495,22 @@ fn prompt_rpc_port<R: BufRead, W: Write>(
     }
 }
 
+/// Reads a yes or no. Blank, ended or unrecognized input keeps `default`.
 fn confirm<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     question: &str,
+    default: bool,
 ) -> io::Result<bool> {
-    let answer = ask(input, output, format_args!("{question} [y/N] "))?;
-    Ok(answer.is_some_and(|answer| {
-        answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
-    }))
+    let choices = if default { "[Y/n]" } else { "[y/N]" };
+    let answer = ask(input, output, format_args!("{question} {choices} "))?;
+    Ok(
+        match answer.map(|answer| answer.to_ascii_lowercase()).as_deref() {
+            Some("y" | "yes") => true,
+            Some("n" | "no") => false,
+            _ => default,
+        },
+    )
 }
 
 fn unique(addresses: Vec<Address>) -> Vec<Address> {
@@ -859,10 +901,101 @@ mod tests {
     #[test]
     fn overwrite_needs_an_explicit_yes() {
         for (script, expected) in [("y\n", true), ("YES\n", true), ("\n", false), ("", false)] {
-            let (answer, output) = scripted(script, |i, o| confirm(i, o, "Overwrite?"));
+            let (answer, output) = scripted(script, |i, o| confirm(i, o, "Overwrite?", false));
             assert_eq!(answer.unwrap(), expected, "{script:?}");
             assert!(output.starts_with("Overwrite? [y/N] "));
         }
+    }
+
+    #[test]
+    fn a_yes_default_takes_blank_input_and_yields_to_no() {
+        for (script, expected) in [("\n", true), ("", true), ("n\n", false), ("No\n", false)] {
+            let (answer, output) = scripted(script, |i, o| confirm(i, o, "Keep?", true));
+            assert_eq!(answer.unwrap(), expected, "{script:?}");
+            assert!(output.starts_with("Keep? [Y/n] "));
+        }
+    }
+
+    /// Plain init with every answer but the history one given as flags.
+    fn history_answer(
+        path: &Path,
+        script: &str,
+        history: bool,
+        no_history: bool,
+    ) -> (bool, String) {
+        let mut lines = Lines {
+            input: Cursor::new(script.as_bytes()),
+            output: Vec::new(),
+        };
+        let args = InitArgs {
+            network: Some(Network::Sepolia),
+            addresses: vec![ALICE],
+            rpc_host: Some(RpcHost::default()),
+            rpc_port: Some(port(8545)),
+            history,
+            no_history,
+            ..InitArgs::default()
+        };
+        let (config, _) = collect(&mut lines, args, path).unwrap().unwrap();
+        (config.history, String::from_utf8(lines.output).unwrap())
+    }
+
+    #[test]
+    fn plain_init_asks_whether_to_keep_history_and_defaults_to_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (history, output) = history_answer(&path, "y\n", false, false);
+        assert!(history);
+        assert_eq!(
+            output,
+            "Keep a transaction history for watched accounts? [y/N] "
+        );
+        let (history, _) = history_answer(&path, "", false, false);
+        assert!(!history);
+    }
+
+    #[test]
+    fn history_flags_skip_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(
+            history_answer(&path, "", true, false),
+            (true, String::new())
+        );
+        assert_eq!(
+            history_answer(&path, "y\n", false, true),
+            (false, String::new())
+        );
+    }
+
+    #[test]
+    fn history_flags_exclude_each_other() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            init: InitArgs,
+        }
+        let parse = |argv: &[&str]| <Cli as clap::Parser>::try_parse_from(argv).map(|cli| cli.init);
+        let on = parse(&["chibi", "--history"]).unwrap();
+        assert!(on.history && !on.no_history);
+        let off = parse(&["chibi", "--no-history"]).unwrap();
+        assert!(!off.history && off.no_history);
+        assert!(parse(&["chibi", "--history", "--no-history"]).is_err());
+    }
+
+    #[test]
+    fn rerunning_init_over_a_history_config_defaults_to_keeping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut existing = Config::new(Network::Sepolia, vec![ALICE]);
+        existing.history = true;
+        existing.save(&path).unwrap();
+        let (history, output) = history_answer(&path, "y\n\n", false, false);
+        assert!(history);
+        assert!(
+            output.ends_with("Keep a transaction history for watched accounts? [Y/n] "),
+            "{output}"
+        );
     }
 
     #[test]
@@ -871,7 +1004,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let mut lines = Lines {
             input: Cursor::new(
-                "0x00000000000000000000000000000000000000b0\n\nchibi.local\n".as_bytes(),
+                "0x00000000000000000000000000000000000000b0\n\n\nchibi.local\n".as_bytes(),
             ),
             output: Vec::new(),
         };
@@ -911,6 +1044,7 @@ mod tests {
                 rpc_port: Some(port(8545)),
                 keys,
                 keystore,
+                ..InitArgs::default()
             };
             collect(&mut lines, args, &path).unwrap().unwrap().0
         };
@@ -968,7 +1102,7 @@ mod tests {
                 rpc_host: Some(RpcHost::default()),
                 rpc_port: Some(port(8545)),
                 keys,
-                keystore: None,
+                ..InitArgs::default()
             };
             collect(&mut lines, args, &path).map(|config| config.unwrap().0)
         };
@@ -1029,7 +1163,7 @@ mod tests {
                     data_dir,
                     ..ConfigArgs::default()
                 },
-                keystore: None,
+                ..InitArgs::default()
             };
             collect(&mut lines, args, &path).unwrap().unwrap()
         };
