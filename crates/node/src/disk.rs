@@ -559,21 +559,16 @@ impl Disk {
         })
     }
 
-    /// Settles history at `finalized`, or at the tip when the tip is lower, when the stored
-    /// hash there agrees: unsettled rows at or below it are dropped and the mark only rises.
-    /// Otherwise does nothing.
+    /// Settles history at `finalized` when the stored hash at its height equals its hash:
+    /// unsettled rows at or below it are dropped and the mark only rises. Otherwise, including
+    /// when history has not reached that height, does nothing.
     pub(crate) fn settle_history(&self, finalized: BlockNumHash) -> Result<(), NodeError> {
         self.history(|conn| {
-            let Some(tip) = history_tip(conn)? else {
-                return Ok(());
-            };
-            let target = finalized.number.min(tip.number);
-            let Some(hash) = followed_hash(conn, target)? else {
-                return Ok(());
-            };
-            if target == finalized.number && hash != finalized.hash {
+            let target = finalized.number;
+            if followed_hash(conn, target)? != Some(finalized.hash) {
                 return Ok(());
             }
+            let hash = finalized.hash;
             if settled(conn)?.is_none_or(|mark| mark.number < target) {
                 conn.execute(
                     "INSERT INTO history_settled (id, number, hash) VALUES (0, ?1, ?2)
@@ -2977,18 +2972,17 @@ mod tests {
         }
 
         #[test]
-        fn with_the_tip_below_finalized_settling_settles_at_the_tip() {
+        fn with_the_tip_below_a_finalized_header_from_another_fork_nothing_settles() {
             let (_dir, disk) = fresh();
             disk.settle_history(at(20, 1)).unwrap();
             assert_eq!(settled_mark(&disk), None, "no history, nothing to settle");
             disk.record_head(at(9, 1), &chain(at(9, 1), 1, 3)).unwrap();
-            disk.settle_history(at(20, 7)).unwrap();
-            assert_eq!(settled_mark(&disk), Some(at(12, 1)));
-            assert_eq!(numbers(&disk, "history_unsettled"), Vec::<u64>::new());
-            assert_eq!(tip(&disk), Some(at(12, 1)));
-            disk.record_head(at(12, 1), &chain(at(12, 1), 1, 1))
-                .unwrap();
-            assert_eq!(tip(&disk), Some(at(13, 1)));
+            disk.settle_history(at(20, 2)).unwrap();
+            assert_eq!(settled_mark(&disk), None);
+            assert_eq!(numbers(&disk, "history_unsettled"), [10, 11, 12]);
+            let ancestry = BTreeMap::from([(11, hash(11, 2)), (10, hash(10, 1))]);
+            assert_eq!(disk.reconcile_history(&ancestry).unwrap(), Some(at(10, 1)));
+            assert_eq!(numbers(&disk, "history_unsettled"), [10]);
         }
 
         #[test]
