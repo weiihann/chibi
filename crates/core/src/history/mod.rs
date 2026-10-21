@@ -3,6 +3,10 @@
 //!
 //! History is display-only. Its rows never answer an RPC request and never enter a `Store`.
 
+mod scan;
+
+pub use scan::{Pending, Scan, ScanError, scan_backward, scan_forward};
+
 use alloy_primitives::{Address, B256, Bytes, Log, TxHash, U256};
 
 /// Where a fact sits in its block, from the block access list's block access index.
