@@ -38,8 +38,8 @@ pub fn format_units(value: U256, decimals: u8) -> String {
     format!("{whole}.{}", &fraction[..keep])
 }
 
-/// `address` as its first four and last four hex digits, enough to tell addresses apart at a
-/// glance.
+/// A contract's address as its first four and last four hex digits, enough to tell tokens
+/// apart at a glance. Counterparties are never shortened: a lookalike shares these digits.
 pub fn short(address: Address) -> String {
     let full = address.to_string();
     format!("{}…{}", &full[..6], &full[full.len() - 4..])
@@ -81,7 +81,7 @@ pub fn activity_line(
         "{}  {}  {}",
         grouped(activity.number),
         ago(now.saturating_sub(activity.timestamp)),
-        effect_text(&activity.effect, account, registry)
+        effect_text(activity, account, registry)
     )
 }
 
@@ -101,14 +101,14 @@ fn token_amount(amount: U256, token: Address, registry: &[Token]) -> String {
 fn movement(what: &str, from: Address, to: Address, account: Address) -> String {
     match (from == account, to == account) {
         (true, true) => format!("{what} to self"),
-        (false, true) => format!("+{what} from {}", short(from)),
-        (true, false) => format!("-{what} to {}", short(to)),
-        (false, false) => format!("{what} from {} to {}", short(from), short(to)),
+        (false, true) => format!("+{what} from {from}"),
+        (true, false) => format!("-{what} to {to}"),
+        (false, false) => format!("{what} from {from} to {to}"),
     }
 }
 
-fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String {
-    match effect {
+fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> String {
+    match &activity.effect {
         Effect::Sent {
             to,
             nonce,
@@ -123,7 +123,7 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             match (to, nonce) {
                 (Some(to), _) if *to == account => text.push_str(" to self"),
                 (Some(to), _) => {
-                    let _ = write!(text, " to {}", short(*to));
+                    let _ = write!(text, " to {to}");
                 }
                 (None, Some(_)) => text.push_str(" creating a contract"),
                 (None, None) => {}
@@ -144,12 +144,19 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             from,
             to,
             amount,
-        } => movement(
-            &token_amount(*amount, *token, registry),
-            *from,
-            *to,
-            account,
-        ),
+        } => {
+            let text = movement(
+                &token_amount(*amount, *token, registry),
+                *from,
+                *to,
+                account,
+            );
+            if amount.is_zero() && *from == account && *to != account && !activity.sent {
+                format!("{text} (zero transfer you did not send; do not copy this address)")
+            } else {
+                text
+            }
+        }
         Effect::Nft {
             token,
             from,
@@ -188,11 +195,7 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             } else {
                 token_amount(*amount, *token, registry)
             };
-            approval(
-                *owner,
-                account,
-                &format!("{} for {allowance}", short(*spender)),
-            )
+            approval(*owner, account, &format!("{spender} for {allowance}"))
         }
         Effect::NftApproval {
             token,
@@ -202,7 +205,7 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
         } => approval(
             *owner,
             account,
-            &format!("{} for NFT #{id} of {}", short(*approved), short(*token)),
+            &format!("{approved} for NFT #{id} of {}", short(*token)),
         ),
         Effect::ApprovalForAll {
             token,
@@ -211,11 +214,11 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             approved,
         } => {
             let verb = if *approved { "approved" } else { "revoked" };
-            let what = format!("{} for all of {}", short(*operator), short(*token));
+            let what = format!("{operator} for all of {}", short(*token));
             if *owner == account {
                 format!("{verb} {what}")
             } else {
-                format!("{verb} {what} by {}", short(*owner))
+                format!("{verb} {what} by {owner}")
             }
         }
         Effect::Withdrawal { validator, amount } => {
@@ -225,7 +228,7 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             amount: Some(amount),
         } => format!("+{} fee credit", eth(*amount)),
         Effect::FeeCredit { amount: None } => "fee credit".to_owned(),
-        Effect::Called { from } => format!("called by {}", short(*from)),
+        Effect::Called { from } => format!("called by {from}"),
         Effect::BalanceChange {
             before: Some(before),
             after,
@@ -238,7 +241,7 @@ fn effect_text(effect: &Effect, account: Address, registry: &[Token]) -> String 
             before: None,
             after,
         } => format!("balance now {}", eth(*after)),
-        Effect::Delegated { to: Some(to) } => format!("delegated to {}", short(*to)),
+        Effect::Delegated { to: Some(to) } => format!("delegated to {to}"),
         Effect::Delegated { to: None } => "delegation cleared".to_owned(),
         Effect::Other { emitter, .. } => format!("event from {}", short(*emitter)),
     }
@@ -249,7 +252,7 @@ fn approval(owner: Address, account: Address, what: &str) -> String {
     if owner == account {
         format!("approved {what}")
     } else {
-        format!("approved {what} by {}", short(owner))
+        format!("approved {what} by {owner}")
     }
 }
 
@@ -369,14 +372,64 @@ mod tests {
     }];
 
     fn line(effect: Effect) -> String {
+        line_sent(effect, false)
+    }
+
+    fn line_sent(effect: Effect, sent: bool) -> String {
         let activity = Activity {
             number: 11_856_337,
             timestamp: NOW - 12 * 60,
             at: At::Tx(0),
             tx: None,
+            sent,
             effect,
         };
         activity_line(&activity, ME, &REGISTRY, NOW)
+    }
+
+    const MIXED: Address = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+
+    #[test]
+    fn a_token_transfer_shows_the_full_checksummed_counterparty() {
+        let transfer = Effect::Token {
+            token: USDC,
+            from: ME,
+            to: MIXED,
+            amount: U256::from(2_000_000u64),
+        };
+        assert_eq!(
+            line_sent(transfer, true),
+            "11,856,337  12 min ago  -2.00 USDC to 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        );
+    }
+
+    #[test]
+    fn a_zero_transfer_out_the_account_did_not_send_warns() {
+        let zero = Effect::Token {
+            token: USDC,
+            from: ME,
+            to: MIXED,
+            amount: U256::ZERO,
+        };
+        assert_eq!(
+            line_sent(zero.clone(), false),
+            "11,856,337  12 min ago  -0.00 USDC to 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
+             (zero transfer you did not send; do not copy this address)"
+        );
+        assert_eq!(
+            line_sent(zero, true),
+            "11,856,337  12 min ago  -0.00 USDC to 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        );
+        let nonzero = Effect::Token {
+            token: USDC,
+            from: ME,
+            to: MIXED,
+            amount: U256::from(1u64),
+        };
+        assert_eq!(
+            line_sent(nonzero, false),
+            "11,856,337  12 min ago  -0.000001 USDC to 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        );
     }
 
     fn milli_eth(n: u64) -> U256 {
@@ -393,7 +446,7 @@ mod tests {
                     to: ME,
                     amount: U256::from(1_500_000u64),
                 },
-                "+1.50 USDC from 0x1111…2222",
+                "+1.50 USDC from 0x1111000000000000000000000000000000002222",
             ),
             (
                 Effect::Token {
@@ -402,7 +455,7 @@ mod tests {
                     to: PEER,
                     amount: U256::from(42u64),
                 },
-                "-42 of 0x7070…7070 to 0x1111…2222",
+                "-42 of 0x7070…7070 to 0x1111000000000000000000000000000000002222",
             ),
             (
                 Effect::Eth {
@@ -410,7 +463,7 @@ mod tests {
                     to: PEER,
                     amount: milli_eth(1),
                 },
-                "-0.001 ETH to 0x1111…2222",
+                "-0.001 ETH to 0x1111000000000000000000000000000000002222",
             ),
             (
                 Effect::Eth {
@@ -426,7 +479,7 @@ mod tests {
                     to: ME,
                     amount: milli_eth(1_500),
                 },
-                "+1.50 ETH from 0x1111…2222",
+                "+1.50 ETH from 0x1111000000000000000000000000000000002222",
             ),
             (
                 Effect::Sent {
@@ -436,7 +489,7 @@ mod tests {
                     fee: Some(U256::from(21_000_000_000_000u64)),
                     value: None,
                 },
-                "sent to 0x1111…2222 (nonce 42, fee 0.000021 ETH)",
+                "sent to 0x1111000000000000000000000000000000002222 (nonce 42, fee 0.000021 ETH)",
             ),
             (
                 Effect::Sent {
@@ -456,11 +509,11 @@ mod tests {
                     fee: None,
                     value: None,
                 },
-                "failed send to 0x1111…2222 (nonce 43)",
+                "failed send to 0x1111000000000000000000000000000000002222 (nonce 43)",
             ),
             (
                 Effect::Delegated { to: Some(ODD) },
-                "delegated to 0x7070…7070",
+                "delegated to 0x7070000000000000000000000000000000007070",
             ),
             (Effect::Delegated { to: None }, "delegation cleared"),
             (
@@ -470,7 +523,7 @@ mod tests {
                     to: ME,
                     id: U256::from(7u64),
                 },
-                "+NFT #7 of 0x7070…7070 from 0x1111…2222",
+                "+NFT #7 of 0x7070…7070 from 0x1111000000000000000000000000000000002222",
             ),
             (
                 Effect::Multi {
@@ -481,7 +534,7 @@ mod tests {
                     id: U256::from(7u64),
                     amount: U256::from(3u64),
                 },
-                "+3 of #7 of 0x7070…7070 from 0x1111…2222",
+                "+3 of #7 of 0x7070…7070 from 0x1111000000000000000000000000000000002222",
             ),
             (
                 Effect::Approval {
@@ -490,7 +543,7 @@ mod tests {
                     spender: PEER,
                     amount: U256::from(100_000_000u64),
                 },
-                "approved 0x1111…2222 for 100.00 USDC",
+                "approved 0x1111000000000000000000000000000000002222 for 100.00 USDC",
             ),
             (
                 Effect::NftApproval {
@@ -499,7 +552,7 @@ mod tests {
                     approved: PEER,
                     id: U256::from(7u64),
                 },
-                "approved 0x1111…2222 for NFT #7 of 0x7070…7070",
+                "approved 0x1111000000000000000000000000000000002222 for NFT #7 of 0x7070…7070",
             ),
             (
                 Effect::ApprovalForAll {
@@ -508,7 +561,7 @@ mod tests {
                     operator: PEER,
                     approved: false,
                 },
-                "revoked 0x1111…2222 for all of 0x7070…7070",
+                "revoked 0x1111000000000000000000000000000000002222 for all of 0x7070…7070",
             ),
             (
                 Effect::Withdrawal {
@@ -523,7 +576,10 @@ mod tests {
                 },
                 "+0.0001 ETH fee credit",
             ),
-            (Effect::Called { from: PEER }, "called by 0x1111…2222"),
+            (
+                Effect::Called { from: PEER },
+                "called by 0x1111000000000000000000000000000000002222",
+            ),
             (
                 Effect::BalanceChange {
                     before: Some(milli_eth(1_200)),

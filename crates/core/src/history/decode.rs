@@ -37,6 +37,8 @@ pub struct Activity {
     pub at: At,
     /// The transaction it came from, when it came from one.
     pub tx: Option<TxHash>,
+    /// Whether the account sent that transaction.
+    pub sent: bool,
     /// What happened.
     pub effect: Effect,
 }
@@ -226,6 +228,13 @@ fn decode_block(
 ) {
     let block = &facts.block;
     let mut push = |at: At, rank: u64, tx: Option<TxHash>, effect: Effect| {
+        let sent = match at {
+            At::Tx(n) => facts
+                .txs
+                .iter()
+                .any(|tx| tx.index == n && tx.sender == account),
+            At::System | At::Post => false,
+        };
         found.push(Found {
             key: (block.number, at.index(block.tx_count), rank),
             activity: Activity {
@@ -233,6 +242,7 @@ fn decode_block(
                 timestamp: block.timestamp,
                 at,
                 tx,
+                sent,
                 effect,
             },
         });
@@ -822,7 +832,15 @@ mod tests {
             timestamp: 1_000 + number,
             at,
             tx,
+            sent: false,
             effect,
+        }
+    }
+
+    fn sent(activity: Activity) -> Activity {
+        Activity {
+            sent: true,
+            ..activity
         }
     }
 
@@ -859,7 +877,7 @@ mod tests {
         assert_eq!(
             decode(&page(vec![block], Some((99, U256::from(1_000_000u64))))),
             [
-                activity(
+                sent(activity(
                     100,
                     At::Tx(1),
                     Some(hash(2)),
@@ -870,8 +888,8 @@ mod tests {
                         fee: Some(U256::from(189_000u64)),
                         value: None,
                     },
-                ),
-                activity(
+                )),
+                sent(activity(
                     100,
                     At::Tx(0),
                     Some(hash(1)),
@@ -882,7 +900,7 @@ mod tests {
                         fee: Some(U256::from(189_000u64)),
                         value: Some(U256::from(1_000_000_000u64)),
                     },
-                ),
+                )),
             ]
         );
     }
@@ -1012,7 +1030,7 @@ mod tests {
 
         assert_eq!(
             decode(&page(vec![block], Some((99, U256::from(1_000_000u64))))),
-            [activity(
+            [sent(activity(
                 100,
                 At::Tx(0),
                 Some(hash(1)),
@@ -1023,7 +1041,7 @@ mod tests {
                     fee: Some(U256::from(63_000u64)),
                     value: None,
                 },
-            )]
+            ))]
         );
     }
 
@@ -1132,7 +1150,7 @@ mod tests {
             ),
         ];
         block.touches = vec![touch(At::Tx(0), None)];
-        let at = |effect| activity(100, At::Tx(0), Some(hash(1)), effect);
+        let at = |effect| sent(activity(100, At::Tx(0), Some(hash(1)), effect));
 
         assert_eq!(
             decode(&page(vec![block], None)),
@@ -1320,13 +1338,13 @@ mod tests {
         assert_eq!(
             decode(&page),
             [
-                activity(
+                sent(activity(
                     100,
                     At::Tx(1),
                     Some(hash(2)),
                     Effect::Delegated { to: None }
-                ),
-                activity(
+                )),
+                sent(activity(
                     100,
                     At::Tx(1),
                     Some(hash(2)),
@@ -1337,7 +1355,7 @@ mod tests {
                         fee: Some(U256::from(189_000u64)),
                         value: None,
                     }
-                ),
+                )),
                 activity(
                     100,
                     At::Tx(0),

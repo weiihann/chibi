@@ -466,7 +466,7 @@ mod tests {
                 "sepolia head 107 (saved 8s ago, not re-verified)\n\
                  {ALICE}   1.00 ETH\n\
                  \x20 history since block 101 · gaps: none · no sends found\n\
-                 \x20 107  2 h ago  +0.001 ETH from 0x0000…00B0\n\
+                 \x20 107  2 h ago  +0.001 ETH from 0x00000000000000000000000000000000000000B0\n\
                  \x20 106  2 h ago  +0.50 ETH withdrawal (validator 106)\n\
                  \x20 105  2 h ago  +0.50 ETH withdrawal (validator 105)\n\
                  \x20 104  2 h ago  +0.50 ETH withdrawal (validator 104)\n\

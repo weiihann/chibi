@@ -2613,7 +2613,7 @@ mod tests {
         assert_eq!(app.history_request(false), Some(SENDER));
         let coverage = "history since block 11,856,337 · gaps: none · no sends found";
         let activities: Vec<String> = (0..40)
-            .map(|n| format!("11,900,{n:03}  {n} min ago  +0.001 ETH from 0x1111…2222"))
+            .map(|n| format!("11,900,{n:03}  {n} min ago  +0.001 ETH from 0x1111000000000000000000000000000000002222"))
             .collect();
         app.history_read(
             SENDER,
