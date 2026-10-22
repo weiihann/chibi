@@ -39,5 +39,5 @@ Preconditions:
 - Backward blocks never get BAL coverage, so a restart's downtime stays a gap there for good; the coverage line reports logs coverage.
 - A self-send emits no EIP-7708 log, so the oracle has nothing to compare for it.
 - `chibi status` reads history read-only beside a running node; a long write can make it wait up to the 5 s busy timeout.
-- The walk back covers about 10 blocks a second on Sepolia, so reaching the fork from today takes hours; it never delays the head by more than the 2 s history budget.
+- The walk back covers about 10 blocks a second on Sepolia when the watched accounts are quiet (85 to 201 blocks per head on 2026-10-21), but only about 3.6 with a busy USDC holder watched, whose bloom hits all need receipts (24 to 61 blocks per head on 2026-10-22). Reaching the fork from today takes hours either way, about 8 with a busy account; it never delays the head by more than the 2 s history budget.
 - A re-anchor (`cannot extend with BALs; reanchoring` in the log) leaves its anchor block unrecorded, and the walk waits there until finality passes it before filling anything older. On 2026-10-21 that held a three-block restart gap open for 17 minutes, until `older history added blocks=4` filled both gaps in one step.
