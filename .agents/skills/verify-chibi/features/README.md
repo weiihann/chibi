@@ -5,6 +5,7 @@ This directory is the maintained source for verifying chibi's user-facing behavi
 ## Baseline preconditions
 
 - A run started with `.agents/skills/verify-chibi/scripts/launch.sh`, with `RUN_DIR` and its `PORT` (from `$RUN_DIR/meta.env`) known.
+- Recipes that need their own scratch HOME (onboarding, the TUI) create it under the root `launch.sh` uses: `ROOT=${CHIBI_VERIFY_ROOT:-/tmp/chibi-verify}; mkdir -p "$ROOT"`. When `/tmp` is full, chibi fails with `No space left on device` and `install.sh` with a `mktemp` error; set `CHIBI_VERIFY_ROOT` and `TMPDIR` to a directory on a disk with room.
 - `doctor.sh "$RUN_DIR"` exits 0, including the head-freshness check.
 - `cast`, `curl`, `lsof`, and `tmux` are on `PATH`, and `bun` for `wallet-check.sh`.
 - Outbound access to Sepolia devp2p peers, `https://beacon.sepolia.ethpandaops.io/nimbus` (the light client's beacon API), and `https://ethereum-sepolia-rpc.publicnode.com` (the oracle).
@@ -38,4 +39,4 @@ Each feature file has an H1 title and one paragraph describing the user-visible 
 - [Onboarding](./onboarding.md) covers `install.sh` (download, checksum, install; tested from a local release), interactive and flag-driven `chibi init`, the first `chibi node`, and running without a config.
 - [RPC exposure](./rpc-exposure.md) covers the Host filter, the CORS allowlist, unsupported methods, and block responses.
 - [Terminal UI](./tui.md) covers `chibi wallet`: wallet setup, keystore unlock, watch-only mode, the state-peer wait and its cat, the transfer form with its editing keys and validation, sending to an address or ENS name and tracking to a verified receipt and explorer link, the state-peer pause, and the Sepolia-only rule. Driven in tmux on a scratch port with a scratch keystore; sending needs a funded Sepolia keystore.
-- [Account history](./history.md) covers opting in, forward recording, the walk back to the Glamsterdam fork, the oracle comparison of recorded logs, restart and reconcile, `chibi status`, and the wallet's recent activity and history pane. Sends need a funded Sepolia key.
+- [Account history](./history.md) covers opting in, forward recording, the walk back to the Glamsterdam fork, the oracle comparison of recorded logs, restart and reconcile, `chibi status`, the wallet's recent activity and history pane, and how it hides address-poisoning bait. Sends need a funded Sepolia key.
