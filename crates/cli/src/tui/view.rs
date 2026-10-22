@@ -297,7 +297,7 @@ impl Table {
                     Span::raw(shown)
                 });
             }
-            Line::from(spans)
+            cut_line(spans, width)
         };
         let mut lines = Vec::with_capacity(self.rows.len() + 1);
         lines.push(line("  ", None, false).style(dim));
@@ -311,6 +311,28 @@ impl Table {
         }
         lines
     }
+}
+
+/// The `spans` cut to `width` columns, ending in `…` when cut.
+fn cut_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let columns: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    if columns <= width {
+        return Line::from(spans);
+    }
+    let mut room = width.saturating_sub(1);
+    let mut cut = Vec::with_capacity(spans.len());
+    for span in spans {
+        let count = span.content.chars().count();
+        if count < room {
+            room -= count;
+            cut.push(span);
+            continue;
+        }
+        let text: String = span.content.chars().take(room).chain(['…']).collect();
+        cut.push(Span::styled(text, span.style));
+        break;
+    }
+    Line::from(cut)
 }
 
 /// `text` in `width` columns: cut with `…` when wider, padded with spaces when `pad`.
@@ -3436,6 +3458,40 @@ mod tests {
         let rows = table(&app);
         assert!(rows[0].starts_with("  tx 5 "), "{rows:#?}");
         assert!(rows[5].starts_with("> tx 10 "), "{rows:#?}");
+    }
+
+    #[test]
+    fn below_the_mandatory_columns_width_each_table_row_takes_one_screen_row() {
+        let rows_of = |app: &App, width: u16, height: u16| -> Vec<String> {
+            sized(app, &[], width, height)
+                .lines()
+                .map(|row| row.trim_end().to_owned())
+                .collect()
+        };
+        let entries = (0..40)
+            .map(|n| {
+                let tx = format!("tx {n}");
+                let block = format!("11,900,{n:03}");
+                entry(
+                    100 - n,
+                    [&tx, &block, "1m", "0x1111…2222", "you", "+0.001 ETH", ""],
+                    false,
+                )
+            })
+            .collect();
+        let mut app = read(ready(), SENDER, entries);
+        press(&mut app, KeyCode::Char('h'));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Down);
+            let rows = rows_of(&app, 20, 16);
+            assert!(rows.iter().any(|row| row.starts_with("> ")), "{rows:#?}");
+        }
+
+        let app = read(watching_only(&[WEIHAN]), WEIHAN, five_entries());
+        let rows = rows_of(&app, 20, 60);
+        let recent = recent_rows(&rows).expect("a section");
+        assert_eq!(recent.len(), 7, "{rows:#?}");
+        assert!(recent.iter().all(|row| row.chars().count() <= 20));
     }
 
     #[test]
