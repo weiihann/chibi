@@ -282,6 +282,11 @@ fn approval(owner: Address, account: Address, what: &str) -> String {
 /// The widest an amount cell gets. The detail screen shows every amount exactly.
 pub const AMOUNT_COLUMNS: usize = 24;
 
+/// The counterparty cell of a row with a zero transfer the account did not send. Its address
+/// is an attacker's lookalike, and a shortened one shows just the part a lookalike copies; the
+/// detail screen names it in full with the warning.
+const HIDDEN: &str = "⚠ hidden";
+
 /// What the last line of an entry's details says when the read stopped inside it.
 const MORE_EFFECTS: &str = "more effects than chibi loaded";
 
@@ -538,7 +543,9 @@ fn entry(group: &[Activity], key: EntryKey, cut: bool, reader: &Reader<'_>) -> E
                 format!("{several} transfers")
             };
             let (from, to) = match &send {
+                Some(_) if warning => (you.clone(), HIDDEN.to_owned()),
                 Some(send) => (you.clone(), sent_to(send)),
+                None if warning => (HIDDEN.to_owned(), you.clone()),
                 None => ("several".to_owned(), you.clone()),
             };
             (amount, from, to)
@@ -608,7 +615,7 @@ fn moved_value(activity: &Activity, reader: &Reader<'_>) -> Option<Movement> {
                 Some(Movement {
                     amount: format!("⚠ {what}"),
                     from: party(*from),
-                    to: party(*to),
+                    to: HIDDEN.to_owned(),
                     flagged: true,
                 })
             } else {
@@ -1672,7 +1679,7 @@ mod tests {
         assert!(flagged[0].warning);
         assert_eq!(
             flagged[0].cells,
-            cells("0x6767…6767", "you", "0xd72A…8146", "⚠ 0.00 USDC", "")
+            cells("0x6767…6767", "you", "⚠ hidden", "⚠ 0.00 USDC", "")
         );
         assert!(
             detail_text(&flagged[0]).contains(
@@ -1689,11 +1696,18 @@ mod tests {
     }
 
     #[test]
-    fn a_grouped_summary_keeps_the_warning_marker_of_its_flagged_movements() {
+    fn a_grouped_summary_keeps_the_warning_marker_and_hides_its_counterparty() {
         let bait = || activity(At::Tx(9), Some(HASH), false, usdc(0, ACCOUNT, FRIEND));
         let three = entries(&[bait(), bait(), bait()], false, &reader(Owner::You));
         assert!(three[0].warning);
-        assert_eq!(three[0].cells.amount, "⚠ 3 transfers");
+        assert_eq!(
+            (
+                three[0].cells.from.as_str(),
+                three[0].cells.to.as_str(),
+                three[0].cells.amount.as_str()
+            ),
+            ("⚠ hidden", "you", "⚠ 3 transfers")
+        );
 
         let joined = [
             bait(),
@@ -1704,10 +1718,54 @@ mod tests {
                 usdc(1_000_000, FRIEND, ACCOUNT),
             ),
         ];
+        let row = &rows(&joined, Owner::You)[0];
         assert_eq!(
-            rows(&joined, Owner::You)[0].amount,
-            "⚠ 0.00 USDC, +1.00 USDC"
+            (row.from.as_str(), row.to.as_str(), row.amount.as_str()),
+            ("⚠ hidden", "you", "⚠ 0.00 USDC, +1.00 USDC")
         );
+    }
+
+    #[test]
+    fn a_flagged_row_never_shows_the_short_lookalike_address() {
+        let bait = || activity(At::Tx(9), Some(HASH), false, usdc(0, ACCOUNT, FRIEND));
+        let sent = activity(
+            At::Tx(9),
+            Some(HASH),
+            true,
+            Effect::Sent {
+                to: Some(FRIEND),
+                nonce: Some(4),
+                success: true,
+                fee: None,
+                value: None,
+            },
+        );
+        for group in [
+            vec![bait()],
+            vec![bait(), bait(), bait()],
+            vec![sent, bait(), bait()],
+        ] {
+            let entry = &entries(&group, false, &reader(Owner::You))[0];
+            let Cells { from, to, .. } = &entry.cells;
+            assert!(entry.warning);
+            assert!(
+                [from, to].contains(&&"⚠ hidden".to_owned()),
+                "{:?}",
+                entry.cells
+            );
+            assert!(
+                !format!("{:?}", entry.cells).contains("0xd72A"),
+                "{:?}",
+                entry.cells
+            );
+            assert!(
+                detail_text(entry)
+                    .iter()
+                    .any(|line| line.contains("0xd72A04f52788544702EA111E54B4B226Fd328146")),
+                "{:#?}",
+                entry.detail
+            );
+        }
     }
 
     #[test]

@@ -3135,8 +3135,8 @@ mod tests {
                     "0x5b20…77aa",
                     "11,962,527",
                     "13h",
-                    "0x1111…2222",
                     "you",
+                    "⚠ hidden",
                     "⚠ 0.00 USDC",
                     "",
                 ],
@@ -3184,7 +3184,7 @@ mod tests {
         "  0x671e…4543  11,969,090  7m   you           0xd72A…8146  -1.00 USDC                <0.000001",
         "  0x9a3c…01fe  11,966,550  2h   you           you          0.000000001 ETH           0.000016",
         "  withdrawal   11,962,690  13h  validator 42  you          +0.50 ETH",
-        "  0x5b20…77aa  11,962,527  13h  0x1111…2222   you          ⚠ 0.00 USDC",
+        "  0x5b20…77aa  11,962,527  13h  you           ⚠ hidden     ⚠ 0.00 USDC",
         "  0x0c4d…9e31  11,856,400  2d   you           0xAbFC…D06f  -0.000000000001669629 E…  0.000512",
     ];
 
@@ -3194,7 +3194,7 @@ mod tests {
         "  0x671e…4543  7m   you           0xd72A…8146  -1.00 USDC                <0.000001",
         "  0x9a3c…01fe  2h   you           you          0.000000001 ETH           0.000016",
         "  withdrawal   13h  validator 42  you          +0.50 ETH",
-        "  0x5b20…77aa  13h  0x1111…2222   you          ⚠ 0.00 USDC",
+        "  0x5b20…77aa  13h  you           ⚠ hidden     ⚠ 0.00 USDC",
         "  0x0c4d…9e31  2d   you           0xAbFC…D06f  -0.000000000001669629 E…  0.000512",
     ];
 
@@ -3204,7 +3204,7 @@ mod tests {
         "  0x671e…4543  7m   you           0xd72A…8146  -1.00 USDC",
         "  0x9a3c…01fe  2h   you           you          0.000000001 ETH",
         "  withdrawal   13h  validator 42  you          +0.50 ETH",
-        "  0x5b20…77aa  13h  0x1111…2222   you          ⚠ 0.00 USDC",
+        "  0x5b20…77aa  13h  you           ⚠ hidden     ⚠ 0.00 USDC",
         "  0x0c4d…9e31  2d   you           0xAbFC…D06f  -0.000000000001669629 E…",
     ];
 
@@ -3214,7 +3214,7 @@ mod tests {
         "  0x671e…4543  7m   0xd72A…8146  -1.00 USDC",
         "  0x9a3c…01fe  2h   you          0.000000001 ETH",
         "  withdrawal   13h  you          +0.50 ETH",
-        "  0x5b20…77aa  13h  you          ⚠ 0.00 USDC",
+        "  0x5b20…77aa  13h  ⚠ hidden     ⚠ 0.00 USDC",
         "  0x0c4d…9e31  2d   0xAbFC…D06f  -0.000000000001669629 E…",
     ];
 
@@ -3224,7 +3224,7 @@ mod tests {
         "  7m   0xd72A…8146  -1.00 USDC",
         "  2h   you          0.000000001 ETH",
         "  13h  you          +0.50 ETH",
-        "  13h  you          ⚠ 0.00 USDC",
+        "  13h  ⚠ hidden     ⚠ 0.00 USDC",
         "  2d   0xAbFC…D06f  -0.000000000001669629…",
     ];
 
