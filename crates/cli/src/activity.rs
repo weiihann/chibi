@@ -519,6 +519,8 @@ fn entry(group: &[Activity], key: EntryKey, cut: bool, reader: &Reader<'_>) -> E
                 .join(", ");
             let amount = if listed.chars().count() <= AMOUNT_COLUMNS {
                 listed
+            } else if warning {
+                format!("⚠ {several} transfers")
             } else {
                 format!("{several} transfers")
             };
@@ -1664,6 +1666,28 @@ mod tests {
         let unflagged = entries(&mine, false, &reader(Owner::You));
         assert!(!unflagged[0].warning);
         assert_eq!(unflagged[0].cells.amount, "-0.00 USDC");
+    }
+
+    #[test]
+    fn a_grouped_summary_keeps_the_warning_marker_of_its_flagged_movements() {
+        let bait = || activity(At::Tx(9), Some(HASH), false, usdc(0, ACCOUNT, FRIEND));
+        let three = entries(&[bait(), bait(), bait()], false, &reader(Owner::You));
+        assert!(three[0].warning);
+        assert_eq!(three[0].cells.amount, "⚠ 3 transfers");
+
+        let joined = [
+            bait(),
+            activity(
+                At::Tx(9),
+                Some(HASH),
+                false,
+                usdc(1_000_000, FRIEND, ACCOUNT),
+            ),
+        ];
+        assert_eq!(
+            rows(&joined, Owner::You)[0].amount,
+            "⚠ 0.00 USDC, +1.00 USDC"
+        );
     }
 
     #[test]
