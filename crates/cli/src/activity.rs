@@ -82,7 +82,7 @@ pub fn activity_line(
         "{}  {}  {}",
         grouped(activity.number),
         ago(now.saturating_sub(activity.timestamp)),
-        effect_text(activity, account, registry)
+        effect_text(activity, account, registry, short)
     )
 }
 
@@ -90,11 +90,17 @@ fn eth(amount: U256) -> String {
     format!("{} ETH", format_units(amount, ETH_DECIMALS))
 }
 
-/// `amount` of the ERC-20 `token`, with its symbol when the registry knows it.
-fn token_amount(amount: U256, token: Address, registry: &[Token]) -> String {
+/// `amount` of the ERC-20 `token`, with its symbol when the registry knows it, else with its
+/// address as `contract` writes it.
+fn token_amount(
+    amount: U256,
+    token: Address,
+    registry: &[Token],
+    contract: fn(Address) -> String,
+) -> String {
     match registry.iter().find(|known| known.address == token) {
         Some(known) => format!("{} {}", format_units(amount, known.decimals), known.symbol),
-        None => format!("{amount} of {}", short(token)),
+        None => format!("{amount} of {}", contract(token)),
     }
 }
 
@@ -108,7 +114,14 @@ fn movement(what: &str, from: Address, to: Address, account: Address) -> String 
     }
 }
 
-fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> String {
+/// What `activity` did, from `account`'s side, with each token and event contract address
+/// as `contract` writes it.
+fn effect_text(
+    activity: &Activity,
+    account: Address,
+    registry: &[Token],
+    contract: fn(Address) -> String,
+) -> String {
     match &activity.effect {
         Effect::Sent {
             to,
@@ -147,7 +160,7 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
             amount,
         } => {
             let text = movement(
-                &token_amount(*amount, *token, registry),
+                &token_amount(*amount, *token, registry, contract),
                 *from,
                 *to,
                 account,
@@ -164,7 +177,7 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
             to,
             id,
         } => movement(
-            &format!("NFT #{id} of {}", short(*token)),
+            &format!("NFT #{id} of {}", contract(*token)),
             *from,
             *to,
             account,
@@ -177,7 +190,7 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
             amount,
             ..
         } => movement(
-            &format!("{amount} of #{id} of {}", short(*token)),
+            &format!("{amount} of #{id} of {}", contract(*token)),
             *from,
             *to,
             account,
@@ -191,10 +204,10 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
             let allowance = if *amount == U256::MAX {
                 match registry.iter().find(|known| known.address == *token) {
                     Some(known) => format!("unlimited {}", known.symbol),
-                    None => format!("unlimited of {}", short(*token)),
+                    None => format!("unlimited of {}", contract(*token)),
                 }
             } else {
-                token_amount(*amount, *token, registry)
+                token_amount(*amount, *token, registry, contract)
             };
             approval(*owner, account, &format!("{spender} for {allowance}"))
         }
@@ -206,7 +219,7 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
         } => approval(
             *owner,
             account,
-            &format!("{approved} for NFT #{id} of {}", short(*token)),
+            &format!("{approved} for NFT #{id} of {}", contract(*token)),
         ),
         Effect::ApprovalForAll {
             token,
@@ -215,7 +228,7 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
             approved,
         } => {
             let verb = if *approved { "approved" } else { "revoked" };
-            let what = format!("{operator} for all of {}", short(*token));
+            let what = format!("{operator} for all of {}", contract(*token));
             if *owner == account {
                 format!("{verb} {what}")
             } else {
@@ -253,7 +266,7 @@ fn effect_text(activity: &Activity, account: Address, registry: &[Token]) -> Str
                 format!("{text} (not confirmed: no state change recorded for this block)")
             }
         }
-        Effect::Other { emitter, .. } => format!("event from {}", short(*emitter)),
+        Effect::Other { emitter, .. } => format!("event from {}", contract(*emitter)),
     }
 }
 
@@ -590,7 +603,7 @@ fn moved_value(activity: &Activity, reader: &Reader<'_>) -> Option<Movement> {
             to,
             amount,
         } => {
-            let what = token_amount(*amount, *token, reader.registry);
+            let what = token_amount(*amount, *token, reader.registry, short);
             if amount.is_zero() && *from == account && *to != account && !activity.sent {
                 Some(Movement {
                     amount: format!("⚠ {what}"),
@@ -753,7 +766,14 @@ fn detail(
     let effects: Vec<DetailLine> = group
         .iter()
         .filter(|activity| !matches!(activity.effect, Effect::Sent { .. }))
-        .map(|activity| DetailLine::Text(effect_text(activity, reader.account, reader.registry)))
+        .map(|activity| {
+            DetailLine::Text(effect_text(
+                activity,
+                reader.account,
+                reader.registry,
+                |address| address.to_string(),
+            ))
+        })
         .collect();
     if !effects.is_empty() || cut {
         lines.push(DetailLine::Blank);
@@ -1687,6 +1707,53 @@ mod tests {
         assert_eq!(
             rows(&joined, Owner::You)[0].amount,
             "⚠ 0.00 USDC, +1.00 USDC"
+        );
+    }
+
+    #[test]
+    fn details_name_unknown_tokens_and_event_emitters_in_full() {
+        let mystery = address!("0xAbFC25F2A93829e9A500A5641222F1f2530BD06f");
+        let unknown = activity(
+            At::Tx(2),
+            Some(HASH),
+            false,
+            Effect::Token {
+                token: mystery,
+                from: FRIEND,
+                to: ACCOUNT,
+                amount: U256::from(5),
+            },
+        );
+        let event = activity(
+            At::Tx(2),
+            Some(HASH),
+            false,
+            Effect::Other {
+                emitter: mystery,
+                topic0: None,
+            },
+        );
+        let shown = entries(std::slice::from_ref(&unknown), false, &reader(Owner::You));
+        assert_eq!(shown[0].cells.amount, "+5 of 0xAbFC…D06f");
+        assert!(
+            detail_text(&shown[0]).contains(
+                &"+5 of 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f from \
+                  0xd72A04f52788544702EA111E54B4B226Fd328146"
+                    .to_owned()
+            ),
+            "{:#?}",
+            shown[0].detail
+        );
+        let shown = entries(&[event], false, &reader(Owner::You));
+        assert!(
+            detail_text(&shown[0])
+                .contains(&"event from 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f".to_owned()),
+            "{:#?}",
+            shown[0].detail
+        );
+        assert_eq!(
+            activity_line(&unknown, ACCOUNT, &SEPOLIA, NOW),
+            "11,969,090  7 min ago  +5 of 0xAbFC…D06f from 0xd72A04f52788544702EA111E54B4B226Fd328146"
         );
     }
 
