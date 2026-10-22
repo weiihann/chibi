@@ -3163,6 +3163,16 @@ mod tests {
         "  0x0c4d…9e31  11,856,400  2d   you           0xAbFC…D06f  -0.000000000001669629 E…  0.000512",
     ];
 
+    /// [`five_entries`] in a body 88 columns wide: Block dropped, Fee kept.
+    const AT_88: [&str; 6] = [
+        "  Txn Hash     Age  From          To           Amount                    Fee",
+        "  0x671e…4543  7m   you           0xd72A…8146  -1.00 USDC                <0.000001",
+        "  0x9a3c…01fe  2h   you           you          0.000000001 ETH           0.000016",
+        "  withdrawal   13h  validator 42  you          +0.50 ETH",
+        "  0x5b20…77aa  13h  0x1111…2222   you          ⚠ 0.00 USDC",
+        "  0x0c4d…9e31  2d   you           0xAbFC…D06f  -0.000000000001669629 E…  0.000512",
+    ];
+
     /// [`five_entries`] in a body 72 columns wide: Block and Fee dropped.
     const AT_72: [&str; 6] = [
         "  Txn Hash     Age  From          To           Amount",
@@ -3171,6 +3181,16 @@ mod tests {
         "  withdrawal   13h  validator 42  you          +0.50 ETH",
         "  0x5b20…77aa  13h  0x1111…2222   you          ⚠ 0.00 USDC",
         "  0x0c4d…9e31  2d   you           0xAbFC…D06f  -0.000000000001669629 E…",
+    ];
+
+    /// [`five_entries`] in a body 60 columns wide: From dropped too, Txn Hash kept.
+    const AT_60: [&str; 6] = [
+        "  Txn Hash     Age  To           Amount",
+        "  0x671e…4543  7m   0xd72A…8146  -1.00 USDC",
+        "  0x9a3c…01fe  2h   you          0.000000001 ETH",
+        "  withdrawal   13h  you          +0.50 ETH",
+        "  0x5b20…77aa  13h  you          ⚠ 0.00 USDC",
+        "  0x0c4d…9e31  2d   0xAbFC…D06f  -0.000000000001669629 E…",
     ];
 
     /// [`five_entries`] in a body 42 columns wide: From and Txn Hash dropped too, Amount cut.
@@ -3247,7 +3267,13 @@ mod tests {
     fn narrow_bodies_drop_block_fee_from_then_txn_hash_and_cut_the_amount() {
         let mut app = read(ready(), SENDER, five_entries());
         press(&mut app, KeyCode::Char('h'));
-        for (width, table) in [(120, AT_112), (80, AT_72), (50, AT_42)] {
+        for (width, table) in [
+            (120, AT_112),
+            (96, AT_88),
+            (80, AT_72),
+            (68, AT_60),
+            (50, AT_42),
+        ] {
             let rows = inside_rows(&app, width, 24);
             let heading = rows
                 .iter()
