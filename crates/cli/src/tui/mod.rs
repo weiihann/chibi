@@ -394,7 +394,8 @@ struct Ui<'a> {
 }
 
 impl Ui<'_> {
-    /// Hands the render thread the screen for the current state.
+    /// Hands the render thread the screen for the current state, and stores in the app where
+    /// its details end on that screen, so the next key scrolls them against what is drawn.
     fn draw(&mut self) -> eyre::Result<()> {
         let logs = if self.app.logs {
             self.logs.tail(usize::from(view::LOG_PANE_LINES))
@@ -403,6 +404,7 @@ impl Ui<'_> {
         };
         let now = Instant::now();
         self.app.shown(now);
+        self.app.set_detail_end(view::detail_end(&self.app));
         self.views
             .send(View::new(&self.app, logs, now))
             .map_err(|_| eyre::eyre!("the terminal UI stopped drawing"))

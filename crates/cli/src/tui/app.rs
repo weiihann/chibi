@@ -14,7 +14,6 @@ use crate::activity::{self, format_units};
 use crate::config::{AddressError, parse_address};
 use crate::tui::cat::Pose;
 use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
-use crate::tui::view;
 use crate::tui::wallet::{self, SECRET_BYTES, Secret};
 
 /// Heads a sent transfer may stay pending before the screen says it is still pending.
@@ -664,6 +663,9 @@ pub struct App {
     pub width: u16,
     /// The terminal's height in rows.
     pub height: u16,
+    /// The last display row the open details may start from, as the control loop last
+    /// measured it; 0 when no details show.
+    detail_end: usize,
     quit_armed: bool,
     address_back: Screen,
     balances_asked: Option<(u64, usize)>,
@@ -716,6 +718,7 @@ impl App {
             pixel_cats: false,
             width: 0,
             height: 0,
+            detail_end: 0,
             entered: None,
         }
     }
@@ -841,6 +844,12 @@ impl App {
     /// Whether the history pane is open over the body.
     pub fn history_shown(&self) -> bool {
         self.history_mode() != HistoryMode::Closed
+    }
+
+    /// Stores the last display row the open details may start from, which Up and Down
+    /// clamp to. The control loop measures it after every change and before the next key.
+    pub fn set_detail_end(&mut self, end: usize) {
+        self.detail_end = end;
     }
 
     /// The account to read history for, marking it asked: while history shows, in the pane
@@ -1332,7 +1341,7 @@ impl App {
             self.logs = !self.logs;
             return None;
         }
-        let (account, end) = (self.history_account(), view::detail_end(self));
+        let (account, end) = (self.history_account(), self.detail_end);
         if self.history_key()
             && let Some(pane) = &mut self.history
         {
@@ -4229,25 +4238,6 @@ mod tests {
         app.history_read(WEIHAN, Some(history_of(13, 10)));
         assert_eq!(selected(&app), Some(2));
         press(&mut app, KeyCode::Char('h'));
-        assert_eq!(selected(&app), Some(0));
-    }
-
-    #[test]
-    fn up_and_down_scroll_the_details_by_a_row_until_their_last_row_shows() {
-        let mut app = with_history(watching());
-        (app.width, app.height) = (80, 4);
-        press(&mut app, KeyCode::Char('h'));
-        app.history_request(false);
-        app.history_read(WEIHAN, Some(history_lines(2)));
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Up);
-        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 0 }));
-        for _ in 0..5 {
-            press(&mut app, KeyCode::Down);
-        }
-        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 2 }));
-        press(&mut app, KeyCode::Up);
-        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 1 }));
         assert_eq!(selected(&app), Some(0));
     }
 

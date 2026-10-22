@@ -3050,7 +3050,10 @@ mod tests {
         }
     }
 
+    /// Presses `code` the way the control loop does: storing where the details drawn end
+    /// first.
     fn press(app: &mut App, code: KeyCode) {
+        app.set_detail_end(detail_end(app));
         app.key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
@@ -3432,6 +3435,29 @@ mod tests {
         press(&mut app, KeyCode::Up);
         let up = body(&app);
         assert_eq!(up[2..], end[1..end.len() - 1], "{up:#?}");
+    }
+
+    #[test]
+    fn up_and_down_scroll_the_details_by_a_row_between_their_first_and_last_start() {
+        let mut app = read(watching(), WEIHAN, five_entries());
+        (app.width, app.height) = (80, 8);
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Enter);
+        let first = |app: &App| match app.history_mode() {
+            HistoryMode::Detail { first } => Some(first),
+            HistoryMode::Closed | HistoryMode::List => None,
+        };
+        press(&mut app, KeyCode::Up);
+        assert_eq!(first(&app), Some(0));
+        let end = detail_end(&app);
+        assert!(end >= 2, "{end}");
+        for _ in 0..end + 5 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(first(&app), Some(end));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(first(&app), Some(end - 1));
+        assert_eq!(app.history.as_ref().map(|pane| pane.selected), Some(0));
     }
 
     #[test]
