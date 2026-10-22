@@ -773,13 +773,14 @@ impl App {
         self.history_key() && self.history.as_ref().is_some_and(|pane| pane.open)
     }
 
-    /// The account to read history for, marking it asked: while the pane is open and no read
-    /// is outstanding, when `due` (the balances refresh) or the account in view is not the
-    /// one last asked for.
+    /// The account to read history for, marking it asked: while history shows, in the pane
+    /// or under the form or the watch list, and no read is outstanding, when `due` (the
+    /// balances refresh) or the account in view is not the one last asked for.
     pub fn history_request(&mut self, due: bool) -> Option<Address> {
         let account = self.history_account()?;
+        let shown = self.history_shown() || matches!(self.screen, Screen::Ready | Screen::Watching);
         let pane = self.history.as_mut()?;
-        if !pane.open || pane.reading || !due && pane.asked == Some(account) {
+        if !shown || pane.reading || !due && pane.asked == Some(account) {
             return None;
         }
         pane.asked = Some(account);
@@ -3978,9 +3979,30 @@ mod tests {
     }
 
     #[test]
-    fn history_is_read_for_the_account_in_view_while_the_pane_is_open() {
+    fn history_is_read_on_the_send_form_and_the_watch_screen_with_the_pane_closed() {
+        let mut app = with_history(ready(Network::Sepolia));
+        app.form.field = Field::To;
+        assert_eq!(app.history_request(false), Some(SENDER));
+        app.history_read(SENDER, Some(history_lines(1)));
+        assert_eq!(app.history_request(false), None);
+        assert_eq!(app.history_request(true), Some(SENDER));
+
         let mut app = with_history(watching());
+        assert!(!history_open(&app));
+        assert_eq!(app.history_request(false), Some(WEIHAN));
+        app.history_read(WEIHAN, Some(history_lines(1)));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.history_request(false), Some(SENDER));
+
+        let mut app = with_history(ready(Network::Sepolia));
+        submit(&mut app, "1", BOB, Ok(FEE));
+        assert_eq!(app.screen, Screen::Review);
         assert_eq!(app.history_request(true), None);
+    }
+
+    #[test]
+    fn history_is_read_for_the_account_in_view() {
+        let mut app = with_history(watching());
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.history_request(false), Some(WEIHAN));
         assert_eq!(app.history_request(true), None);

@@ -41,7 +41,7 @@ use crate::run::{self, STARTING, Served};
 /// Log lines kept for the log pane.
 const LOG_LINES: usize = 1_000;
 
-/// Activities the history pane loads, newest first.
+/// Activities a history read loads, newest first, for the pane and the recent activity.
 const HISTORY_ACTIVITIES: usize = 50;
 
 /// How often the TUI animates the ASCII cats, reads the node's health, and tracks a sent
@@ -693,7 +693,7 @@ fn refresh_balances<P: Peers>(
 }
 
 /// Reads `account`'s history from `data_dir` off the event loop. A failed read is logged and
-/// answered with no lines, so the pane keeps its last ones.
+/// answered with no lines, so the wallet keeps its last ones.
 fn refresh_history(
     data_dir: &Path,
     account: Address,

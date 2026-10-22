@@ -115,6 +115,8 @@ enum Body {
         side: Option<u32>,
         /// The token list, drawn over the form.
         picker: Option<Popup>,
+        /// The account's newest activities, under the rows where they fit.
+        recent: Option<Recent>,
     },
     /// The watched addresses, scrolled by address, drawn as a page: Watching.
     Watch {
@@ -126,7 +128,44 @@ enum Body {
         after: Vec<Row>,
         /// The idle cat's frame, drawn right of the list where it fits.
         side: Option<u32>,
+        /// The account's newest activities, under the list where they fit.
+        recent: Option<Recent>,
     },
+}
+
+/// The account's newest activities shown under a page, in the rows it leaves.
+#[derive(Clone, Debug)]
+struct Recent {
+    heading: Line<'static>,
+    /// One row per activity, newest first, or one saying there is none.
+    rows: Vec<Row>,
+}
+
+impl Recent {
+    /// A blank line, the heading and the newest lines that fit whole in `room` rows of a
+    /// body `width` columns wide; none unless the heading and one line fit.
+    fn fitted(self, width: u16, room: usize) -> Vec<Line<'static>> {
+        let height = |lines: &[Line<'static>]| {
+            Paragraph::new(lines.to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+        };
+        let mut used = 1 + height(std::slice::from_ref(&self.heading));
+        let mut lines = vec![Line::default(), self.heading];
+        for row in self.rows {
+            let mut laid = Vec::new();
+            row.lay_out(usize::from(width), &mut laid);
+            used += height(&laid);
+            if used > room {
+                break;
+            }
+            lines.extend(laid);
+        }
+        if lines.len() == 2 {
+            lines.clear();
+        }
+        lines
+    }
 }
 
 /// A watch list laid out for a body of a given width.
@@ -248,6 +287,8 @@ impl WatchList {
 enum Row {
     /// A line word-wrapped to the body's width.
     Text(Line<'static>),
+    /// A line wrapped at spaces, each continuation [`HANGING_INDENT`] in.
+    Hanging(String),
     /// A form row: its label, then its values [`VALUE_GAP`] apart, each kept whole. A value
     /// that does not fit on the line starts the next one, under the first value.
     Form {
@@ -261,6 +302,7 @@ impl Row {
     fn lay_out(self, width: usize, lines: &mut Vec<Line<'static>>) {
         let (label, values) = match self {
             Self::Text(line) => return lines.push(line),
+            Self::Hanging(text) => return lines.extend(hanging(&text, width)),
             Self::Form { label, values } => (label, values),
         };
         let mut line = Line::from(label);
@@ -370,12 +412,18 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
     let (mut areas, mut footer) = split(area, &keys, notice.as_ref(), pane);
     match view.body {
         Body::Scene { cat, lines } => scene(frame, cat, lines, areas[0]),
-        Body::Page { rows, side, picker } => page(frame, rows, side, picker, areas[0]),
+        Body::Page {
+            rows,
+            side,
+            picker,
+            recent,
+        } => page(frame, rows, side, picker, recent, areas[0]),
         Body::Watch {
             addresses,
             first,
             after,
             side,
+            recent,
         } => {
             let list = WatchList::new(addresses, first, after, area.width);
             if list.scrolls(areas[0].height) {
@@ -383,7 +431,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
                 (areas, footer) = split(area, &keys, notice.as_ref(), pane);
             }
             let rows = list.rows(areas[0].height);
-            page(frame, rows, side, None, areas[0]);
+            page(frame, rows, side, None, recent, areas[0]);
         }
     }
     let [_, notice_area, footer_area, log_area] = areas;
@@ -487,12 +535,13 @@ fn cat_scale(body: Rect) -> usize {
 }
 
 /// Draws `rows` from the top left of `body`, the side cat right of them where it fits,
-/// and the token list over them.
+/// `recent` in the rows left under both, and the token list over them.
 fn page(
     frame: &mut Frame<'_>,
     rows: Vec<Row>,
     side: Option<u32>,
     picker: Option<Popup>,
+    recent: Option<Recent>,
     body: Rect,
 ) {
     let mut lines = Vec::with_capacity(rows.len());
@@ -515,7 +564,21 @@ fn page(
         let lines = popup.lines(usize::from(room));
         (popup_area(popup.widest(), lines.len(), top, body), lines)
     });
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+    let page = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let recent = recent.map(|recent| {
+        let cat_rows = side.as_ref().map_or(0, |(rect, _)| rect.bottom() - body.y);
+        let top = u16::try_from(page.line_count(body.width))
+            .unwrap_or(u16::MAX)
+            .max(cat_rows);
+        let room = body.height.saturating_sub(top);
+        let lines = recent.fitted(body.width, usize::from(room));
+        let rect = Rect::new(body.x, body.y.saturating_add(top), body.width, room);
+        (rect.intersection(body), lines)
+    });
+    frame.render_widget(page, body);
+    if let Some((rect, lines)) = recent {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rect);
+    }
     if let Some((rect, cat)) = side {
         frame.render_widget(Paragraph::new(cat), rect);
     }
@@ -609,18 +672,55 @@ fn pick<T: Copy, const N: usize>(frames: &[T; N], tick: u64) -> T {
 
 /// A page of `lines` under a blank one, with no side cat or token list.
 fn plain(write: impl FnOnce(&mut Vec<Line<'static>>)) -> Body {
-    let mut lines = vec![Line::default()];
+    let mut lines = Vec::new();
     write(&mut lines);
+    rows(lines.into_iter().map(Row::Text).collect())
+}
+
+/// A page of `rows` under a blank line, with no side cat or token list.
+fn rows(rows: Vec<Row>) -> Body {
     Body::Page {
-        rows: lines.into_iter().map(Row::Text).collect(),
+        rows: std::iter::once(Row::Text(Line::default()))
+            .chain(rows)
+            .collect(),
         side: None,
         picker: None,
+        recent: None,
     }
+}
+
+/// The newest activities of the account in view, once a read for it has finished, headed
+/// by the account itself when several addresses are watched.
+fn recent(app: &App) -> Option<Recent> {
+    let account = app.history_account()?;
+    let (read, history) = app.history.as_ref()?.read.as_ref()?;
+    if *read != account {
+        return None;
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let heading = if app.screen == Screen::Watching && app.watched.len() > 1 {
+        format!("  recent activity of {}", account.to_checksum(None))
+    } else {
+        "  recent activity".to_owned()
+    };
+    let rows = if history.activities.is_empty() {
+        vec![Row::Text(Line::styled("  no activity recorded yet", dim))]
+    } else {
+        history
+            .activities
+            .iter()
+            .map(|activity| Row::Hanging(format!("  {activity}")))
+            .collect()
+    };
+    Some(Recent {
+        heading: Line::styled(heading, dim),
+        rows,
+    })
 }
 
 fn body(app: &App, now: Instant) -> Body {
     if app.history_shown() {
-        return plain(|lines| history(app, lines));
+        return rows(history(app));
     }
     match app.screen {
         Screen::Menu => plain(|lines| menu(app, lines)),
@@ -664,7 +764,12 @@ fn body(app: &App, now: Instant) -> Body {
             let picker = picker_popup(app, token_row);
             let side =
                 (app.cat() == Some(Pose::Idle) && picker.is_none()).then(|| app.cat_frame(now));
-            Body::Page { rows, side, picker }
+            Body::Page {
+                rows,
+                side,
+                picker,
+                recent: recent(app),
+            }
         }
         Screen::Watching => {
             let mut after = Vec::new();
@@ -678,6 +783,7 @@ fn body(app: &App, now: Instant) -> Body {
                 first: app.watch_first,
                 after,
                 side: (app.cat() == Some(Pose::Idle)).then(|| app.cat_frame(now)),
+                recent: recent(app),
             }
         }
         Screen::Review => plain(|lines| review(app, lines)),
@@ -1120,32 +1226,85 @@ fn sending(app: &App, now: Instant) -> Body {
     }
 }
 
+/// How far an activity's continuation rows sit in from the body's edge.
+const HANGING_INDENT: &str = "    ";
+
+/// `text` in lines at most `width` columns wide, broken at spaces with each continuation
+/// [`HANGING_INDENT`] in, and a word wider than a continuation's room split at the width.
+fn hanging(text: &str, width: usize) -> Vec<Line<'static>> {
+    let columns = |text: &str| text.chars().count();
+    if columns(text) <= width {
+        return vec![Line::raw(text.to_owned())];
+    }
+    let words = text.trim_start_matches(' ');
+    let mut line = text[..text.len() - words.len()].to_owned();
+    let mut lines = Vec::new();
+    let mut fresh = true;
+    let mut gap = 1;
+    for word in words.split(' ') {
+        if word.is_empty() {
+            gap += 1;
+            continue;
+        }
+        if !fresh {
+            if columns(&line) + gap + columns(word) > width {
+                lines.push(Line::raw(std::mem::replace(
+                    &mut line,
+                    HANGING_INDENT.to_owned(),
+                )));
+            } else {
+                line.extend(std::iter::repeat_n(' ', gap));
+            }
+        }
+        let mut word = word;
+        loop {
+            let room = width.saturating_sub(columns(&line)).max(1);
+            let Some((split, _)) = word.char_indices().nth(room) else {
+                line.push_str(word);
+                break;
+            };
+            line.push_str(&word[..split]);
+            lines.push(Line::raw(std::mem::replace(
+                &mut line,
+                HANGING_INDENT.to_owned(),
+            )));
+            word = &word[split..];
+        }
+        fresh = false;
+        gap = 1;
+    }
+    lines.push(Line::raw(line));
+    lines
+}
+
 /// The history pane: the account, its coverage, then its activities from the first scrolled
 /// to, as many as the body holds.
-fn history(app: &App, lines: &mut Vec<Line<'static>>) {
+fn history(app: &App) -> Vec<Row> {
     let Some(account) = app.history_account() else {
-        return;
+        return Vec::new();
     };
-    lines.push(Line::raw(format!("  {}", account.to_checksum(None))));
+    let text = |text: String| Row::Text(Line::raw(text));
+    let mut rows = vec![text(format!("  {}", account.to_checksum(None)))];
     let read = app
         .history
         .as_ref()
         .and_then(|pane| Some((pane.read.as_ref()?, pane.first)));
     match read {
         Some(((read, history), first)) if *read == account => {
-            lines.push(Line::raw(format!("  {}", history.coverage)));
+            rows.push(Row::Hanging(format!("  {}", history.coverage)));
             if history.activities.is_empty() {
-                return;
+                return rows;
             }
-            lines.push(Line::default());
-            lines.extend(
+            rows.push(Row::Text(Line::default()));
+            rows.extend(
                 history.activities[first.min(history.activities.len())..]
                     .iter()
-                    .map(|activity| Line::raw(format!("  {activity}"))),
+                    .map(|activity| Row::Hanging(format!("  {activity}"))),
             );
         }
-        Some(_) | None => lines.push(Line::raw("  reading history...")),
+        Some(_) | None => rows.push(text("  reading history...".to_owned())),
     }
+    rows
 }
 
 /// The keys the footer names on Watching when some address is hidden.
@@ -2524,7 +2683,7 @@ mod tests {
                 .take(usize::from(height))
                 .map(|row| match row {
                     Row::Text(line) => line.to_string().trim_end().to_owned(),
-                    Row::Form { .. } => unreachable!(),
+                    Row::Form { .. } | Row::Hanging(_) => unreachable!(),
                 })
                 .collect::<Vec<_>>()
         };
@@ -2648,6 +2807,41 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_coverage_line_continues_four_spaces_in_without_splitting_a_dot() {
+        let mut app = with_history(ready());
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(SENDER));
+        let coverage = "history since block 11,962,247 · gaps: 11,966,534-11,966,544, 11,966,588-11,966,605 · nonce 42 unexplained between blocks 11,962,690 and 11,966,550 · earlier sends may predate the history";
+        app.history_read(
+            SENDER,
+            Some(HistoryLines {
+                coverage: coverage.to_owned(),
+                activities: Vec::new(),
+            }),
+        );
+        let rows = inside_rows(&app, 80, 24);
+        let start = rows
+            .iter()
+            .position(|row| row.starts_with("  history since"))
+            .expect("coverage row");
+        let end = start
+            + rows[start..]
+                .iter()
+                .take_while(|row| !row.is_empty())
+                .count();
+        let wrapped = &rows[start..end];
+        assert!(wrapped.len() > 1, "{rows:#?}");
+        for row in &wrapped[1..] {
+            assert!(
+                row.starts_with("    ") && !row.starts_with("     "),
+                "{rows:#?}"
+            );
+        }
+        let joined: Vec<&str> = wrapped.iter().map(|row| row.trim()).collect();
+        assert_eq!(joined.join(" "), coverage, "{rows:#?}");
+    }
+
+    #[test]
     fn the_history_pane_says_when_nothing_is_recorded_yet() {
         let mut app = with_history(watching());
         press(&mut app, KeyCode::Char('h'));
@@ -2699,5 +2893,264 @@ mod tests {
         let mut app = with_history(ready());
         app.form.field = Field::To;
         assert!(!inside(&app, &[], 120, 30).contains("h history"));
+    }
+
+    /// Five activities, newest first, each 83 columns wide indented.
+    fn five_activities() -> Vec<String> {
+        (0..5)
+            .map(|n| format!("11,900,00{n}  {n} min ago  +0.00{n} ETH from 0x1111000000000000000000000000000000002222"))
+            .collect()
+    }
+
+    /// `app` with history on and `activities` read for `account`.
+    fn read(app: App, account: Address, activities: Vec<String>) -> App {
+        let mut app = with_history(app);
+        assert_eq!(app.history_request(false), Some(account));
+        app.history_read(
+            account,
+            Some(HistoryLines {
+                coverage: "history since block 11,856,337 · gaps: none · no sends found".to_owned(),
+                activities,
+            }),
+        );
+        app
+    }
+
+    /// The rows from the `recent activity` heading's blank row on, `None` without one.
+    fn recent_rows(rows: &[String]) -> Option<Vec<String>> {
+        let heading = rows
+            .iter()
+            .position(|row| row.starts_with("  recent activity"))?;
+        assert_eq!(rows[heading - 1], "", "{rows:#?}");
+        Some(
+            rows[heading..]
+                .iter()
+                .take_while(|row| !row.is_empty())
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn cat_cells(buffer: &Buffer) -> Vec<(u16, u16, Cell)> {
+        let width = buffer.area().width;
+        (0..buffer.area().height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&at| half_block(buffer[at].symbol()))
+            .map(|(x, y)| (x, y, buffer[(x, y)].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_send_form_shows_the_newest_activities_under_it_with_the_cat_in_place() {
+        let mut app = ready();
+        app.pixel_cats = true;
+        app.width = 120;
+        let alone = drawn(&app, &[], 120, 40);
+        let activities = five_activities();
+        let app = read(app, SENDER, activities.clone());
+        let rows = inside_rows(&app, 120, 40);
+        let mut expected = vec!["  recent activity".to_owned()];
+        expected.extend(activities.iter().map(|activity| format!("  {activity}")));
+        assert_eq!(recent_rows(&rows), Some(expected), "{rows:#?}");
+        let heading = rows.iter().position(|row| row == "  recent activity");
+        let fee = rows.iter().position(|row| row.contains("  fee"));
+        assert!(fee < heading, "{rows:#?}");
+        let with = drawn(&app, &[], 120, 40);
+        assert!(!cat_cells(&alone).is_empty());
+        assert_eq!(cat_cells(&with), cat_cells(&alone));
+        let cat_bottom = cat_cells(&with).iter().map(|&(_, y, _)| y).max().unwrap();
+        let heading_y = (0..40)
+            .find(|&y| row_from(&with, 0, y).contains("recent activity"))
+            .unwrap();
+        assert!(heading_y > cat_bottom + 1, "{heading_y} {cat_bottom}");
+    }
+
+    #[test]
+    fn a_short_send_form_shows_only_the_whole_activities_that_fit() {
+        let app = read(ready(), SENDER, five_activities());
+        let activity = |n: usize| {
+            [
+                format!("  11,900,00{n}  {n} min ago  +0.00{n} ETH from"),
+                "    0x1111000000000000000000000000000000002222".to_owned(),
+            ]
+        };
+        let expected = |shown: usize| {
+            let mut rows = vec!["  recent activity".to_owned()];
+            rows.extend((0..shown).flat_map(activity));
+            Some(rows)
+        };
+        let rows = inside_rows(&app, 80, 24);
+        assert_eq!(recent_rows(&rows), expected(4), "{rows:#?}");
+        let rows = inside_rows(&app, 80, 22);
+        assert_eq!(recent_rows(&rows), expected(3), "{rows:#?}");
+        let rows = inside_rows(&app, 80, 18);
+        assert_eq!(recent_rows(&rows), expected(1), "{rows:#?}");
+
+        let rows = inside_rows(&app, 80, 16);
+        assert_eq!(recent_rows(&rows), None, "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("  fee")), "{rows:#?}");
+    }
+
+    /// Four activities, newest first, of the widths a real account shows.
+    fn sends() -> Vec<String> {
+        [
+            "11,966,550  2 min ago  sent 0.000000001 ETH to self (nonce 43, fee 0.00000000001578 ETH)",
+            "11,962,690  13 h ago  sent 0.000000001 ETH to self (nonce 41, fee 0.000000000000252 ETH)",
+            "11,962,527  13 h ago  -0.000000001 ETH to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f",
+            "11,962,527  13 h ago  sent to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f (nonce 40, fee 0.0000000000151404 ETH)",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// [`sends`] laid out in a body 72 columns wide.
+    const SENDS_AT_72: [&[&str]; 4] = [
+        &[
+            "  11,966,550  2 min ago  sent 0.000000001 ETH to self (nonce 43, fee",
+            "    0.00000000001578 ETH)",
+        ],
+        &[
+            "  11,962,690  13 h ago  sent 0.000000001 ETH to self (nonce 41, fee",
+            "    0.000000000000252 ETH)",
+        ],
+        &[
+            "  11,962,527  13 h ago  -0.000000001 ETH to",
+            "    0xAbFC25F2A93829e9A500A5641222F1f2530BD06f",
+        ],
+        &[
+            "  11,962,527  13 h ago  sent to",
+            "    0xAbFC25F2A93829e9A500A5641222F1f2530BD06f (nonce 40, fee",
+            "    0.0000000000151404 ETH)",
+        ],
+    ];
+
+    #[test]
+    fn a_long_activity_continues_indented_under_itself_on_the_send_form() {
+        let app = read(ready(), SENDER, sends());
+        let expected = |shown: usize| {
+            let mut rows = vec!["  recent activity"];
+            rows.extend(SENDS_AT_72[..shown].concat());
+            rows
+        };
+        let rows = inside_rows(&app, 80, 24);
+        let mut whole = expected(4);
+        whole.push("up/down field · Enter or left/right token · type amount (or max) and to");
+        let recent = recent_rows(&rows).expect("a section");
+        assert_eq!(recent[..recent.len() - 1], whole, "{rows:#?}");
+        let rows = inside_rows(&app, 80, 23);
+        let recent = recent_rows(&rows).expect("a section");
+        assert_eq!(recent, expected(3), "{rows:#?}");
+
+        let rows = inside_rows(&app, 120, 40);
+        let mut expected = vec!["  recent activity".to_owned()];
+        expected.extend(sends()[..3].iter().map(|activity| format!("  {activity}")));
+        expected.extend([
+            "  11,962,527  13 h ago  sent to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f (nonce 40, fee 0.0000000000151404".to_owned(),
+            "    ETH)".to_owned(),
+        ]);
+        assert_eq!(recent_rows(&rows), Some(expected), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_long_activity_continues_indented_under_itself_in_the_history_pane() {
+        let mut app = read(ready(), SENDER, sends());
+        press(&mut app, KeyCode::Char('h'));
+        let rows = inside_rows(&app, 80, 24);
+        let expected: Vec<&str> = SENDS_AT_72.concat();
+        assert_eq!(rows[4..4 + expected.len()], expected, "{rows:#?}");
+
+        press(&mut app, KeyCode::Down);
+        let rows = inside_rows(&app, 80, 24);
+        let expected: Vec<&str> = SENDS_AT_72[1..].concat();
+        assert_eq!(rows[4..4 + expected.len()], expected, "{rows:#?}");
+    }
+
+    #[test]
+    fn a_word_wider_than_a_continuation_row_is_split_at_the_width() {
+        let lines = hanging("  1  to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f", 20);
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rows,
+            [
+                "  1  to",
+                "    0xAbFC25F2A93829",
+                "    e9A500A5641222F1",
+                "    f2530BD06f",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_watch_screen_names_the_account_of_its_activities_only_when_watching_several() {
+        let activities = five_activities();
+        let one = read(watching_only(&[WEIHAN]), WEIHAN, activities.clone());
+        let rows = inside_rows(&one, 120, 30);
+        let recent = recent_rows(&rows).expect("a section");
+        assert_eq!(recent[0], "  recent activity");
+        assert_eq!(recent[1], format!("  {}", activities[0]));
+
+        let several = read(watching(), WEIHAN, activities.clone());
+        let rows = inside_rows(&several, 120, 30);
+        let recent = recent_rows(&rows).expect("a section");
+        assert_eq!(
+            recent[..2],
+            [
+                "  recent activity of 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7".to_owned(),
+                format!("  {}", activities[0])
+            ]
+        );
+        let list = rows
+            .iter()
+            .position(|row| row.contains("0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025"));
+        let heading = rows
+            .iter()
+            .position(|row| row.starts_with("  recent activity"));
+        assert!(list < heading, "{rows:#?}");
+
+        let twelve: Vec<Address> = (1..=12).map(Address::with_last_byte).collect();
+        let off = inside_rows(&watching_only(&twelve), 120, 16);
+        let on = read(watching_only(&twelve), twelve[0], activities);
+        let rows = inside_rows(&on, 120, 16);
+        assert_eq!(recent_rows(&rows), None, "{rows:#?}");
+        assert_eq!(rows[..rows.len() - 1], off[..off.len() - 1]);
+    }
+
+    #[test]
+    fn the_section_says_when_no_activity_is_recorded_and_is_absent_before_the_first_read() {
+        let mut app = with_history(watching_only(&[WEIHAN]));
+        assert_eq!(recent_rows(&inside_rows(&app, 120, 30)), None);
+        assert_eq!(app.history_request(false), Some(WEIHAN));
+        assert_eq!(recent_rows(&inside_rows(&app, 120, 30)), None);
+        app.history_read(
+            WEIHAN,
+            Some(HistoryLines {
+                coverage: crate::activity::NO_HISTORY.to_owned(),
+                activities: Vec::new(),
+            }),
+        );
+        assert_eq!(
+            recent_rows(&inside_rows(&app, 120, 30)),
+            Some(vec![
+                "  recent activity".to_owned(),
+                "  no activity recorded yet".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn with_history_off_the_form_and_watch_screen_draw_as_before() {
+        for mut app in [ready(), watching()] {
+            let before = drawn(&app, &[], 120, 40);
+            let account = app.history_account().unwrap();
+            assert_eq!(app.history_request(true), None);
+            app.history_read(
+                account,
+                Some(HistoryLines {
+                    coverage: String::new(),
+                    activities: five_activities(),
+                }),
+            );
+            assert_eq!(drawn(&app, &[], 120, 40), before);
+        }
     }
 }

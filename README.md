@@ -40,7 +40,7 @@ From a cold start, chibi served JSON-RPC after 20 s to 3 min in six Sepolia runs
 - **Current every block.** Block access lists (EIP-7928) update the state you hold without re-executing anything.
 - **Direct sends.** Signed transactions go straight to Ethereum peers, and their receipts are proven too.
 - **A terminal wallet.** `chibi wallet` sends ETH and tokens, resolves ENS names, watches balances read-only, and has cats.
-- **Account history, if you want it.** Answer yes in `chibi init` and chibi keeps your accounts' sends, transfers, approvals and delegations, each checked against a verified block, and fills them in back to the Glamsterdam fork. `chibi status` and `h` in `chibi wallet` show them.
+- **Account history, if you want it.** Answer yes in `chibi init` and chibi keeps your accounts' sends, transfers, approvals and delegations, each checked against a verified block, and fills them in back to the Glamsterdam fork. `chibi wallet` shows the newest under your balance, `h` opens all of it, and `chibi status` prints it.
 
 <p align="center">
   <a href="assets/chibi-wallet.mp4"><img alt="chibi wallet unlocking a keystore, finding a state peer, and sending 1 USDC on Sepolia with a verified receipt" src="assets/chibi-wallet.gif" width="900"></a>

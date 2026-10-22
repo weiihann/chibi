@@ -1,6 +1,6 @@
 # Account history
 
-With history on, chibi keeps a permanent record of what happened to the watched accounts: sends, ETH moves (EIP-7708 logs), token, NFT and ERC-1155 transfers, approvals, delegations and withdrawals. Every row comes from a block chibi verified. Forward from the moment it starts, chibi records each extended block; in the background it walks back to the Glamsterdam fork and fills in older blocks whose header bloom may name an account. `chibi status` and `h` in `chibi wallet` show the history.
+With history on, chibi keeps a permanent record of what happened to the watched accounts: sends, ETH moves (EIP-7708 logs), token, NFT and ERC-1155 transfers, approvals, delegations and withdrawals. Every row comes from a block chibi verified. Forward from the moment it starts, chibi records each extended block; in the background it walks back to the Glamsterdam fork and fills in older blocks whose header bloom may name an account. `chibi status` prints the history, and `chibi wallet` shows the newest activities under the send form or the watch list, with `h` opening all of it.
 
 ## Sub-features
 
@@ -10,13 +10,13 @@ With history on, chibi keeps a permanent record of what happened to the watched 
 - `history-oracle`: over every covered range, the logs naming the account match the oracle exactly.
 - `history-restart`: a restart keeps the history, reconciles it, and fills the stretch it missed once finality passes it.
 - `history-status`: `chibi status` prints the coverage line and the newest activities under each watched address.
-- `history-wallet`: `h` in `chibi wallet` opens the same history in a pane.
+- `history-wallet`: `chibi wallet` shows a dim `recent activity` heading and the newest activities that fit whole under the send form and the watch list (`recent activity of <address>` when several addresses are watched), and `h` opens the full history in a pane.
 
 ## How to get to it (user POV)
 
 - `chibi init` asks "Keep a transaction history for watched accounts?"; `--history` answers yes.
 - `chibi status` prints, under each watched address, a line such as `history since block 11,941,326 · gaps: none · sends from nonce 36 complete` and the five newest activities.
-- In `chibi wallet`, `h` opens the history pane wherever `l` opens the logs; `h` or Esc closes it.
+- In `chibi wallet`, the newest activities sit under the send form or the watch list once the first read finishes; `h` opens the full pane wherever `l` opens the logs, and `h` or Esc closes it.
 
 ## Driving it with verify-chibi scripts
 
@@ -31,7 +31,7 @@ Preconditions:
 - **Backfill.** Nothing walks back until finality passes the forward start, about 13 minutes after launch. Then `log.sh "$RUN_DIR" | grep 'older history added'` prints lines with `blocks=` and `reached=`, and `reached` falls each head. On 2026-10-21 one step covered 85 to 201 blocks.
 - **Oracle.** Run `python3 .agents/skills/verify-chibi/scripts/history-check.py "$RUN_DIR" ADDRESS > "$RUN_DIR/evidence/history-check.txt"; echo $?`. It prints one line per covered range, such as `blocks 11941567-11962598: oracle 4 logs, chibi 4, missing 0, extra 0`, and exits 0 only when nothing is missing or extra. Check the exit code of the script itself, not of a pipe.
 - **Restart.** Stop the node with SIGINT on the pid in `chibi.pid` (not `cleanup.sh`, which deletes the data) and wait until `lsof -nP -iTCP:PORT -sTCP:LISTEN` prints nothing; copying a new binary over a running one fails with `Text file busy`. After a minute, start `bin/chibi node` again with the run's environment, appending to `chibi.log` under a marker line of its own. `log.sh` prints `history reconciled tip=<last recorded block>`, and `history_coverage` (read-only, `sqlite3 "file:...chibi.db?mode=ro"`) shows a gap from that tip to the new anchor. Once finality passes the anchor, the logs coverage fills the gap and `history_settled` moves past it; the BAL coverage keeps the gap.
-- **Wallet.** Stop the node, then start `chibi wallet --rpc-port PORT` with the run's environment in tmux. With no keystore configured, the setup menu opens with the `>` on `just watch balances, without a wallet`; press Enter and wait for the balances. Press `h` and capture the pane: it shows the address, the coverage line and the activities. In the `to` field of the send form `h` types instead, as `l` does.
+- **Wallet.** Stop the node, then start `chibi wallet --rpc-port PORT` with the run's environment in tmux. With no keystore configured, the setup menu opens with the `>` on `just watch balances, without a wallet`; press Enter and wait for the balances. Under the address the pane shows a blank row, `recent activity`, and the newest activities that fit, each whole; at `resize-window -x 80 -y 24` fewer show and none is cut mid-line. With a funded keystore, send 1 gwei from the form: after the receipt and back on the form, the send is the newest line within a head or two. Press `h` and capture the pane: it shows the address, the coverage line and every loaded activity. In the `to` field of the send form `h` types instead, as `l` does.
 
 ## Gotchas
 
