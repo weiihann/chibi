@@ -12,12 +12,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
 use super::app::{
-    App, BACKUP_WARNING, Choice, Entry, Field, PAUSED, Resolution, SIDE_CAT_COLUMNS, Screen,
-    SendState, show,
+    App, BACKUP_WARNING, Choice, Entry, Field, HistoryMode, PAUSED, Resolution, SIDE_CAT_COLUMNS,
+    Screen, SendState, show,
 };
 use super::cat::{self, Pose};
 use super::transfer::{Asset, Fee};
-use crate::activity::{self, AMOUNT_COLUMNS, Cells, format_units};
+use crate::activity::{self, AMOUNT_COLUMNS, Cells, DetailLine, format_units};
 
 /// Log lines the log pane shows at most.
 pub const LOG_PANE_LINES: u16 = 10;
@@ -134,6 +134,9 @@ enum Body {
     /// The history pane: `head` from the top left, then the table, scrolled so its selected
     /// row shows.
     History { head: Vec<Row>, table: Table },
+    /// One entry's details under a blank row: `rows` from row `first` on, scrolled no
+    /// further than the last row showing at the bottom.
+    Detail { rows: Vec<Row>, first: usize },
 }
 
 /// The account's newest entries shown under a page, in the rows it leaves.
@@ -597,6 +600,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
             page(frame, rows, side, None, recent, areas[0]);
         }
         Body::History { head, table } => history_page(frame, head, &table, areas[0]),
+        Body::Detail { rows, first } => detail_page(frame, rows, first, areas[0]),
     }
     let [_, notice_area, footer_area, log_area] = areas;
     if let Some(paragraph) = notice {
@@ -779,6 +783,33 @@ fn history_page(frame: &mut Frame<'_>, head: Vec<Row>, table: &Table, body: Rect
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
 }
 
+/// Draws a blank row, then `rows` from row `first` on in the rest of `body`. A start past
+/// the last one that still fills `body` draws from that one, so a body taller than the rows
+/// never scrolls.
+fn detail_page(frame: &mut Frame<'_>, rows: Vec<Row>, first: usize, body: Rect) {
+    let laid: Vec<Vec<Line<'static>>> = rows
+        .into_iter()
+        .map(|row| {
+            let mut lines = Vec::new();
+            row.lay_out(usize::from(body.width), &mut lines);
+            lines
+        })
+        .collect();
+    let room = usize::from(body.height).saturating_sub(1);
+    let mut below = 0;
+    let mut last = 0;
+    for (at, lines) in laid.iter().enumerate().rev() {
+        below += lines.len();
+        if below >= room {
+            last = at;
+            break;
+        }
+    }
+    let mut lines = vec![Line::default()];
+    lines.extend(laid.into_iter().skip(first.min(last)).flatten());
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+}
+
 /// The side cat cropped to its pixels and where it goes in `body`: two columns right of the
 /// widest of `lines` and level with the first, when `body` is at least [`SIDE_CAT_COLUMNS`]
 /// wide, at the scale [`side_cat_size`] picks.
@@ -893,8 +924,10 @@ fn recent(app: &App) -> Option<Recent> {
 }
 
 fn body(app: &App, now: Instant) -> Body {
-    if app.history_shown() {
-        return history(app);
+    match app.history_mode() {
+        HistoryMode::Closed => {}
+        HistoryMode::List => return history(app),
+        HistoryMode::Detail { first } => return detail(app, first),
     }
     match app.screen {
         Screen::Menu => plain(|lines| menu(app, lines)),
@@ -1480,11 +1513,43 @@ fn history(app: &App) -> Body {
     }
 }
 
+/// The selected entry's details from detail line `first` on, each line whole and wrapped
+/// under itself; the table when nothing is selected.
+fn detail(app: &App, first: usize) -> Body {
+    let selected = app.history.as_ref().and_then(|pane| {
+        let (_, history) = pane.read.as_ref()?;
+        history.entries.get(pane.selected)
+    });
+    let Some(entry) = selected else {
+        return history(app);
+    };
+    let rows = entry
+        .detail
+        .iter()
+        .map(|line| match line {
+            DetailLine::Blank => Row::Text(Line::default()),
+            DetailLine::Field { .. } | DetailLine::Text(_) => {
+                Row::Hanging(format!("  {line}"), Style::default())
+            }
+        })
+        .collect();
+    Body::Detail { rows, first }
+}
+
 /// The keys the footer names on Watching when some address is hidden.
 const WATCH_SCROLL_KEYS: &[&str] = &["up/down scroll", "l logs", "q quit"];
 
-/// The keys the footer names while the history pane is open.
-const HISTORY_KEYS: &[&str] = &["up/down choose", "h/Esc close", "l logs", "q quit"];
+/// The keys the footer names over the history table.
+const HISTORY_LIST_KEYS: &[&str] = &[
+    "up/down choose",
+    "Enter details",
+    "h/Esc close",
+    "l logs",
+    "q quit",
+];
+
+/// The keys the footer names over an entry's details.
+const HISTORY_DETAIL_KEYS: &[&str] = &["Esc back", "h close", "l logs", "q quit"];
 
 /// `keys` with `h history` before `l logs` when `history`.
 fn with_history(keys: &[&'static str], history: bool) -> Vec<&'static str> {
@@ -1500,8 +1565,10 @@ fn with_history(keys: &[&'static str], history: bool) -> Vec<&'static str> {
 
 /// The keys the footer names on `app`'s screen.
 fn keys(app: &App) -> &'static [&'static str] {
-    if app.history_shown() {
-        return HISTORY_KEYS;
+    match app.history_mode() {
+        HistoryMode::Closed => {}
+        HistoryMode::List => return HISTORY_LIST_KEYS,
+        HistoryMode::Detail { .. } => return HISTORY_DETAIL_KEYS,
     }
     match app.screen {
         Screen::Menu => &["up/down choose", "Enter select", "Esc quit"],
@@ -2960,9 +3027,9 @@ mod tests {
         }
     }
 
-    /// Five entries, newest first, of the kinds a real account shows.
+    /// Five entries, newest first, of the kinds a real account shows; the first has details.
     fn five_entries() -> Vec<activity::Entry> {
-        vec![
+        let mut entries = vec![
             entry(
                 5,
                 [
@@ -3028,8 +3095,28 @@ mod tests {
                 ],
                 false,
             ),
-        ]
+        ];
+        let field = |label, value: &str| DetailLine::Field {
+            label,
+            value: value.to_owned(),
+        };
+        entries[0].detail = vec![
+            field("transaction", HASH),
+            field("block", "11,969,090 · 7 min ago"),
+            field("status", "success"),
+            field("from", "0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025 (you)"),
+            field("to", "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+            field("nonce", "46"),
+            field("fee", "0.000000000001669629 ETH"),
+            DetailLine::Blank,
+            DetailLine::Text("-1.00 USDC to 0xd72A04f52788544702EA111E54B4B226Fd328146".to_owned()),
+            DetailLine::Blank,
+            DetailLine::Text(format!("https://sepolia.etherscan.io/tx/{HASH}")),
+        ];
+        entries
     }
+
+    const HASH: &str = "0x671eb606000de4305cab87a0f6b334fef8ac4be6e994536e05586d7752e24543";
 
     /// [`five_entries`] as a table in a body 112 columns wide, nothing selected.
     const AT_112: [&str; 6] = [
@@ -3111,7 +3198,7 @@ mod tests {
         assert_eq!(rows[4..10], marked(&AT_112, 0), "{rows:#?}");
         assert_eq!(
             rows.last().unwrap(),
-            "up/down choose · h/Esc close · l logs · q quit"
+            "up/down choose · Enter details · h/Esc close · l logs · q quit"
         );
 
         press(&mut app, KeyCode::Down);
@@ -3137,6 +3224,74 @@ mod tests {
                 "{width}: {rows:#?}"
             );
         }
+    }
+
+    #[test]
+    fn enter_shows_the_selected_entrys_details_in_full_and_esc_returns_to_the_same_row() {
+        let mut app = read(ready(), SENDER, five_entries());
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Enter);
+        let rows = inside_rows(&app, 120, 30);
+        assert_eq!(
+            rows[..12],
+            [
+                "",
+                "  transaction  0x671eb606000de4305cab87a0f6b334fef8ac4be6e994536e05586d7752e24543",
+                "  block        11,969,090 · 7 min ago",
+                "  status       success",
+                "  from         0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025 (you)",
+                "  to           0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+                "  nonce        46",
+                "  fee          0.000000000001669629 ETH",
+                "",
+                "  -1.00 USDC to 0xd72A04f52788544702EA111E54B4B226Fd328146",
+                "",
+                "  https://sepolia.etherscan.io/tx/0x671eb606000de4305cab87a0f6b334fef8ac4be6e994536e05586d7752e24543",
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows.last().unwrap(), "Esc back · h close · l logs · q quit");
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(inside_rows(&app, 120, 30), rows);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(inside_rows(&app, 120, 30)[4..10], marked(&AT_112, 0));
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(inside_rows(&app, 120, 30)[4..10], marked(&AT_112, 1));
+    }
+
+    #[test]
+    fn details_taller_than_the_body_scroll_by_line_until_their_last_row_shows() {
+        let mut app = read(ready(), SENDER, five_entries());
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Enter);
+        let body = |app: &App| {
+            let rows = inside_rows(app, 80, 16);
+            rows[..rows.len() - 1].to_vec()
+        };
+        assert_eq!(
+            body(&app)[..3],
+            [
+                "",
+                "  transaction",
+                "    0x671eb606000de4305cab87a0f6b334fef8ac4be6e994536e05586d7752e24543"
+            ]
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(body(&app)[1], "  block        11,969,090 · 7 min ago");
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down);
+        }
+        let rows = body(&app);
+        assert_eq!(rows[1], "  status       success", "{rows:#?}");
+        assert_eq!(
+            rows.last().unwrap(),
+            "    4be6e994536e05586d7752e24543",
+            "{rows:#?}"
+        );
     }
 
     #[test]

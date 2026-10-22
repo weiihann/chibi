@@ -502,11 +502,26 @@ pub struct HistoryLines {
     pub entries: Vec<activity::Entry>,
 }
 
+/// What the history pane shows over the body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryMode {
+    /// Nothing: the pane is closed.
+    #[default]
+    Closed,
+    /// The table of entries, one selected.
+    List,
+    /// The selected entry's details, from detail line `first` on.
+    Detail {
+        /// The first detail line shown.
+        first: usize,
+    },
+}
+
 /// The history pane, which exists only when history is on.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HistoryPane {
-    /// Whether it is open over the body.
-    pub open: bool,
+    /// What it shows.
+    pub mode: HistoryMode,
     /// The lines last read and the account they are about; `None` before the first read.
     pub read: Option<(Address, HistoryLines)>,
     /// The index in the entries of the one selected.
@@ -518,22 +533,55 @@ pub struct HistoryPane {
 }
 
 impl HistoryPane {
-    /// Closes on `h` or Esc, and moves the selection by one entry on Up and Down.
+    /// In the list, Up and Down move the selection by one entry, Enter opens its details,
+    /// and `h` or Esc closes the pane. In the details, Up and Down scroll by a line, Esc or
+    /// Backspace goes back to the list, and `h` closes the pane. Every other key does
+    /// nothing, so none reaches the screen under the pane.
     fn key(&mut self, key: Key) {
-        match key {
-            Key::Char('h') | Key::Esc => self.open = false,
-            Key::Up => self.selected = self.selected.saturating_sub(1),
-            Key::Down => {
-                let loaded = self.entries().len();
-                self.selected = (self.selected + 1).min(loaded.saturating_sub(1));
-            }
-            Key::Char(_)
-            | Key::Backspace
-            | Key::EraseWord
-            | Key::EraseAll
-            | Key::Enter
-            | Key::Left
-            | Key::Right => {}
+        match self.mode {
+            HistoryMode::Closed => {}
+            HistoryMode::List => match key {
+                Key::Char('h') | Key::Esc => self.mode = HistoryMode::Closed,
+                Key::Up => self.selected = self.selected.saturating_sub(1),
+                Key::Down => {
+                    let loaded = self.entries().len();
+                    self.selected = (self.selected + 1).min(loaded.saturating_sub(1));
+                }
+                Key::Enter if !self.entries().is_empty() => {
+                    self.mode = HistoryMode::Detail { first: 0 };
+                }
+                Key::Char(_)
+                | Key::Backspace
+                | Key::EraseWord
+                | Key::EraseAll
+                | Key::Enter
+                | Key::Left
+                | Key::Right => {}
+            },
+            HistoryMode::Detail { first } => match key {
+                Key::Char('h') => self.mode = HistoryMode::Closed,
+                Key::Esc | Key::Backspace => self.mode = HistoryMode::List,
+                Key::Up => {
+                    self.mode = HistoryMode::Detail {
+                        first: first.saturating_sub(1),
+                    };
+                }
+                Key::Down => {
+                    let lines = self
+                        .entries()
+                        .get(self.selected)
+                        .map_or(0, |entry| entry.detail.len());
+                    self.mode = HistoryMode::Detail {
+                        first: (first + 1).min(lines.saturating_sub(1)),
+                    };
+                }
+                Key::Char(_)
+                | Key::EraseWord
+                | Key::EraseAll
+                | Key::Enter
+                | Key::Left
+                | Key::Right => {}
+            },
         }
     }
 
@@ -772,9 +820,18 @@ impl App {
             )
     }
 
+    /// What the history pane shows over the body: [`HistoryMode::Closed`] too when history is
+    /// off or the screen up has no body for it.
+    pub fn history_mode(&self) -> HistoryMode {
+        match &self.history {
+            Some(pane) if self.history_key() => pane.mode,
+            Some(_) | None => HistoryMode::Closed,
+        }
+    }
+
     /// Whether the history pane is open over the body.
     pub fn history_shown(&self) -> bool {
-        self.history_key() && self.history.as_ref().is_some_and(|pane| pane.open)
+        self.history_mode() != HistoryMode::Closed
     }
 
     /// The account to read history for, marking it asked: while history shows, in the pane
@@ -793,8 +850,8 @@ impl App {
     }
 
     /// A history read for `account` finished. A failed read, `None`, keeps the last lines.
-    /// The selection stays on the entry it was on; when that entry is gone it stays at its
-    /// index, within the entries read.
+    /// The selection stays on the entry it was on. When that entry is gone it stays at its
+    /// index, within the entries read, and open details go back to the list.
     pub fn history_read(&mut self, account: Address, lines: Option<HistoryLines>) {
         let Some(pane) = &mut self.history else {
             return;
@@ -813,6 +870,9 @@ impl App {
             None if same => pane.selected.min(lines.entries.len().saturating_sub(1)),
             None => 0,
         };
+        if found.is_none() && matches!(pane.mode, HistoryMode::Detail { .. }) {
+            pane.mode = HistoryMode::List;
+        }
         pane.read = Some((account, lines));
     }
 
@@ -1266,12 +1326,12 @@ impl App {
         if self.history_key()
             && let Some(pane) = &mut self.history
         {
-            if pane.open {
+            if pane.mode != HistoryMode::Closed {
                 pane.key(key);
                 return None;
             }
             if key == Key::Char('h') {
-                pane.open = true;
+                pane.mode = HistoryMode::List;
                 pane.asked = None;
                 return None;
             }
@@ -3921,7 +3981,9 @@ mod tests {
     }
 
     fn history_open(app: &App) -> bool {
-        app.history.as_ref().is_some_and(|pane| pane.open)
+        app.history
+            .as_ref()
+            .is_some_and(|pane| pane.mode != HistoryMode::Closed)
     }
 
     /// The entry of block `number`, with three detail lines.
@@ -4088,20 +4150,117 @@ mod tests {
         assert_eq!(ready(Network::Sepolia).history_request(true), None);
     }
 
+    fn mode(app: &App) -> Option<HistoryMode> {
+        app.history.as_ref().map(|pane| pane.mode)
+    }
+
     #[test]
-    fn the_history_pane_over_a_sent_transfer_takes_enter_and_esc_closes_only_it() {
+    fn enter_opens_the_selected_entrys_details_esc_or_backspace_goes_back_and_h_closes() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        app.history_request(false);
+        app.history_read(
+            WEIHAN,
+            Some(HistoryLines {
+                coverage: String::new(),
+                entries: Vec::new(),
+            }),
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(mode(&app), Some(HistoryMode::List));
+
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_lines(3)));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 0 }));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            (mode(&app), selected(&app)),
+            (Some(HistoryMode::List), Some(1))
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(
+            (mode(&app), selected(&app)),
+            (Some(HistoryMode::List), Some(1))
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(mode(&app), Some(HistoryMode::Closed));
+        assert_eq!(app.watch_first, 0);
+    }
+
+    #[test]
+    fn up_and_down_scroll_the_details_by_a_line_within_their_lines() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        app.history_request(false);
+        app.history_read(WEIHAN, Some(history_lines(2)));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 0 }));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 2 }));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 1 }));
+        assert_eq!(selected(&app), Some(0));
+    }
+
+    #[test]
+    fn details_stay_open_across_a_refresh_until_their_entry_is_gone() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        app.history_request(false);
+        app.history_read(WEIHAN, Some(history_of(12, 10)));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_of(13, 10)));
+        assert_eq!(
+            (mode(&app), selected(&app)),
+            (Some(HistoryMode::Detail { first: 0 }), Some(2))
+        );
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_of(13, 11)));
+        assert_eq!(
+            (mode(&app), selected(&app)),
+            (Some(HistoryMode::Detail { first: 0 }), Some(2))
+        );
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_of(14, 13)));
+        assert_eq!(
+            (mode(&app), selected(&app)),
+            (Some(HistoryMode::List), Some(1))
+        );
+    }
+
+    #[test]
+    fn the_history_list_and_details_over_a_sent_transfer_take_every_key_until_closed() {
         let mut app = with_history(ready(Network::Sepolia));
         submit(&mut app, "1", BOB, Ok(FEE));
         press(&mut app, KeyCode::Char('y'));
         app.sent(Ok(TxHash::ZERO));
         app.tracked(Tracked::Receipt { success: true });
         assert_eq!(app.screen, Screen::Sending);
+        let (form, sending) = (app.form.clone(), app.sending.clone());
         press(&mut app, KeyCode::Char('h'));
-        assert!(app.history_shown());
+        assert_eq!(app.history_request(false), Some(SENDER));
+        app.history_read(SENDER, Some(history_lines(2)));
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.screen, Screen::Sending);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!((app.screen, history_open(&app)), (Screen::Sending, false));
+        assert_eq!(mode(&app), Some(HistoryMode::Detail { first: 0 }));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(mode(&app), Some(HistoryMode::List));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(mode(&app), Some(HistoryMode::Closed));
+        assert_eq!(
+            (app.screen, &app.form, &app.sending),
+            (Screen::Sending, &form, &sending)
+        );
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.screen, Screen::Ready);
     }
