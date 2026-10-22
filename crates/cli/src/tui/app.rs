@@ -533,21 +533,22 @@ pub struct HistoryPane {
 }
 
 impl HistoryPane {
-    /// In the list, Up and Down move the selection by one entry, Enter opens its details,
-    /// and `h` or Esc closes the pane. In the details, Up and Down scroll by a line, Esc or
-    /// Backspace goes back to the list, and `h` closes the pane. Every other key does
-    /// nothing, so none reaches the screen under the pane.
-    fn key(&mut self, key: Key) {
+    /// In the list, Up and Down move the selection by one entry, Enter opens its details when
+    /// the entries read are about `account`, the one in view, and `h` or Esc closes the pane.
+    /// In the details, Up and Down scroll by a line, Esc or Backspace goes back to the list,
+    /// and `h` closes the pane. Every other key does nothing, so none reaches the screen
+    /// under the pane.
+    fn key(&mut self, key: Key, account: Option<Address>) {
         match self.mode {
             HistoryMode::Closed => {}
             HistoryMode::List => match key {
                 Key::Char('h') | Key::Esc => self.mode = HistoryMode::Closed,
                 Key::Up => self.selected = self.selected.saturating_sub(1),
                 Key::Down => {
-                    let loaded = self.entries().len();
+                    let loaded = self.entries_of(account).len();
                     self.selected = (self.selected + 1).min(loaded.saturating_sub(1));
                 }
-                Key::Enter if !self.entries().is_empty() => {
+                Key::Enter if !self.entries_of(account).is_empty() => {
                     self.mode = HistoryMode::Detail { first: 0 };
                 }
                 Key::Char(_)
@@ -568,7 +569,7 @@ impl HistoryPane {
                 }
                 Key::Down => {
                     let lines = self
-                        .entries()
+                        .entries_of(account)
                         .get(self.selected)
                         .map_or(0, |entry| entry.detail.len());
                     self.mode = HistoryMode::Detail {
@@ -590,6 +591,14 @@ impl HistoryPane {
         self.read
             .as_ref()
             .map_or(&[], |(_, lines)| lines.entries.as_slice())
+    }
+
+    /// The entries last read when they are about `account`, newest first.
+    fn entries_of(&self, account: Option<Address>) -> &[activity::Entry] {
+        match &self.read {
+            Some((read, lines)) if Some(*read) == account => &lines.entries,
+            Some(_) | None => &[],
+        }
     }
 }
 
@@ -1323,11 +1332,12 @@ impl App {
             self.logs = !self.logs;
             return None;
         }
+        let account = self.history_account();
         if self.history_key()
             && let Some(pane) = &mut self.history
         {
             if pane.mode != HistoryMode::Closed {
-                pane.key(key);
+                pane.key(key, account);
                 return None;
             }
             if key == Key::Char('h') {
@@ -4189,6 +4199,20 @@ mod tests {
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(mode(&app), Some(HistoryMode::Closed));
         assert_eq!(app.watch_first, 0);
+    }
+
+    #[test]
+    fn enter_opens_no_details_while_the_account_in_view_is_still_being_read() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(WEIHAN));
+        app.history_read(WEIHAN, Some(history_lines(2)));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_account(), Some(SENDER));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(mode(&app), Some(HistoryMode::List));
     }
 
     #[test]

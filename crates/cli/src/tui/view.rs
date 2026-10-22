@@ -1514,10 +1514,15 @@ fn history(app: &App) -> Body {
 }
 
 /// The selected entry's details from detail line `first` on, each line whole and wrapped
-/// under itself; the table when nothing is selected.
+/// under itself; the table when nothing is selected or the entries read are about another
+/// account than the one in view.
 fn detail(app: &App, first: usize) -> Body {
+    let account = app.history_account();
     let selected = app.history.as_ref().and_then(|pane| {
-        let (_, history) = pane.read.as_ref()?;
+        let (_, history) = pane
+            .read
+            .as_ref()
+            .filter(|(read, _)| Some(*read) == account)?;
         history.entries.get(pane.selected)
     });
     let Some(entry) = selected else {
@@ -3261,6 +3266,26 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Backspace);
         assert_eq!(inside_rows(&app, 120, 30)[4..10], marked(&AT_112, 1));
+    }
+
+    #[test]
+    fn details_read_for_another_account_are_never_drawn() {
+        let mut app = read(watching(), WEIHAN, five_entries());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('h'));
+        if let Some(pane) = &mut app.history {
+            pane.mode = HistoryMode::Detail { first: 0 };
+        }
+        let rows = inside_rows(&app, 120, 30);
+        assert_eq!(
+            rows[..3],
+            [
+                "",
+                "  0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025",
+                "  reading history..."
+            ],
+            "{rows:#?}"
+        );
     }
 
     #[test]
