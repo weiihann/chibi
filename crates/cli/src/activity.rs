@@ -39,8 +39,9 @@ pub fn format_units(value: U256, decimals: u8) -> String {
     format!("{whole}.{}", &fraction[..keep])
 }
 
-/// A contract's address as its first four and last four hex digits, enough to tell tokens
-/// apart at a glance. Counterparties are never shortened: a lookalike shares these digits.
+/// An address as its first four and last four hex digits, enough to tell tokens apart at a
+/// glance. A lookalike shares these digits, so a counterparty is shortened only in a history
+/// table cell, whose details name it in full, and never in a row flagged as bait.
 pub fn short(address: Address) -> String {
     let full = address.to_string();
     format!("{}…{}", &full[..6], &full[full.len() - 4..])
