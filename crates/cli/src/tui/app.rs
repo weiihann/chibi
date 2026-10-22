@@ -1342,6 +1342,7 @@ impl App {
             }
             if key == Key::Char('h') {
                 pane.mode = HistoryMode::List;
+                pane.selected = 0;
                 pane.asked = None;
                 return None;
             }
@@ -4213,6 +4214,22 @@ mod tests {
         assert_eq!(app.history_account(), Some(SENDER));
         press(&mut app, KeyCode::Enter);
         assert_eq!(mode(&app), Some(HistoryMode::List));
+    }
+
+    #[test]
+    fn opening_the_history_pane_selects_the_newest_entry() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        app.history_request(false);
+        app.history_read(WEIHAN, Some(history_of(12, 10)));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(selected(&app), Some(1));
+        press(&mut app, KeyCode::Char('h'));
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_of(13, 10)));
+        assert_eq!(selected(&app), Some(2));
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(selected(&app), Some(0));
     }
 
     #[test]
