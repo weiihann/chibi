@@ -10,7 +10,7 @@ use chibi_node::{Explorer, Network, Startup, Token};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::activity::format_units;
+use crate::activity::{self, format_units};
 use crate::config::{AddressError, parse_address};
 use crate::tui::cat::Pose;
 use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
@@ -493,13 +493,13 @@ impl Setup {
     }
 }
 
-/// What history holds for one account, as display lines.
+/// What history holds for one account, ready to show.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryLines {
     /// Where its coverage starts, its gaps, and whether its sends are complete.
     pub coverage: String,
-    /// Its newest activities, newest first.
-    pub activities: Vec<String>,
+    /// Its newest entries, newest first.
+    pub entries: Vec<activity::Entry>,
 }
 
 /// The history pane, which exists only when history is on.
@@ -509,8 +509,8 @@ pub struct HistoryPane {
     pub open: bool,
     /// The lines last read and the account they are about; `None` before the first read.
     pub read: Option<(Address, HistoryLines)>,
-    /// The index in the activities of the first shown.
-    pub first: usize,
+    /// The index in the entries of the one selected.
+    pub selected: usize,
     /// The account last asked for, so a failed read is retried on the next refresh rather
     /// than on every tick.
     asked: Option<Address>,
@@ -518,17 +518,14 @@ pub struct HistoryPane {
 }
 
 impl HistoryPane {
-    /// Closes on `h` or Esc, and scrolls the loaded activities by one on Up and Down.
+    /// Closes on `h` or Esc, and moves the selection by one entry on Up and Down.
     fn key(&mut self, key: Key) {
         match key {
             Key::Char('h') | Key::Esc => self.open = false,
-            Key::Up => self.first = self.first.saturating_sub(1),
+            Key::Up => self.selected = self.selected.saturating_sub(1),
             Key::Down => {
-                let loaded = self
-                    .read
-                    .as_ref()
-                    .map_or(0, |(_, lines)| lines.activities.len());
-                self.first = (self.first + 1).min(loaded.saturating_sub(1));
+                let loaded = self.entries().len();
+                self.selected = (self.selected + 1).min(loaded.saturating_sub(1));
             }
             Key::Char(_)
             | Key::Backspace
@@ -538,6 +535,13 @@ impl HistoryPane {
             | Key::Left
             | Key::Right => {}
         }
+    }
+
+    /// The entries last read, newest first.
+    fn entries(&self) -> &[activity::Entry] {
+        self.read
+            .as_ref()
+            .map_or(&[], |(_, lines)| lines.entries.as_slice())
     }
 }
 
@@ -789,6 +793,8 @@ impl App {
     }
 
     /// A history read for `account` finished. A failed read, `None`, keeps the last lines.
+    /// The selection stays on the entry it was on; when that entry is gone it stays at its
+    /// index, within the entries read.
     pub fn history_read(&mut self, account: Address, lines: Option<HistoryLines>) {
         let Some(pane) = &mut self.history else {
             return;
@@ -797,11 +803,15 @@ impl App {
         let Some(lines) = lines else {
             return;
         };
-        pane.first = match &pane.read {
-            Some((read, _)) if *read == account => {
-                pane.first.min(lines.activities.len().saturating_sub(1))
-            }
-            Some(_) | None => 0,
+        let same = pane.read.as_ref().is_some_and(|(read, _)| *read == account);
+        let key = same
+            .then(|| pane.entries().get(pane.selected).map(|entry| entry.key))
+            .flatten();
+        let found = key.and_then(|key| lines.entries.iter().position(|entry| entry.key == key));
+        pane.selected = match found {
+            Some(at) => at,
+            None if same => pane.selected.min(lines.entries.len().saturating_sub(1)),
+            None => 0,
         };
         pane.read = Some((account, lines));
     }
@@ -3914,11 +3924,39 @@ mod tests {
         app.history.as_ref().is_some_and(|pane| pane.open)
     }
 
-    fn history_lines(activities: usize) -> HistoryLines {
+    /// The entry of block `number`, with three detail lines.
+    fn entry(number: u64) -> activity::Entry {
+        activity::Entry {
+            key: activity::EntryKey {
+                number,
+                at: chibi_core::history::At::Tx(0),
+                nth: 0,
+            },
+            cells: activity::Cells {
+                block: number.to_string(),
+                ..activity::Cells::default()
+            },
+            warning: false,
+            detail: (0..3)
+                .map(|n| activity::DetailLine::Text(format!("line {n}")))
+                .collect(),
+        }
+    }
+
+    /// Entries of blocks `newest` down to `oldest`.
+    fn history_of(newest: u64, oldest: u64) -> HistoryLines {
         HistoryLines {
             coverage: "history since block 100 · gaps: none · no sends found".to_owned(),
-            activities: (0..activities).map(|n| format!("activity {n}")).collect(),
+            entries: (oldest..=newest).rev().map(entry).collect(),
         }
+    }
+
+    fn history_lines(entries: u64) -> HistoryLines {
+        history_of(entries, 1)
+    }
+
+    fn selected(app: &App) -> Option<usize> {
+        app.history.as_ref().map(|pane| pane.selected)
     }
 
     #[test]
@@ -3961,21 +3999,46 @@ mod tests {
     }
 
     #[test]
-    fn up_and_down_scroll_the_loaded_history_and_stop_at_the_ends() {
+    fn up_and_down_move_the_history_selection_and_stop_at_the_ends() {
         let mut app = with_history(watching());
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.history_request(false), Some(WEIHAN));
         app.history_read(WEIHAN, Some(history_lines(3)));
-        let first = |app: &App| app.history.as_ref().map(|pane| pane.first);
         press(&mut app, KeyCode::Up);
-        assert_eq!(first(&app), Some(0));
+        assert_eq!(selected(&app), Some(0));
         for _ in 0..5 {
             press(&mut app, KeyCode::Down);
         }
-        assert_eq!(first(&app), Some(2));
+        assert_eq!(selected(&app), Some(2));
         press(&mut app, KeyCode::Up);
-        assert_eq!(first(&app), Some(1));
+        assert_eq!(selected(&app), Some(1));
         assert_eq!(app.watch_first, 0);
+    }
+
+    #[test]
+    fn the_selection_stays_on_its_entry_across_a_refresh_and_on_its_index_once_it_is_gone() {
+        let mut app = with_history(watching());
+        press(&mut app, KeyCode::Char('h'));
+        app.history_request(false);
+        app.history_read(WEIHAN, Some(history_of(13, 10)));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(selected(&app), Some(1));
+
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_of(14, 10)));
+        assert_eq!(selected(&app), Some(2));
+
+        app.history_request(true);
+        let mut gone = history_of(14, 10);
+        gone.entries.remove(2);
+        app.history_read(WEIHAN, Some(gone));
+        assert_eq!(selected(&app), Some(2));
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        app.history_request(true);
+        app.history_read(WEIHAN, Some(history_of(2, 1)));
+        assert_eq!(selected(&app), Some(1));
     }
 
     #[test]

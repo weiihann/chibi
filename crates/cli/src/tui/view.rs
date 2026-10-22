@@ -17,7 +17,7 @@ use super::app::{
 };
 use super::cat::{self, Pose};
 use super::transfer::{Asset, Fee};
-use crate::activity::format_units;
+use crate::activity::{self, AMOUNT_COLUMNS, Cells, format_units};
 
 /// Log lines the log pane shows at most.
 pub const LOG_PANE_LINES: u16 = 10;
@@ -131,40 +131,197 @@ enum Body {
         /// The account's newest activities, under the list where they fit.
         recent: Option<Recent>,
     },
+    /// The history pane: `head` from the top left, then the table, scrolled so its selected
+    /// row shows.
+    History { head: Vec<Row>, table: Table },
 }
 
-/// The account's newest activities shown under a page, in the rows it leaves.
+/// The account's newest entries shown under a page, in the rows it leaves.
 #[derive(Clone, Debug)]
 struct Recent {
     heading: Line<'static>,
-    /// One row per activity, newest first, or one saying there is none.
-    rows: Vec<Row>,
+    /// The entries, newest first; `None` when none is recorded.
+    table: Option<Table>,
 }
 
 impl Recent {
-    /// A blank line, the heading and the newest lines that fit whole in `room` rows of a
-    /// body `width` columns wide; none unless the heading and one line fit.
+    /// A blank line, the heading and as many whole table rows as fit in `room` rows of a
+    /// body `width` columns wide; none unless the heading, the table's heading and one row
+    /// fit.
     fn fitted(self, width: u16, room: usize) -> Vec<Line<'static>> {
-        let height = |lines: &[Line<'static>]| {
-            Paragraph::new(lines.to_vec())
-                .wrap(Wrap { trim: false })
-                .line_count(width)
+        let heading = Paragraph::new(vec![self.heading.clone()])
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        let body = match &self.table {
+            Some(table) => table.lines(usize::from(width)),
+            None => vec![Line::styled(
+                "  no activity recorded yet",
+                Style::default().add_modifier(Modifier::DIM),
+            )],
         };
-        let mut used = 1 + height(std::slice::from_ref(&self.heading));
+        let fits = room.saturating_sub(1 + heading);
+        if fits < body.len().min(2) {
+            return Vec::new();
+        }
         let mut lines = vec![Line::default(), self.heading];
-        for row in self.rows {
-            let mut laid = Vec::new();
-            row.lay_out(usize::from(width), &mut laid);
-            used += height(&laid);
-            if used > room {
+        lines.extend(body.into_iter().take(fits));
+        lines
+    }
+}
+
+/// A column of the history table, in the order drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Column {
+    Tx,
+    Block,
+    Age,
+    From,
+    To,
+    Amount,
+    Fee,
+}
+
+impl Column {
+    const ALL: [Self; 7] = [
+        Self::Tx,
+        Self::Block,
+        Self::Age,
+        Self::From,
+        Self::To,
+        Self::Amount,
+        Self::Fee,
+    ];
+
+    /// The columns a narrow body drops, first to last. Age, To and Amount always stay.
+    const DROPPED: [Self; 4] = [Self::Block, Self::Fee, Self::From, Self::Tx];
+
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Tx => "Txn Hash",
+            Self::Block => "Block",
+            Self::Age => "Age",
+            Self::From => "From",
+            Self::To => "To",
+            Self::Amount => "Amount",
+            Self::Fee => "Fee",
+        }
+    }
+
+    fn cell(self, cells: &Cells) -> &str {
+        match self {
+            Self::Tx => &cells.tx,
+            Self::Block => &cells.block,
+            Self::Age => &cells.age,
+            Self::From => &cells.from,
+            Self::To => &cells.to,
+            Self::Amount => &cells.amount,
+            Self::Fee => &cells.fee,
+        }
+    }
+}
+
+/// The columns between two table columns.
+const COLUMN_GAP: &str = "  ";
+
+/// History entries as a table: one row per entry, each column as wide as its widest cell.
+#[derive(Clone, Debug)]
+struct Table {
+    /// Each entry's cells, and whether it holds a zero transfer it did not send.
+    rows: Vec<(Cells, bool)>,
+    /// The row marked `>` in the gutter; `None` in a table nothing is chosen from.
+    selected: Option<usize>,
+}
+
+impl Table {
+    fn new(entries: &[activity::Entry], selected: Option<usize>) -> Self {
+        Self {
+            rows: entries
+                .iter()
+                .map(|entry| (entry.cells.clone(), entry.warning))
+                .collect(),
+            selected,
+        }
+    }
+
+    /// The dim heading line, then one line per row, for a body `width` columns wide. Whole
+    /// columns drop in [`Column::DROPPED`] order until the rest fit; then Amount is cut.
+    fn lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut columns: Vec<(Column, usize)> = Column::ALL
+            .into_iter()
+            .map(|column| {
+                let widest = self
+                    .rows
+                    .iter()
+                    .map(|(cells, _)| column.cell(cells).chars().count())
+                    .fold(column.heading().len(), usize::max);
+                let cap = if column == Column::Amount {
+                    AMOUNT_COLUMNS
+                } else {
+                    usize::MAX
+                };
+                (column, widest.min(cap))
+            })
+            .collect();
+        let total = |columns: &[(Column, usize)]| {
+            2 + columns.iter().map(|(_, width)| width).sum::<usize>()
+                + COLUMN_GAP.len() * columns.len().saturating_sub(1)
+        };
+        for dropped in Column::DROPPED {
+            if total(&columns) <= width {
                 break;
             }
-            lines.extend(laid);
+            columns.retain(|(column, _)| *column != dropped);
         }
-        if lines.len() == 2 {
-            lines.clear();
+        let excess = total(&columns).saturating_sub(width);
+        for (column, room) in &mut columns {
+            if *column == Column::Amount {
+                *room = room.saturating_sub(excess).max(1);
+            }
+        }
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let warning = Style::default().fg(Color::Red);
+        let line = |gutter: &'static str, cells: Option<&Cells>, flagged: bool| {
+            let mut spans = vec![Span::raw(gutter)];
+            for (at, &(column, room)) in columns.iter().enumerate() {
+                if at > 0 {
+                    spans.push(Span::raw(COLUMN_GAP));
+                }
+                let text = cells.map_or(column.heading(), |cells| column.cell(cells));
+                let shown = fit(text, room, at + 1 < columns.len());
+                spans.push(if flagged && column == Column::Amount {
+                    Span::styled(shown, warning)
+                } else {
+                    Span::raw(shown)
+                });
+            }
+            Line::from(spans)
+        };
+        let mut lines = Vec::with_capacity(self.rows.len() + 1);
+        lines.push(line("  ", None, false).style(dim));
+        for (at, (cells, flagged)) in self.rows.iter().enumerate() {
+            let gutter = if self.selected == Some(at) {
+                "> "
+            } else {
+                "  "
+            };
+            lines.push(line(gutter, Some(cells), *flagged));
         }
         lines
+    }
+}
+
+/// `text` in `width` columns: cut with `…` when wider, padded with spaces when `pad`.
+fn fit(text: &str, width: usize, pad: bool) -> String {
+    let columns = text.chars().count();
+    if columns > width {
+        let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+        cut.push('…');
+        return cut;
+    }
+    if pad {
+        format!("{text}{}", " ".repeat(width - columns))
+    } else {
+        text.to_owned()
     }
 }
 
@@ -287,8 +444,8 @@ impl WatchList {
 enum Row {
     /// A line word-wrapped to the body's width.
     Text(Line<'static>),
-    /// A line wrapped at spaces, each continuation [`HANGING_INDENT`] in.
-    Hanging(String),
+    /// A line in a style, wrapped at spaces, each continuation [`HANGING_INDENT`] in.
+    Hanging(String, Style),
     /// A form row: its label, then its values [`VALUE_GAP`] apart, each kept whole. A value
     /// that does not fit on the line starts the next one, under the first value.
     Form {
@@ -302,7 +459,13 @@ impl Row {
     fn lay_out(self, width: usize, lines: &mut Vec<Line<'static>>) {
         let (label, values) = match self {
             Self::Text(line) => return lines.push(line),
-            Self::Hanging(text) => return lines.extend(hanging(&text, width)),
+            Self::Hanging(text, style) => {
+                return lines.extend(
+                    hanging(&text, width)
+                        .into_iter()
+                        .map(|line| line.style(style)),
+                );
+            }
             Self::Form { label, values } => (label, values),
         };
         let mut line = Line::from(label);
@@ -433,6 +596,7 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
             let rows = list.rows(areas[0].height);
             page(frame, rows, side, None, recent, areas[0]);
         }
+        Body::History { head, table } => history_page(frame, head, &table, areas[0]),
     }
     let [_, notice_area, footer_area, log_area] = areas;
     if let Some(paragraph) = notice {
@@ -595,6 +759,26 @@ fn page(
     }
 }
 
+/// Draws `head` from the top left of `body`, then the table's heading and as many of its rows
+/// as fit, starting low enough that the selected row shows.
+fn history_page(frame: &mut Frame<'_>, head: Vec<Row>, table: &Table, body: Rect) {
+    let mut lines = Vec::new();
+    for row in head {
+        row.lay_out(usize::from(body.width), &mut lines);
+    }
+    let used = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(body.width);
+    let mut table_lines = table.lines(usize::from(body.width)).into_iter();
+    lines.extend(table_lines.next());
+    let room = usize::from(body.height).saturating_sub(used + 1).max(1);
+    let first = table
+        .selected
+        .map_or(0, |selected| (selected + 1).saturating_sub(room));
+    lines.extend(table_lines.skip(first).take(room));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+}
+
 /// The side cat cropped to its pixels and where it goes in `body`: two columns right of the
 /// widest of `lines` and level with the first, when `body` is at least [`SIDE_CAT_COLUMNS`]
 /// wide, at the scale [`side_cat_size`] picks.
@@ -689,38 +873,28 @@ fn rows(rows: Vec<Row>) -> Body {
     }
 }
 
-/// The newest activities of the account in view, once a read for it has finished, headed
-/// by the account itself when several addresses are watched.
+/// The newest entries of the account in view, once a read for it has finished, headed by the
+/// account itself when several addresses are watched.
 fn recent(app: &App) -> Option<Recent> {
     let account = app.history_account()?;
     let (read, history) = app.history.as_ref()?.read.as_ref()?;
     if *read != account {
         return None;
     }
-    let dim = Style::default().add_modifier(Modifier::DIM);
     let heading = if app.screen == Screen::Watching && app.watched.len() > 1 {
         format!("  recent activity of {}", account.to_checksum(None))
     } else {
         "  recent activity".to_owned()
     };
-    let rows = if history.activities.is_empty() {
-        vec![Row::Text(Line::styled("  no activity recorded yet", dim))]
-    } else {
-        history
-            .activities
-            .iter()
-            .map(|activity| Row::Hanging(format!("  {activity}")))
-            .collect()
-    };
     Some(Recent {
-        heading: Line::styled(heading, dim),
-        rows,
+        heading: Line::styled(heading, Style::default().add_modifier(Modifier::DIM)),
+        table: (!history.entries.is_empty()).then(|| Table::new(&history.entries, None)),
     })
 }
 
 fn body(app: &App, now: Instant) -> Body {
     if app.history_shown() {
-        return rows(history(app));
+        return history(app);
     }
     match app.screen {
         Screen::Menu => plain(|lines| menu(app, lines)),
@@ -1277,41 +1451,40 @@ fn hanging(text: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// The history pane: the account, its coverage, then its activities from the first scrolled
-/// to, as many as the body holds.
-fn history(app: &App) -> Vec<Row> {
+/// The history pane: the account, its dim coverage line, then a table of its entries with
+/// the selected one marked.
+fn history(app: &App) -> Body {
     let Some(account) = app.history_account() else {
-        return Vec::new();
+        return rows(Vec::new());
     };
     let text = |text: String| Row::Text(Line::raw(text));
-    let mut rows = vec![text(format!("  {}", account.to_checksum(None)))];
+    let mut head = vec![text(format!("  {}", account.to_checksum(None)))];
     let read = app
         .history
         .as_ref()
-        .and_then(|pane| Some((pane.read.as_ref()?, pane.first)));
-    match read {
-        Some(((read, history), first)) if *read == account => {
-            rows.push(Row::Hanging(format!("  {}", history.coverage)));
-            if history.activities.is_empty() {
-                return rows;
-            }
-            rows.push(Row::Text(Line::default()));
-            rows.extend(
-                history.activities[first.min(history.activities.len())..]
-                    .iter()
-                    .map(|activity| Row::Hanging(format!("  {activity}"))),
-            );
-        }
-        Some(_) | None => rows.push(text("  reading history...".to_owned())),
+        .and_then(|pane| Some((pane.read.as_ref()?, pane.selected)));
+    let Some(((_, history), selected)) = read.filter(|((read, _), _)| *read == account) else {
+        head.push(text("  reading history...".to_owned()));
+        return rows(head);
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    head.push(Row::Hanging(format!("  {}", history.coverage), dim));
+    if history.entries.is_empty() {
+        return rows(head);
     }
-    rows
+    head.insert(0, Row::Text(Line::default()));
+    head.push(Row::Text(Line::default()));
+    Body::History {
+        head,
+        table: Table::new(&history.entries, Some(selected)),
+    }
 }
 
 /// The keys the footer names on Watching when some address is hidden.
 const WATCH_SCROLL_KEYS: &[&str] = &["up/down scroll", "l logs", "q quit"];
 
 /// The keys the footer names while the history pane is open.
-const HISTORY_KEYS: &[&str] = &["up/down scroll", "h/Esc close", "l logs", "q quit"];
+const HISTORY_KEYS: &[&str] = &["up/down choose", "h/Esc close", "l logs", "q quit"];
 
 /// `keys` with `h history` before `l logs` when `history`.
 fn with_history(keys: &[&'static str], history: bool) -> Vec<&'static str> {
@@ -1448,6 +1621,7 @@ mod tests {
     use std::path::Path;
 
     use alloy_primitives::{Address, address};
+    use chibi_core::history::At;
     use chibi_node::{Network, Startup, Token};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -2683,7 +2857,7 @@ mod tests {
                 .take(usize::from(height))
                 .map(|row| match row {
                     Row::Text(line) => line.to_string().trim_end().to_owned(),
-                    Row::Form { .. } | Row::Hanging(_) => unreachable!(),
+                    Row::Form { .. } | Row::Hanging(..) => unreachable!(),
                 })
                 .collect::<Vec<_>>()
         };
@@ -2761,8 +2935,163 @@ mod tests {
         app
     }
 
+    const COVERAGE: &str = "history since block 11,856,337 · gaps: none · no sends found";
+
+    /// An entry of block `number` with `cells` in column order.
+    fn entry(number: u64, cells: [&str; 7], warning: bool) -> activity::Entry {
+        let [tx, block, age, from, to, amount, fee] = cells.map(str::to_owned);
+        activity::Entry {
+            key: activity::EntryKey {
+                number,
+                at: At::Tx(0),
+                nth: 0,
+            },
+            cells: Cells {
+                tx,
+                block,
+                age,
+                from,
+                to,
+                amount,
+                fee,
+            },
+            warning,
+            detail: Vec::new(),
+        }
+    }
+
+    /// Five entries, newest first, of the kinds a real account shows.
+    fn five_entries() -> Vec<activity::Entry> {
+        vec![
+            entry(
+                5,
+                [
+                    "0x671e…4543",
+                    "11,969,090",
+                    "7m",
+                    "you",
+                    "0xd72A…8146",
+                    "-1.00 USDC",
+                    "<0.000001",
+                ],
+                false,
+            ),
+            entry(
+                4,
+                [
+                    "0x9a3c…01fe",
+                    "11,966,550",
+                    "2h",
+                    "you",
+                    "you",
+                    "0.000000001 ETH",
+                    "0.000016",
+                ],
+                false,
+            ),
+            entry(
+                3,
+                [
+                    "withdrawal",
+                    "11,962,690",
+                    "13h",
+                    "validator 42",
+                    "you",
+                    "+0.50 ETH",
+                    "",
+                ],
+                false,
+            ),
+            entry(
+                2,
+                [
+                    "0x5b20…77aa",
+                    "11,962,527",
+                    "13h",
+                    "0x1111…2222",
+                    "you",
+                    "⚠ 0.00 USDC",
+                    "",
+                ],
+                true,
+            ),
+            entry(
+                1,
+                [
+                    "0x0c4d…9e31",
+                    "11,856,400",
+                    "2d",
+                    "you",
+                    "0xAbFC…D06f",
+                    "-0.000000000001669629 ETH",
+                    "0.000512",
+                ],
+                false,
+            ),
+        ]
+    }
+
+    /// [`five_entries`] as a table in a body 112 columns wide, nothing selected.
+    const AT_112: [&str; 6] = [
+        "  Txn Hash     Block       Age  From          To           Amount                    Fee",
+        "  0x671e…4543  11,969,090  7m   you           0xd72A…8146  -1.00 USDC                <0.000001",
+        "  0x9a3c…01fe  11,966,550  2h   you           you          0.000000001 ETH           0.000016",
+        "  withdrawal   11,962,690  13h  validator 42  you          +0.50 ETH",
+        "  0x5b20…77aa  11,962,527  13h  0x1111…2222   you          ⚠ 0.00 USDC",
+        "  0x0c4d…9e31  11,856,400  2d   you           0xAbFC…D06f  -0.000000000001669629 E…  0.000512",
+    ];
+
+    /// [`five_entries`] in a body 72 columns wide: Block and Fee dropped.
+    const AT_72: [&str; 6] = [
+        "  Txn Hash     Age  From          To           Amount",
+        "  0x671e…4543  7m   you           0xd72A…8146  -1.00 USDC",
+        "  0x9a3c…01fe  2h   you           you          0.000000001 ETH",
+        "  withdrawal   13h  validator 42  you          +0.50 ETH",
+        "  0x5b20…77aa  13h  0x1111…2222   you          ⚠ 0.00 USDC",
+        "  0x0c4d…9e31  2d   you           0xAbFC…D06f  -0.000000000001669629 E…",
+    ];
+
+    /// [`five_entries`] in a body 42 columns wide: From and Txn Hash dropped too, Amount cut.
+    const AT_42: [&str; 6] = [
+        "  Age  To           Amount",
+        "  7m   0xd72A…8146  -1.00 USDC",
+        "  2h   you          0.000000001 ETH",
+        "  13h  you          +0.50 ETH",
+        "  13h  you          ⚠ 0.00 USDC",
+        "  2d   0xAbFC…D06f  -0.000000000001669629…",
+    ];
+
+    /// `table` with row `at` (0 for the first under the heading) marked selected.
+    fn marked(table: &[&str], at: usize) -> Vec<String> {
+        table
+            .iter()
+            .enumerate()
+            .map(|(n, row)| {
+                if n == at + 1 {
+                    format!("> {}", &row[2..])
+                } else {
+                    (*row).to_owned()
+                }
+            })
+            .collect()
+    }
+
+    /// `app` with history on and `entries` read for `account`.
+    fn read(app: App, account: Address, entries: Vec<activity::Entry>) -> App {
+        let mut app = with_history(app);
+        assert_eq!(app.history_request(false), Some(account));
+        app.history_read(
+            account,
+            Some(HistoryLines {
+                coverage: COVERAGE.to_owned(),
+                entries,
+            }),
+        );
+        app
+    }
+
     #[test]
-    fn the_open_history_pane_shows_the_coverage_then_the_newest_activities() {
+    fn the_open_history_pane_shows_the_coverage_then_one_row_per_entry_with_one_selected() {
         let mut app = with_history(ready());
         press(&mut app, KeyCode::Char('h'));
         let account = "  0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025";
@@ -2770,40 +3099,85 @@ mod tests {
         assert_eq!(rows[..3], ["", account, "  reading history..."]);
 
         assert_eq!(app.history_request(false), Some(SENDER));
-        let coverage = "history since block 11,856,337 · gaps: none · no sends found";
-        let activities: Vec<String> = (0..40)
-            .map(|n| format!("11,900,{n:03}  {n} min ago  +0.001 ETH from 0x1111000000000000000000000000000000002222"))
-            .collect();
         app.history_read(
             SENDER,
             Some(HistoryLines {
-                coverage: coverage.to_owned(),
-                activities: activities.clone(),
+                coverage: COVERAGE.to_owned(),
+                entries: five_entries(),
             }),
         );
         let rows = inside_rows(&app, 120, 30);
-        assert_eq!(
-            rows[..5],
-            [
-                "",
-                account,
-                &format!("  {coverage}"),
-                "",
-                &format!("  {}", activities[0])
-            ]
-        );
-        assert!(rows.contains(&format!("  {}", activities[1])), "{rows:?}");
-        assert!(!rows.iter().any(|row| row.contains("amount")), "{rows:?}");
+        assert_eq!(rows[..4], ["", account, &format!("  {COVERAGE}"), ""]);
+        assert_eq!(rows[4..10], marked(&AT_112, 0), "{rows:#?}");
         assert_eq!(
             rows.last().unwrap(),
-            "up/down scroll · h/Esc close · l logs · q quit"
+            "up/down choose · h/Esc close · l logs · q quit"
         );
 
         press(&mut app, KeyCode::Down);
         let rows = inside_rows(&app, 120, 30);
-        assert_eq!(rows[4], format!("  {}", activities[1]));
+        assert_eq!(rows[4..10], marked(&AT_112, 1), "{rows:#?}");
         press(&mut app, KeyCode::Esc);
         assert!(inside(&app, &[], 120, 30).contains("> amount"));
+    }
+
+    #[test]
+    fn narrow_bodies_drop_block_fee_from_then_txn_hash_and_cut_the_amount() {
+        let mut app = read(ready(), SENDER, five_entries());
+        press(&mut app, KeyCode::Char('h'));
+        for (width, table) in [(120, AT_112), (80, AT_72), (50, AT_42)] {
+            let rows = inside_rows(&app, width, 24);
+            let heading = rows
+                .iter()
+                .position(|row| row == table[0])
+                .unwrap_or_else(|| panic!("{width}: {rows:#?}"));
+            assert_eq!(
+                rows[heading..heading + 6],
+                marked(&table, 0),
+                "{width}: {rows:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selected_row_stays_in_view_as_it_moves_down_a_long_history() {
+        let entries = (0..40)
+            .map(|n| {
+                let tx = format!("tx {n}");
+                let block = format!("11,900,{n:03}");
+                entry(
+                    100 - n,
+                    [&tx, &block, "1m", "0x1111…2222", "you", "+0.001 ETH", ""],
+                    false,
+                )
+            })
+            .collect();
+        let mut app = read(ready(), SENDER, entries);
+        press(&mut app, KeyCode::Char('h'));
+        let table = |app: &App| inside_rows(app, 120, 16)[5..11].to_vec();
+        let rows = table(&app);
+        assert!(rows[0].starts_with("> tx 0 ") && rows[5].starts_with("  tx 5 "));
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Down);
+        }
+        let rows = table(&app);
+        assert!(rows[0].starts_with("  tx 5 "), "{rows:#?}");
+        assert!(rows[5].starts_with("> tx 10 "), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_flagged_row_shows_its_amount_in_the_warning_colour() {
+        let app = read(ready(), SENDER, five_entries());
+        let buffer = drawn(&app, &[], 120, 40);
+        let colour_of = |text: &str| {
+            let (x, y) = (0..40)
+                .flat_map(|y| (0..120).map(move |x| (x, y)))
+                .find(|&(x, y)| row_from(&buffer, x, y).starts_with(text))
+                .unwrap_or_else(|| panic!("{text}"));
+            buffer[(x, y)].fg
+        };
+        assert_eq!(colour_of("⚠ 0.00 USDC"), Color::Red);
+        assert_eq!(colour_of("+0.50 ETH"), Color::Reset);
     }
 
     #[test]
@@ -2816,7 +3190,7 @@ mod tests {
             SENDER,
             Some(HistoryLines {
                 coverage: coverage.to_owned(),
-                activities: Vec::new(),
+                entries: Vec::new(),
             }),
         );
         let rows = inside_rows(&app, 80, 24);
@@ -2850,16 +3224,17 @@ mod tests {
             WEIHAN,
             Some(HistoryLines {
                 coverage: crate::activity::NO_HISTORY.to_owned(),
-                activities: Vec::new(),
+                entries: Vec::new(),
             }),
         );
         let rows = inside_rows(&app, 120, 30);
         assert_eq!(
-            rows[..3],
+            rows[..4],
             [
                 "",
                 "  0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7",
-                "  no history yet"
+                "  no history yet",
+                ""
             ]
         );
     }
@@ -2895,27 +3270,6 @@ mod tests {
         assert!(!inside(&app, &[], 120, 30).contains("h history"));
     }
 
-    /// Five activities, newest first, each 83 columns wide indented.
-    fn five_activities() -> Vec<String> {
-        (0..5)
-            .map(|n| format!("11,900,00{n}  {n} min ago  +0.00{n} ETH from 0x1111000000000000000000000000000000002222"))
-            .collect()
-    }
-
-    /// `app` with history on and `activities` read for `account`.
-    fn read(app: App, account: Address, activities: Vec<String>) -> App {
-        let mut app = with_history(app);
-        assert_eq!(app.history_request(false), Some(account));
-        app.history_read(
-            account,
-            Some(HistoryLines {
-                coverage: "history since block 11,856,337 · gaps: none · no sends found".to_owned(),
-                activities,
-            }),
-        );
-        app
-    }
-
     /// The rows from the `recent activity` heading's blank row on, `None` without one.
     fn recent_rows(rows: &[String]) -> Option<Vec<String>> {
         let heading = rows
@@ -2940,18 +3294,21 @@ mod tests {
             .collect()
     }
 
+    fn to_strings(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|&row| row.to_owned()).collect()
+    }
+
     #[test]
-    fn the_send_form_shows_the_newest_activities_under_it_with_the_cat_in_place() {
+    fn the_send_form_shows_the_newest_entries_as_a_table_under_it_with_the_cat_in_place() {
         let mut app = ready();
         app.pixel_cats = true;
         app.width = 120;
         let alone = drawn(&app, &[], 120, 40);
-        let activities = five_activities();
-        let app = read(app, SENDER, activities.clone());
+        let app = read(app, SENDER, five_entries());
         let rows = inside_rows(&app, 120, 40);
-        let mut expected = vec!["  recent activity".to_owned()];
-        expected.extend(activities.iter().map(|activity| format!("  {activity}")));
-        assert_eq!(recent_rows(&rows), Some(expected), "{rows:#?}");
+        let mut expected = vec!["  recent activity"];
+        expected.extend(AT_112);
+        assert_eq!(recent_rows(&rows), Some(to_strings(&expected)), "{rows:#?}");
         let heading = rows.iter().position(|row| row == "  recent activity");
         let fee = rows.iter().position(|row| row.contains("  fee"));
         assert!(fee < heading, "{rows:#?}");
@@ -2966,103 +3323,25 @@ mod tests {
     }
 
     #[test]
-    fn a_short_send_form_shows_only_the_whole_activities_that_fit() {
-        let app = read(ready(), SENDER, five_activities());
-        let activity = |n: usize| {
-            [
-                format!("  11,900,00{n}  {n} min ago  +0.00{n} ETH from"),
-                "    0x1111000000000000000000000000000000002222".to_owned(),
-            ]
-        };
+    fn a_short_send_form_shows_only_the_rows_that_fit_under_the_table_heading() {
+        let app = read(ready(), SENDER, five_entries());
         let expected = |shown: usize| {
-            let mut rows = vec!["  recent activity".to_owned()];
-            rows.extend((0..shown).flat_map(activity));
-            Some(rows)
+            let mut rows = vec!["  recent activity"];
+            rows.extend(&AT_72[..=shown]);
+            rows.push("up/down field · Enter or left/right token · type amount (or max) and to");
+            rows.push("ctrl+u clear · Enter review · h history · l logs · q quit");
+            Some(to_strings(&rows))
         };
-        let rows = inside_rows(&app, 80, 24);
+        let rows = inside_rows(&app, 80, 21);
+        assert_eq!(recent_rows(&rows), expected(5), "{rows:#?}");
+        let rows = inside_rows(&app, 80, 20);
         assert_eq!(recent_rows(&rows), expected(4), "{rows:#?}");
-        let rows = inside_rows(&app, 80, 22);
-        assert_eq!(recent_rows(&rows), expected(3), "{rows:#?}");
-        let rows = inside_rows(&app, 80, 18);
+        let rows = inside_rows(&app, 80, 17);
         assert_eq!(recent_rows(&rows), expected(1), "{rows:#?}");
 
         let rows = inside_rows(&app, 80, 16);
         assert_eq!(recent_rows(&rows), None, "{rows:#?}");
         assert!(rows.iter().any(|row| row.contains("  fee")), "{rows:#?}");
-    }
-
-    /// Four activities, newest first, of the widths a real account shows.
-    fn sends() -> Vec<String> {
-        [
-            "11,966,550  2 min ago  sent 0.000000001 ETH to self (nonce 43, fee 0.00000000001578 ETH)",
-            "11,962,690  13 h ago  sent 0.000000001 ETH to self (nonce 41, fee 0.000000000000252 ETH)",
-            "11,962,527  13 h ago  -0.000000001 ETH to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f",
-            "11,962,527  13 h ago  sent to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f (nonce 40, fee 0.0000000000151404 ETH)",
-        ]
-        .map(str::to_owned)
-        .to_vec()
-    }
-
-    /// [`sends`] laid out in a body 72 columns wide.
-    const SENDS_AT_72: [&[&str]; 4] = [
-        &[
-            "  11,966,550  2 min ago  sent 0.000000001 ETH to self (nonce 43, fee",
-            "    0.00000000001578 ETH)",
-        ],
-        &[
-            "  11,962,690  13 h ago  sent 0.000000001 ETH to self (nonce 41, fee",
-            "    0.000000000000252 ETH)",
-        ],
-        &[
-            "  11,962,527  13 h ago  -0.000000001 ETH to",
-            "    0xAbFC25F2A93829e9A500A5641222F1f2530BD06f",
-        ],
-        &[
-            "  11,962,527  13 h ago  sent to",
-            "    0xAbFC25F2A93829e9A500A5641222F1f2530BD06f (nonce 40, fee",
-            "    0.0000000000151404 ETH)",
-        ],
-    ];
-
-    #[test]
-    fn a_long_activity_continues_indented_under_itself_on_the_send_form() {
-        let app = read(ready(), SENDER, sends());
-        let expected = |shown: usize| {
-            let mut rows = vec!["  recent activity"];
-            rows.extend(SENDS_AT_72[..shown].concat());
-            rows
-        };
-        let rows = inside_rows(&app, 80, 24);
-        let mut whole = expected(4);
-        whole.push("up/down field · Enter or left/right token · type amount (or max) and to");
-        let recent = recent_rows(&rows).expect("a section");
-        assert_eq!(recent[..recent.len() - 1], whole, "{rows:#?}");
-        let rows = inside_rows(&app, 80, 23);
-        let recent = recent_rows(&rows).expect("a section");
-        assert_eq!(recent, expected(3), "{rows:#?}");
-
-        let rows = inside_rows(&app, 120, 40);
-        let mut expected = vec!["  recent activity".to_owned()];
-        expected.extend(sends()[..3].iter().map(|activity| format!("  {activity}")));
-        expected.extend([
-            "  11,962,527  13 h ago  sent to 0xAbFC25F2A93829e9A500A5641222F1f2530BD06f (nonce 40, fee 0.0000000000151404".to_owned(),
-            "    ETH)".to_owned(),
-        ]);
-        assert_eq!(recent_rows(&rows), Some(expected), "{rows:#?}");
-    }
-
-    #[test]
-    fn a_long_activity_continues_indented_under_itself_in_the_history_pane() {
-        let mut app = read(ready(), SENDER, sends());
-        press(&mut app, KeyCode::Char('h'));
-        let rows = inside_rows(&app, 80, 24);
-        let expected: Vec<&str> = SENDS_AT_72.concat();
-        assert_eq!(rows[4..4 + expected.len()], expected, "{rows:#?}");
-
-        press(&mut app, KeyCode::Down);
-        let rows = inside_rows(&app, 80, 24);
-        let expected: Vec<&str> = SENDS_AT_72[1..].concat();
-        assert_eq!(rows[4..4 + expected.len()], expected, "{rows:#?}");
     }
 
     #[test]
@@ -3081,22 +3360,20 @@ mod tests {
     }
 
     #[test]
-    fn the_watch_screen_names_the_account_of_its_activities_only_when_watching_several() {
-        let activities = five_activities();
-        let one = read(watching_only(&[WEIHAN]), WEIHAN, activities.clone());
+    fn the_watch_screen_names_the_account_of_its_entries_only_when_watching_several() {
+        let one = read(watching_only(&[WEIHAN]), WEIHAN, five_entries());
         let rows = inside_rows(&one, 120, 30);
         let recent = recent_rows(&rows).expect("a section");
-        assert_eq!(recent[0], "  recent activity");
-        assert_eq!(recent[1], format!("  {}", activities[0]));
+        assert_eq!(recent[..3], ["  recent activity", AT_112[0], AT_112[1]]);
 
-        let several = read(watching(), WEIHAN, activities.clone());
+        let several = read(watching(), WEIHAN, five_entries());
         let rows = inside_rows(&several, 120, 30);
         let recent = recent_rows(&rows).expect("a section");
         assert_eq!(
             recent[..2],
             [
-                "  recent activity of 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7".to_owned(),
-                format!("  {}", activities[0])
+                "  recent activity of 0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7",
+                AT_112[0]
             ]
         );
         let list = rows
@@ -3109,7 +3386,7 @@ mod tests {
 
         let twelve: Vec<Address> = (1..=12).map(Address::with_last_byte).collect();
         let off = inside_rows(&watching_only(&twelve), 120, 16);
-        let on = read(watching_only(&twelve), twelve[0], activities);
+        let on = read(watching_only(&twelve), twelve[0], five_entries());
         let rows = inside_rows(&on, 120, 16);
         assert_eq!(recent_rows(&rows), None, "{rows:#?}");
         assert_eq!(rows[..rows.len() - 1], off[..off.len() - 1]);
@@ -3125,7 +3402,7 @@ mod tests {
             WEIHAN,
             Some(HistoryLines {
                 coverage: crate::activity::NO_HISTORY.to_owned(),
-                activities: Vec::new(),
+                entries: Vec::new(),
             }),
         );
         assert_eq!(
@@ -3147,7 +3424,7 @@ mod tests {
                 account,
                 Some(HistoryLines {
                     coverage: String::new(),
-                    activities: five_activities(),
+                    entries: five_entries(),
                 }),
             );
             assert_eq!(drawn(&app, &[], 120, 40), before);

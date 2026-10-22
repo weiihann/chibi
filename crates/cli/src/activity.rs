@@ -1,12 +1,13 @@
-//! Account history as lines of text: one line per activity and one coverage line per account.
-//! The formatting is pure, so `chibi status` and the wallet show history in the same words.
+//! Account history as text: one line per activity and one coverage line per account for
+//! `chibi status`, and one table row with its details per transaction for the wallet. The
+//! formatting is pure, so both show history in the same words.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{Address, U256};
-use chibi_core::history::{Activity, Capability, Coverage, Effect, SendCheck, TopEnd};
-use chibi_node::Token;
+use alloy_primitives::{Address, TxHash, U256};
+use chibi_core::history::{Activity, At, Capability, Coverage, Effect, SendCheck, TopEnd};
+use chibi_node::{Explorer, Token};
 
 /// What the coverage line says for an account history holds nothing for.
 pub const NO_HISTORY: &str = "no history yet";
@@ -263,6 +264,541 @@ fn approval(owner: Address, account: Address, what: &str) -> String {
     } else {
         format!("approved {what} by {owner}")
     }
+}
+
+/// The widest an amount cell gets. The detail screen shows every amount exactly.
+pub const AMOUNT_COLUMNS: usize = 24;
+
+/// What the last line of an entry's details says when the read stopped inside it.
+const MORE_EFFECTS: &str = "more effects than chibi loaded";
+
+/// Who the account a history is about is to the person reading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// The unlocked wallet's own account.
+    You,
+    /// An address the session only watches.
+    Watched,
+}
+
+impl Owner {
+    /// [`Owner::You`] when `account` is the unlocked `sender`, else [`Owner::Watched`].
+    pub fn of(account: Address, sender: Option<Address>) -> Self {
+        if sender == Some(account) {
+            Self::You
+        } else {
+            Self::Watched
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::You => "you",
+            Self::Watched => "watched",
+        }
+    }
+}
+
+/// How a history is read: whose it is, who that is to the reader, the tokens known by name,
+/// the time ages count to (Unix seconds), and the explorer transactions link to.
+#[derive(Clone, Copy, Debug)]
+pub struct Reader<'a> {
+    /// The account the history is about.
+    pub account: Address,
+    /// Who the account is to the reader.
+    pub owner: Owner,
+    /// The network's registry tokens.
+    pub registry: &'a [Token],
+    /// Now, in Unix seconds.
+    pub now: u64,
+    /// The network's block explorer.
+    pub explorer: Explorer,
+}
+
+/// Which entry of a history: its block, its place in the block, and its order among the
+/// entries at that place, since a block's withdrawals share the post-block place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryKey {
+    /// Block number.
+    pub number: u64,
+    /// Where in the block.
+    pub at: At,
+    /// How many entries before it share the block and the place.
+    pub nth: usize,
+}
+
+/// An entry's row in the history table, one field per column.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cells {
+    /// The shortened transaction hash, or what the entry is when no transaction made it.
+    pub tx: String,
+    /// The block number, grouped.
+    pub block: String,
+    /// How long ago, in one compact unit.
+    pub age: String,
+    /// Where the value came from.
+    pub from: String,
+    /// Where the value went.
+    pub to: String,
+    /// What moved, signed from the account's side, or what the transaction did.
+    pub amount: String,
+    /// The fee the account paid, in ETH rounded down to 6 decimals.
+    pub fee: String,
+}
+
+/// One line of an entry's detail screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetailLine {
+    /// A labelled value, never shortened.
+    Field {
+        /// What the value is.
+        label: &'static str,
+        /// The value.
+        value: String,
+    },
+    /// A blank line between the parts.
+    Blank,
+    /// A whole line: an effect, a note, or the explorer link.
+    Text(String),
+}
+
+impl fmt::Display for DetailLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Field { label, value } => write!(f, "{label:<11}  {value}"),
+            Self::Blank => Ok(()),
+            Self::Text(text) => f.write_str(text),
+        }
+    }
+}
+
+/// One transaction of an account's history, or one withdrawal, fee credit or balance change,
+/// as the wallet shows it: a table row and a detail screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// Which entry it is, so a selection survives a refresh.
+    pub key: EntryKey,
+    /// Its table row.
+    pub cells: Cells,
+    /// Whether it holds a zero transfer out the account did not send: address-poisoning bait.
+    pub warning: bool,
+    /// Its detail screen.
+    pub detail: Vec<DetailLine>,
+}
+
+/// `activities`, newest first, as entries: one per transaction, and one per activity outside
+/// any transaction. `full` says the read returned every activity it asked for, so the oldest
+/// entry may lack activities past the cut: it is dropped, or marked when it is the only one.
+pub fn entries(activities: &[Activity], full: bool, reader: &Reader<'_>) -> Vec<Entry> {
+    let mut groups: Vec<&[Activity]> = activities
+        .chunk_by(|a, b| a.number == b.number && a.at == b.at && matches!(a.at, At::Tx(_)))
+        .collect();
+    let cut = full && groups.len() == 1;
+    if full && groups.len() > 1 {
+        groups.pop();
+    }
+    let mut entries: Vec<Entry> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let first = &group[0];
+        let nth = entries
+            .last()
+            .filter(|last| last.key.number == first.number && last.key.at == first.at)
+            .map_or(0, |last| last.key.nth + 1);
+        let key = EntryKey {
+            number: first.number,
+            at: first.at,
+            nth,
+        };
+        entries.push(entry(group, key, cut, reader));
+    }
+    entries
+}
+
+/// A value moved to or from the account, as its table cells show it.
+struct Movement {
+    amount: String,
+    from: String,
+    to: String,
+    flagged: bool,
+}
+
+/// The send in an entry: the fields of its [`Effect::Sent`].
+struct Send {
+    to: Option<Address>,
+    nonce: Option<u64>,
+    success: bool,
+    fee: Option<U256>,
+    value: Option<U256>,
+}
+
+fn entry(group: &[Activity], key: EntryKey, cut: bool, reader: &Reader<'_>) -> Entry {
+    let first = &group[0];
+    let hash = group.iter().find_map(|activity| activity.tx);
+    let send = group.iter().find_map(|activity| match activity.effect {
+        Effect::Sent {
+            to,
+            nonce,
+            success,
+            fee,
+            value,
+        } => Some(Send {
+            to,
+            nonce,
+            success,
+            fee,
+            value,
+        }),
+        Effect::Eth { .. }
+        | Effect::Token { .. }
+        | Effect::Nft { .. }
+        | Effect::Multi { .. }
+        | Effect::Approval { .. }
+        | Effect::NftApproval { .. }
+        | Effect::ApprovalForAll { .. }
+        | Effect::Withdrawal { .. }
+        | Effect::FeeCredit { .. }
+        | Effect::Called { .. }
+        | Effect::BalanceChange { .. }
+        | Effect::Delegated { .. }
+        | Effect::Other { .. } => None,
+    });
+    let caller = group.iter().find_map(|activity| match activity.effect {
+        Effect::Called { from } => Some(from),
+        Effect::Sent { .. }
+        | Effect::Eth { .. }
+        | Effect::Token { .. }
+        | Effect::Nft { .. }
+        | Effect::Multi { .. }
+        | Effect::Approval { .. }
+        | Effect::NftApproval { .. }
+        | Effect::ApprovalForAll { .. }
+        | Effect::Withdrawal { .. }
+        | Effect::FeeCredit { .. }
+        | Effect::BalanceChange { .. }
+        | Effect::Delegated { .. }
+        | Effect::Other { .. } => None,
+    });
+    let mut movements: Vec<Movement> = group
+        .iter()
+        .filter_map(|activity| moved_value(activity, reader))
+        .collect();
+    let warning = movements.iter().any(|movement| movement.flagged);
+    let you = reader.owner.label().to_owned();
+    let party = |address: Address| {
+        if address == reader.account {
+            you.clone()
+        } else {
+            short(address)
+        }
+    };
+    let sent_to = |send: &Send| match (send.to, send.nonce) {
+        (Some(to), _) => party(to),
+        (None, Some(_)) => "new contract".to_owned(),
+        (None, None) => String::new(),
+    };
+    let (amount, from, to) = match movements.len() {
+        1 => {
+            let Movement {
+                amount, from, to, ..
+            } = movements.remove(0);
+            (amount, from, to)
+        }
+        0 => {
+            let (from, to) = match (&send, caller) {
+                (Some(send), _) => (you.clone(), sent_to(send)),
+                (None, Some(caller)) => (party(caller), you.clone()),
+                (None, None) => (String::new(), String::new()),
+            };
+            (label(group, reader.registry), from, to)
+        }
+        several => {
+            let listed = movements
+                .iter()
+                .map(|movement| movement.amount.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let amount = if listed.chars().count() <= AMOUNT_COLUMNS {
+                listed
+            } else {
+                format!("{several} transfers")
+            };
+            let (from, to) = match &send {
+                Some(send) => (you.clone(), sent_to(send)),
+                None => ("several".to_owned(), you.clone()),
+            };
+            (amount, from, to)
+        }
+    };
+    let cells = Cells {
+        tx: hash.map_or_else(|| untraced(group).to_owned(), short_hash),
+        block: grouped(first.number),
+        age: age(reader.now.saturating_sub(first.timestamp)),
+        from,
+        to,
+        amount,
+        fee: send
+            .as_ref()
+            .and_then(|send| send.fee)
+            .map(fee_cell)
+            .unwrap_or_default(),
+    };
+    Entry {
+        key,
+        cells,
+        warning,
+        detail: detail(group, hash, send.as_ref(), caller, cut, reader),
+    }
+}
+
+/// The value `activity` moved, `None` for an effect that moves none.
+fn moved_value(activity: &Activity, reader: &Reader<'_>) -> Option<Movement> {
+    let account = reader.account;
+    let you = reader.owner.label();
+    let party = |address: Address| {
+        if address == account {
+            you.to_owned()
+        } else {
+            short(address)
+        }
+    };
+    let moved = |what: String, from: Address, to: Address| {
+        let sign = match (from == account, to == account) {
+            (true, false) => "-",
+            (false, true) => "+",
+            (true, true) | (false, false) => "",
+        };
+        Movement {
+            amount: format!("{sign}{what}"),
+            from: party(from),
+            to: party(to),
+            flagged: false,
+        }
+    };
+    let credit = |amount: String, from: String| Movement {
+        amount,
+        from,
+        to: you.to_owned(),
+        flagged: false,
+    };
+    match &activity.effect {
+        Effect::Eth { from, to, amount } => Some(moved(eth(*amount), *from, *to)),
+        Effect::Token {
+            token,
+            from,
+            to,
+            amount,
+        } => {
+            let what = token_amount(*amount, *token, reader.registry);
+            if amount.is_zero() && *from == account && *to != account && !activity.sent {
+                Some(Movement {
+                    amount: format!("⚠ {what}"),
+                    from: party(*from),
+                    to: party(*to),
+                    flagged: true,
+                })
+            } else {
+                Some(moved(what, *from, *to))
+            }
+        }
+        Effect::Nft { from, to, id, .. } => Some(moved(format!("NFT #{id}"), *from, *to)),
+        Effect::Multi {
+            from,
+            to,
+            id,
+            amount,
+            ..
+        } => Some(moved(format!("{amount} of #{id}"), *from, *to)),
+        Effect::Withdrawal { validator, amount } => Some(credit(
+            format!("+{}", eth(*amount)),
+            format!("validator {validator}"),
+        )),
+        Effect::FeeCredit { amount } => Some(credit(
+            amount
+                .map(|amount| format!("+{}", eth(amount)))
+                .unwrap_or_default(),
+            "block fees".to_owned(),
+        )),
+        Effect::BalanceChange { after, .. } => Some(Movement {
+            amount: format!("= {}", eth(*after)),
+            from: String::new(),
+            to: String::new(),
+            flagged: false,
+        }),
+        Effect::Sent {
+            to: Some(to),
+            value: Some(value),
+            ..
+        } if *to == account => Some(moved(eth(*value), account, account)),
+        Effect::Sent { .. }
+        | Effect::Approval { .. }
+        | Effect::NftApproval { .. }
+        | Effect::ApprovalForAll { .. }
+        | Effect::Called { .. }
+        | Effect::Delegated { .. }
+        | Effect::Other { .. } => None,
+    }
+}
+
+/// What an entry that moved no value did, in a word or two: an approval first, then a
+/// delegation, a call, and last an unknown event.
+fn label(group: &[Activity], registry: &[Token]) -> String {
+    group
+        .iter()
+        .filter_map(|activity| match &activity.effect {
+            Effect::Approval { token, .. } | Effect::NftApproval { token, .. } => {
+                Some((0, format!("approve {}", symbol(*token, registry))))
+            }
+            Effect::ApprovalForAll {
+                token, approved, ..
+            } => {
+                let verb = if *approved { "approve" } else { "revoke" };
+                Some((0, format!("{verb} {}", symbol(*token, registry))))
+            }
+            Effect::Delegated { to: Some(_), .. } => Some((1, "delegate".to_owned())),
+            Effect::Delegated { to: None, .. } => Some((1, "undelegate".to_owned())),
+            Effect::Sent { .. } | Effect::Called { .. } => Some((2, "call".to_owned())),
+            Effect::Other { .. } => Some((3, "event".to_owned())),
+            Effect::Eth { .. }
+            | Effect::Token { .. }
+            | Effect::Nft { .. }
+            | Effect::Multi { .. }
+            | Effect::Withdrawal { .. }
+            | Effect::FeeCredit { .. }
+            | Effect::BalanceChange { .. } => None,
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, label)| label)
+        .unwrap_or_default()
+}
+
+/// What an entry no stored transaction made is, for its transaction cell.
+fn untraced(group: &[Activity]) -> &'static str {
+    group
+        .iter()
+        .find_map(|activity| match activity.effect {
+            Effect::Withdrawal { .. } => Some("withdrawal"),
+            Effect::FeeCredit { .. } => Some("fee credit"),
+            Effect::BalanceChange { .. } => Some("balance"),
+            Effect::Sent { .. }
+            | Effect::Eth { .. }
+            | Effect::Token { .. }
+            | Effect::Nft { .. }
+            | Effect::Multi { .. }
+            | Effect::Approval { .. }
+            | Effect::NftApproval { .. }
+            | Effect::ApprovalForAll { .. }
+            | Effect::Called { .. }
+            | Effect::Delegated { .. }
+            | Effect::Other { .. } => None,
+        })
+        .unwrap_or_default()
+}
+
+/// An entry's detail screen: the transaction, its block, what the account's send says about
+/// it, every effect in full, and the explorer link.
+fn detail(
+    group: &[Activity],
+    hash: Option<TxHash>,
+    send: Option<&Send>,
+    caller: Option<Address>,
+    cut: bool,
+    reader: &Reader<'_>,
+) -> Vec<DetailLine> {
+    let first = &group[0];
+    let field = |label: &'static str, value: String| DetailLine::Field { label, value };
+    let named = |address: Address| {
+        if address == reader.account {
+            format!("{address} ({})", reader.owner.label())
+        } else {
+            address.to_string()
+        }
+    };
+    let mut lines = Vec::new();
+    if let Some(hash) = hash {
+        lines.push(field("transaction", hash.to_string()));
+    }
+    lines.push(field(
+        "block",
+        format!(
+            "{} · {}",
+            grouped(first.number),
+            ago(reader.now.saturating_sub(first.timestamp))
+        ),
+    ));
+    match (send, caller) {
+        (Some(send), _) => {
+            let status = if send.success { "success" } else { "failed" };
+            lines.push(field("status", status.to_owned()));
+            lines.push(field("from", named(reader.account)));
+            match (send.to, send.nonce) {
+                (Some(to), _) => lines.push(field("to", named(to))),
+                (None, Some(_)) => lines.push(field("to", "new contract".to_owned())),
+                (None, None) => {}
+            }
+            if let Some(value) = send.value {
+                lines.push(field("value", eth(value)));
+            }
+            if let Some(nonce) = send.nonce {
+                lines.push(field("nonce", nonce.to_string()));
+            }
+            if let Some(fee) = send.fee {
+                lines.push(field("fee", eth(fee)));
+            }
+        }
+        (None, Some(caller)) => lines.push(field("from", named(caller))),
+        (None, None) => {}
+    }
+    let effects: Vec<DetailLine> = group
+        .iter()
+        .filter(|activity| !matches!(activity.effect, Effect::Sent { .. }))
+        .map(|activity| DetailLine::Text(effect_text(activity, reader.account, reader.registry)))
+        .collect();
+    if !effects.is_empty() || cut {
+        lines.push(DetailLine::Blank);
+    }
+    lines.extend(effects);
+    if cut {
+        lines.push(DetailLine::Text(MORE_EFFECTS.to_owned()));
+    }
+    if let Some(hash) = hash {
+        lines.push(DetailLine::Blank);
+        lines.push(DetailLine::Text(reader.explorer.tx_url(hash)));
+    }
+    lines
+}
+
+/// A token's symbol when the registry knows it, else its shortened address.
+fn symbol(token: Address, registry: &[Token]) -> String {
+    registry
+        .iter()
+        .find(|known| known.address == token)
+        .map_or_else(|| short(token), |known| known.symbol.to_owned())
+}
+
+/// A transaction hash as its first four and last four hex digits.
+fn short_hash(hash: TxHash) -> String {
+    let full = hash.to_string();
+    format!("{}…{}", &full[..6], &full[full.len() - 4..])
+}
+
+/// How long ago `seconds` was, as a number and a one-letter unit.
+fn age(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        86_400.. => format!("{}d", seconds / 86_400),
+    }
+}
+
+/// A fee in wei as ETH rounded down to 6 decimals, without the unit: a nonzero fee that
+/// rounds to nothing shows as below the smallest step.
+fn fee_cell(fee: U256) -> String {
+    let micro = fee / U256::from(1_000_000_000_000u64);
+    if micro.is_zero() && !fee.is_zero() {
+        return "<0.000001".to_owned();
+    }
+    format_units(micro, 6)
 }
 
 /// What history holds for an account, as one line: where its log coverage starts, the gaps
@@ -791,5 +1327,443 @@ mod tests {
     #[test]
     fn coverage_without_log_ranges_says_there_is_no_history_yet() {
         assert_eq!(coverage(&[], Vec::new(), Vec::new()), "no history yet");
+    }
+
+    const ACCOUNT: Address = address!("0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7");
+    const FRIEND: Address = address!("0xd72A04f52788544702EA111E54B4B226Fd328146");
+    const SEPOLIA_USDC: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+    const HASH: B256 = B256::repeat_byte(0x67);
+    const OTHER_HASH: B256 = B256::repeat_byte(0x42);
+    const SEPOLIA: [Token; 1] = [Token {
+        symbol: "USDC",
+        name: "USD Coin",
+        address: SEPOLIA_USDC,
+        decimals: 6,
+    }];
+    const BLOCK: u64 = 11_969_090;
+
+    fn reader(owner: Owner) -> Reader<'static> {
+        Reader {
+            account: ACCOUNT,
+            owner,
+            registry: &SEPOLIA,
+            now: NOW,
+            explorer: Explorer("https://sepolia.etherscan.io"),
+        }
+    }
+
+    /// An activity of block [`BLOCK`], mined 7 minutes before [`NOW`].
+    fn activity(at: At, tx: Option<B256>, sent: bool, effect: Effect) -> Activity {
+        Activity {
+            number: BLOCK,
+            timestamp: NOW - 7 * 60,
+            at,
+            tx,
+            sent,
+            effect,
+        }
+    }
+
+    fn sent_by_me(effect: Effect) -> Activity {
+        activity(At::Tx(3), Some(HASH), true, effect)
+    }
+
+    fn sent(to: Address, nonce: u64, fee: u64) -> Effect {
+        Effect::Sent {
+            to: Some(to),
+            nonce: Some(nonce),
+            success: true,
+            fee: Some(U256::from(fee)),
+            value: None,
+        }
+    }
+
+    fn usdc(units: u64, from: Address, to: Address) -> Effect {
+        Effect::Token {
+            token: SEPOLIA_USDC,
+            from,
+            to,
+            amount: U256::from(units),
+        }
+    }
+
+    fn wei(from: Address, to: Address, amount: u64) -> Effect {
+        Effect::Eth {
+            from,
+            to,
+            amount: U256::from(amount),
+        }
+    }
+
+    fn cells(tx: &str, from: &str, to: &str, amount: &str, fee: &str) -> Cells {
+        Cells {
+            tx: tx.to_owned(),
+            block: "11,969,090".to_owned(),
+            age: "7m".to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+            amount: amount.to_owned(),
+            fee: fee.to_owned(),
+        }
+    }
+
+    fn rows(activities: &[Activity], owner: Owner) -> Vec<Cells> {
+        entries(activities, false, &reader(owner))
+            .into_iter()
+            .map(|entry| entry.cells)
+            .collect()
+    }
+
+    fn detail_text(entry: &Entry) -> Vec<String> {
+        entry.detail.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_send_and_its_eth_move_are_one_row() {
+        let activities = [
+            sent_by_me(wei(ACCOUNT, FRIEND, 1_000_000_000)),
+            sent_by_me(sent(FRIEND, 46, 1_669_629)),
+        ];
+        assert_eq!(
+            rows(&activities, Owner::You),
+            [cells(
+                "0x6767…6767",
+                "you",
+                "0xd72A…8146",
+                "-0.000000001 ETH",
+                "<0.000001"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_token_send_and_its_sent_are_one_row_whose_details_say_everything_in_full() {
+        let activities = [
+            sent_by_me(usdc(1_000_000, ACCOUNT, FRIEND)),
+            sent_by_me(sent(SEPOLIA_USDC, 46, 1_669_629)),
+        ];
+        let entries = entries(&activities, false, &reader(Owner::You));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].cells,
+            cells(
+                "0x6767…6767",
+                "you",
+                "0xd72A…8146",
+                "-1.00 USDC",
+                "<0.000001"
+            )
+        );
+        assert_eq!(
+            detail_text(&entries[0]),
+            [
+                "transaction  0x6767676767676767676767676767676767676767676767676767676767676767",
+                "block        11,969,090 · 7 min ago",
+                "status       success",
+                "from         0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 (you)",
+                "to           0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+                "nonce        46",
+                "fee          0.000000000001669629 ETH",
+                "",
+                "-1.00 USDC to 0xd72A04f52788544702EA111E54B4B226Fd328146",
+                "",
+                "https://sepolia.etherscan.io/tx/0x6767676767676767676767676767676767676767676767676767676767676767",
+            ]
+        );
+        assert_eq!(
+            entries[0].key,
+            EntryKey {
+                number: BLOCK,
+                at: At::Tx(3),
+                nth: 0
+            }
+        );
+    }
+
+    #[test]
+    fn two_withdrawals_in_one_block_are_two_rows() {
+        let withdrawal = |validator| {
+            activity(
+                At::Post,
+                None,
+                false,
+                Effect::Withdrawal {
+                    validator,
+                    amount: milli_eth(500),
+                },
+            )
+        };
+        let entries = entries(
+            &[withdrawal(42), withdrawal(43)],
+            false,
+            &reader(Owner::You),
+        );
+        let shown: Vec<(EntryKey, Cells)> = entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.cells))
+            .collect();
+        let key = |nth| EntryKey {
+            number: BLOCK,
+            at: At::Post,
+            nth,
+        };
+        assert_eq!(
+            shown,
+            [
+                (
+                    key(0),
+                    cells("withdrawal", "validator 42", "you", "+0.50 ETH", "")
+                ),
+                (
+                    key(1),
+                    cells("withdrawal", "validator 43", "you", "+0.50 ETH", "")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_swap_lists_both_movements_when_they_fit_and_counts_them_when_not() {
+        let swap = |paid| {
+            [
+                sent_by_me(wei(ACCOUNT, FRIEND, paid)),
+                sent_by_me(usdc(500_000_000, FRIEND, ACCOUNT)),
+                sent_by_me(sent(FRIEND, 47, 512_000_000_000_000)),
+            ]
+        };
+        assert_eq!(
+            rows(&swap(100_000_000_000_000_000), Owner::You),
+            [cells(
+                "0x6767…6767",
+                "you",
+                "0xd72A…8146",
+                "-0.10 ETH, +500.00 USDC",
+                "0.000512"
+            )]
+        );
+        assert_eq!(
+            rows(&swap(1_000_000_000), Owner::You),
+            [cells(
+                "0x6767…6767",
+                "you",
+                "0xd72A…8146",
+                "2 transfers",
+                "0.000512"
+            )]
+        );
+        let received = [
+            activity(At::Tx(5), Some(HASH), false, wei(FRIEND, ACCOUNT, 1)),
+            activity(
+                At::Tx(5),
+                Some(HASH),
+                false,
+                usdc(1_000_000, SEPOLIA_USDC, ACCOUNT),
+            ),
+        ];
+        assert_eq!(
+            rows(&received, Owner::You),
+            [cells("0x6767…6767", "several", "you", "2 transfers", "")]
+        );
+    }
+
+    #[test]
+    fn a_send_to_oneself_shows_its_value_between_the_account_and_itself() {
+        let to_self = [sent_by_me(Effect::Sent {
+            to: Some(ACCOUNT),
+            nonce: Some(44),
+            success: true,
+            fee: None,
+            value: Some(U256::from(1_000_000_000u64)),
+        })];
+        assert_eq!(
+            rows(&to_self, Owner::You),
+            [cells("0x6767…6767", "you", "you", "0.000000001 ETH", "")]
+        );
+        assert_eq!(
+            rows(&to_self, Owner::Watched),
+            [cells(
+                "0x6767…6767",
+                "watched",
+                "watched",
+                "0.000000001 ETH",
+                ""
+            )]
+        );
+    }
+
+    #[test]
+    fn the_fee_rounds_down_to_six_decimals_and_a_tiny_one_shows_as_below_the_step() {
+        let shown = [
+            1_669_629u64,
+            512_000_000_000_000,
+            512_999_999_999_999,
+            1_000_000_000_000,
+            0,
+        ]
+        .map(|wei| fee_cell(U256::from(wei)));
+        assert_eq!(
+            shown,
+            ["<0.000001", "0.000512", "0.000512", "0.000001", "0.00"]
+        );
+    }
+
+    #[test]
+    fn age_shows_one_compact_unit() {
+        let shown = [45, 7 * 60 + 5, 3 * 3_600, 2 * 86_400 + 5].map(age);
+        assert_eq!(shown, ["45s", "7m", "3h", "2d"]);
+    }
+
+    #[test]
+    fn the_account_is_you_only_when_unlocked_and_watched_otherwise() {
+        assert_eq!(Owner::of(ACCOUNT, Some(ACCOUNT)), Owner::You);
+        assert_eq!(Owner::of(ACCOUNT, None), Owner::Watched);
+        let received = [activity(
+            At::Tx(1),
+            Some(HASH),
+            false,
+            wei(FRIEND, ACCOUNT, 1_500_000_000_000_000_000),
+        )];
+        let row = |owner| cells("0x6767…6767", "0xd72A…8146", owner, "+1.50 ETH", "");
+        assert_eq!(rows(&received, Owner::You), [row("you")]);
+        assert_eq!(rows(&received, Owner::Watched), [row("watched")]);
+
+        let to_self = [sent_by_me(sent(ACCOUNT, 1, 0))];
+        let entries = entries(&to_self, false, &reader(Owner::Watched));
+        assert!(
+            detail_text(&entries[0]).contains(
+                &"to           0x3499ddf9E66b53Ca484554d5309Bf32521AAE5a7 (watched)".to_owned()
+            ),
+            "{:#?}",
+            entries[0].detail
+        );
+    }
+
+    #[test]
+    fn a_zero_transfer_out_the_account_did_not_send_is_flagged_in_text() {
+        let bait = [activity(
+            At::Tx(9),
+            Some(HASH),
+            false,
+            usdc(0, ACCOUNT, FRIEND),
+        )];
+        let flagged = entries(&bait, false, &reader(Owner::You));
+        assert!(flagged[0].warning);
+        assert_eq!(
+            flagged[0].cells,
+            cells("0x6767…6767", "you", "0xd72A…8146", "⚠ 0.00 USDC", "")
+        );
+        assert!(
+            detail_text(&flagged[0]).contains(
+                &"-0.00 USDC to 0xd72A04f52788544702EA111E54B4B226Fd328146 (zero transfer you did \
+              not send; do not copy this address)"
+                    .to_owned()
+            )
+        );
+
+        let mine = [sent_by_me(usdc(0, ACCOUNT, FRIEND))];
+        let unflagged = entries(&mine, false, &reader(Owner::You));
+        assert!(!unflagged[0].warning);
+        assert_eq!(unflagged[0].cells.amount, "-0.00 USDC");
+    }
+
+    #[test]
+    fn a_full_read_drops_its_oldest_entry_unless_it_is_the_only_one() {
+        let newer = activity(At::Tx(4), Some(OTHER_HASH), false, wei(FRIEND, ACCOUNT, 1));
+        let older = [
+            sent_by_me(usdc(1_000_000, ACCOUNT, FRIEND)),
+            sent_by_me(sent(SEPOLIA_USDC, 46, 1)),
+        ];
+        let mut both = vec![newer];
+        both.extend(older.clone());
+        let places = |activities: &[Activity], full| {
+            entries(activities, full, &reader(Owner::You))
+                .into_iter()
+                .map(|entry| entry.key.at)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(places(&both, false), [At::Tx(4), At::Tx(3)]);
+        assert_eq!(places(&both, true), [At::Tx(4)]);
+
+        let alone = entries(&older, true, &reader(Owner::You));
+        assert_eq!(alone.len(), 1);
+        assert_eq!(
+            detail_text(&alone[0])[7..],
+            [
+                "",
+                "-1.00 USDC to 0xd72A04f52788544702EA111E54B4B226Fd328146",
+                "more effects than chibi loaded",
+                "",
+                "https://sepolia.etherscan.io/tx/0x6767676767676767676767676767676767676767676767676767676767676767",
+            ]
+        );
+        let unmarked = entries(&older, false, &reader(Owner::You));
+        assert!(!detail_text(&unmarked[0]).contains(&"more effects than chibi loaded".to_owned()));
+    }
+
+    #[test]
+    fn an_entry_that_moves_nothing_says_what_it_did() {
+        let approve = [
+            sent_by_me(Effect::Approval {
+                token: SEPOLIA_USDC,
+                owner: ACCOUNT,
+                spender: FRIEND,
+                amount: U256::MAX,
+            }),
+            sent_by_me(sent(SEPOLIA_USDC, 48, 0)),
+        ];
+        let called = [activity(
+            At::Tx(2),
+            Some(HASH),
+            false,
+            Effect::Called { from: FRIEND },
+        )];
+        let delegated = [sent_by_me(Effect::Delegated {
+            to: Some(FRIEND),
+            confirmed: true,
+        })];
+        let event = [activity(
+            At::Tx(2),
+            Some(HASH),
+            false,
+            Effect::Other {
+                emitter: FRIEND,
+                topic0: None,
+            },
+        )];
+        let fee_credit = [activity(
+            At::Tx(2),
+            None,
+            false,
+            Effect::FeeCredit {
+                amount: Some(U256::from(100_000_000_000_000u64)),
+            },
+        )];
+        let balance = [activity(
+            At::System,
+            None,
+            false,
+            Effect::BalanceChange {
+                before: None,
+                after: milli_eth(1_300),
+            },
+        )];
+        let hashed = "0x6767…6767";
+        let cases = [
+            (
+                &approve[..],
+                cells(hashed, "you", "0x1c7D…7238", "approve USDC", "0.00"),
+            ),
+            (&called, cells(hashed, "0xd72A…8146", "you", "call", "")),
+            (&delegated, cells(hashed, "", "", "delegate", "")),
+            (&event, cells(hashed, "", "", "event", "")),
+            (
+                &fee_credit,
+                cells("fee credit", "block fees", "you", "+0.0001 ETH", ""),
+            ),
+            (&balance, cells("balance", "", "", "= 1.30 ETH", "")),
+        ];
+        for (activities, expected) in cases {
+            assert_eq!(rows(activities, Owner::You), [expected]);
+        }
     }
 }

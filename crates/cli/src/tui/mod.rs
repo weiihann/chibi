@@ -33,7 +33,7 @@ use self::app::{Action, App, Balances, CAT_FRAME, HistoryLines, HistoryPane, Req
 use self::transfer::{Quote, Quoted, UnlockError};
 use self::view::View;
 use self::wallet::Saved;
-use crate::activity::{NO_HISTORY, activity_line, coverage_line, unix_now};
+use crate::activity::{NO_HISTORY, Owner, Reader, coverage_line, entries, unix_now};
 use crate::config::process_env;
 use crate::names::printable;
 use crate::run::{self, STARTING, Served};
@@ -615,13 +615,14 @@ impl Ui<'_> {
                                 refresh_balances(node, self.app.registry, &mut tasks);
                             }
                             if let Some(account) = self.app.history_request(due) {
-                                refresh_history(
-                                    data_dir,
+                                let reader = Reader {
                                     account,
-                                    self.app.chain_id,
-                                    self.app.registry,
-                                    &mut tasks,
-                                );
+                                    owner: Owner::of(account, self.app.sender),
+                                    registry: self.app.registry,
+                                    now: unix_now(),
+                                    explorer: self.app.explorer,
+                                };
+                                refresh_history(data_dir, self.app.chain_id, reader, &mut tasks);
                             }
                             if let Some(hash) = self.app.tracking()
                                 && let Some(tracked) = transfer::track(node, hash)
@@ -692,47 +693,42 @@ fn refresh_balances<P: Peers>(
     });
 }
 
-/// Reads `account`'s history from `data_dir` off the event loop. A failed read is logged and
-/// answered with no lines, so the wallet keeps its last ones.
+/// Reads the history of the account `reader` reads from `data_dir` off the event loop. A
+/// failed read is logged and answered with no lines, so the wallet keeps its last ones.
 fn refresh_history(
     data_dir: &Path,
-    account: Address,
     chain_id: u64,
-    registry: &'static [Token],
+    reader: Reader<'static>,
     tasks: &mut JoinSet<Done>,
 ) {
     let data_dir = data_dir.to_owned();
     tasks.spawn_blocking(move || {
-        let lines = read_history(&data_dir, account, chain_id, registry, unix_now())
+        let account = reader.account;
+        let lines = read_history(&data_dir, chain_id, &reader)
             .inspect_err(|err| tracing::warn!(%err, %account, "cannot read the account history"))
             .ok();
         Done::History(account, lines)
     });
 }
 
-/// `account`'s coverage line and its newest [`HISTORY_ACTIVITIES`] activities at `now`.
+/// The coverage line and the entries of the newest [`HISTORY_ACTIVITIES`] activities of the
+/// account `reader` reads.
 fn read_history(
     data_dir: &Path,
-    account: Address,
     chain_id: u64,
-    registry: &[Token],
-    now: u64,
+    reader: &Reader<'_>,
 ) -> Result<HistoryLines, NodeError> {
     let Some(history) = History::open(data_dir)? else {
         return Ok(HistoryLines {
             coverage: NO_HISTORY.to_owned(),
-            activities: Vec::new(),
+            entries: Vec::new(),
         });
     };
-    let view = history.view(account, HISTORY_ACTIVITIES, chain_id)?;
-    let activities = view
-        .activities
-        .iter()
-        .map(|activity| activity_line(activity, account, registry, now))
-        .collect();
+    let view = history.view(reader.account, HISTORY_ACTIVITIES, chain_id)?;
+    let full = view.activities.len() == HISTORY_ACTIVITIES;
     Ok(HistoryLines {
         coverage: coverage_line(&view.coverage, &send_check(&view.coverage, chain_id)),
-        activities,
+        entries: entries(&view.activities, full, reader),
     })
 }
 
@@ -1108,19 +1104,25 @@ mod tests {
 
     #[test]
     fn history_reads_as_no_history_yet_before_anything_is_recorded() {
-        let account = address!("0x00000000000000000000000000000000000000aa");
+        let reader = Reader {
+            account: address!("0x00000000000000000000000000000000000000aa"),
+            owner: Owner::Watched,
+            registry: &[],
+            now: 0,
+            explorer: Network::Sepolia.spec().explorer,
+        };
         let empty = HistoryLines {
             coverage: "no history yet".to_owned(),
-            activities: Vec::new(),
+            entries: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            read_history(dir.path(), account, 11_155_111, &[], 0).unwrap(),
+            read_history(dir.path(), 11_155_111, &reader).unwrap(),
             empty
         );
         drop(Disk::open(dir.path()).unwrap());
         assert_eq!(
-            read_history(dir.path(), account, 11_155_111, &[], 0).unwrap(),
+            read_history(dir.path(), 11_155_111, &reader).unwrap(),
             empty
         );
     }
