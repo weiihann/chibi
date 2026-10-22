@@ -4279,14 +4279,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_history_list_and_details_over_a_sent_transfer_take_every_key_until_closed() {
+    /// A history-on app on Sending, its transfer's receipt verified, so Enter or Esc on the
+    /// screen itself clears the form and goes back to it.
+    fn sent_transfer() -> App {
         let mut app = with_history(ready(Network::Sepolia));
         submit(&mut app, "1", BOB, Ok(FEE));
         press(&mut app, KeyCode::Char('y'));
         app.sent(Ok(TxHash::ZERO));
         app.tracked(Tracked::Receipt { success: true });
         assert_eq!(app.screen, Screen::Sending);
+        app
+    }
+
+    #[test]
+    fn the_history_list_and_details_over_a_sent_transfer_take_every_key_until_closed() {
+        let mut app = sent_transfer();
         let (form, sending) = (app.form.clone(), app.sending.clone());
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.history_request(false), Some(SENDER));
@@ -4305,6 +4312,52 @@ mod tests {
         );
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.screen, Screen::Ready);
+    }
+
+    #[test]
+    fn esc_over_a_sent_transfer_closes_only_the_history_list_or_details() {
+        let mut app = sent_transfer();
+        let (form, sending) = (app.form.clone(), app.sending.clone());
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(SENDER));
+        app.history_read(SENDER, Some(history_lines(2)));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(mode(&app), Some(HistoryMode::Closed));
+        assert_eq!(
+            (app.screen, &app.form, &app.sending),
+            (Screen::Sending, &form, &sending)
+        );
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(mode(&app), Some(HistoryMode::List));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(mode(&app), Some(HistoryMode::Closed));
+        assert_eq!(
+            (app.screen, &app.form, &app.sending),
+            (Screen::Sending, &form, &sending)
+        );
+    }
+
+    #[test]
+    fn enter_on_an_empty_history_list_over_a_sent_transfer_does_nothing() {
+        let mut app = sent_transfer();
+        let (form, sending) = (app.form.clone(), app.sending.clone());
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history_request(false), Some(SENDER));
+        app.history_read(
+            SENDER,
+            Some(HistoryLines {
+                coverage: String::new(),
+                entries: Vec::new(),
+            }),
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(mode(&app), Some(HistoryMode::List));
+        assert_eq!(
+            (app.screen, &app.form, &app.sending),
+            (Screen::Sending, &form, &sending)
+        );
     }
 
     #[test]
