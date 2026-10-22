@@ -28,11 +28,14 @@ if lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
 fi
 
 (cd "$repo" && cargo build --release -p chibi >&2)
+# CARGO_TARGET_DIR or a cargo config can move the build out of $repo/target.
+target_dir=$(cd "$repo" && cargo metadata --format-version 1 --no-deps |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 run_dir=${CHIBI_VERIFY_ROOT:-/tmp/chibi-verify}/$run_id
 mkdir -p "$run_dir/home" "$run_dir/bin" "$run_dir/evidence"
-cp "$repo/target/release/chibi" "$run_dir/bin/chibi"
+cp "$target_dir/release/chibi" "$run_dir/bin/chibi"
 
 cat > "$run_dir/meta.env" <<EOF
 RUN_ID=$run_id
