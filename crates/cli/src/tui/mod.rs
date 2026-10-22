@@ -288,7 +288,7 @@ pub fn run(
         app.setup(process_env("HOME").map(PathBuf::from));
     }
     let terminal = open(init, ratatui::restore).wrap_err("cannot open the terminal UI")?;
-    app.width = crossterm::terminal::size().map_or(0, |(width, _)| width);
+    (app.width, app.height) = crossterm::terminal::size().unwrap_or_default();
     let (input_tx, input) = mpsc::unbounded_channel();
     let reader = thread::spawn(move || read_input(&input_tx));
     let (views, latest) = watch::channel(View::new(&app, Vec::new(), Instant::now()));
@@ -425,8 +425,8 @@ impl Ui<'_> {
                 _ = &mut shutdown => return Ok(None),
                 () = self.views.closed() => eyre::bail!("the terminal UI stopped drawing"),
             };
-            if let Some(Event::Resize(width, _)) = event {
-                self.app.width = width;
+            if let Some(Event::Resize(width, height)) = event {
+                (self.app.width, self.app.height) = (width, height);
             }
             let Some(Event::Key(key)) = event else {
                 if event.is_none() {
@@ -553,8 +553,8 @@ impl Ui<'_> {
                         }
                     }
                     Some(event) = self.input.recv() => {
-                        if let Event::Resize(width, _) = event {
-                            self.app.width = width;
+                        if let Event::Resize(width, height) = event {
+                            (self.app.width, self.app.height) = (width, height);
                         }
                         let Event::Key(key) = event else { continue };
                         match self.app.key(key) {

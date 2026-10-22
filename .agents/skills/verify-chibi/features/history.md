@@ -16,7 +16,7 @@ With history on, chibi keeps a permanent record of what happened to the watched 
 
 - `chibi init` asks "Keep a transaction history for watched accounts?"; `--history` answers yes.
 - `chibi status` prints, under each watched address, a line such as `history since block 11,941,326 · gaps: none · sends from nonce 36 complete` and the five newest activities.
-- In `chibi wallet`, the table sits under the send form or the watch list once the first read finishes. `h` opens the full pane wherever `l` opens the logs: Up and Down move the `>`, Enter opens the selected transaction's details, and `h` or Esc closes the pane. In the details Up and Down scroll, Esc or Backspace goes back to the list on the same row, and `h` closes the pane.
+- In `chibi wallet`, the table sits under the send form or the watch list once the first read finishes. `h` opens the full pane wherever `l` opens the logs, with the `>` on the newest transaction: Up and Down move the `>`, Enter opens the selected transaction's details, and `h` or Esc closes the pane. In the details Up and Down scroll by one screen row, down until the last row shows at the bottom and no further, Esc or Backspace goes back to the list on the same row, and `h` closes the pane.
 
 ## Driving it with verify-chibi scripts
 

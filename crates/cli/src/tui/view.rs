@@ -134,8 +134,8 @@ enum Body {
     /// The history pane: `head` from the top left, then the table, scrolled so its selected
     /// row shows.
     History { head: Vec<Row>, table: Table },
-    /// One entry's details under a blank row: `rows` from row `first` on, scrolled no
-    /// further than the last row showing at the bottom.
+    /// One entry's details under a blank row: the display rows of `rows` from display row
+    /// `first` on, scrolled no further than the last row showing at the bottom.
     Detail { rows: Vec<Row>, first: usize },
 }
 
@@ -540,40 +540,22 @@ fn card(area: Rect, pane: u16) -> Option<Rect> {
 /// Draws the whole screen: in a card titled with the header when the terminal has room for
 /// one, else borderless under a header row.
 pub fn draw(frame: &mut Frame<'_>, view: View) {
-    let pane = if view.logs.is_some() {
-        LOG_PANE_LINES + 2
-    } else {
-        0
-    };
+    let pane = log_pane(view.logs.is_some());
     let screen = frame.area();
-    let area = if let Some(card) = card(screen, pane) {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .title(view.header)
-            .padding(Padding::horizontal(1));
-        let inner = block.inner(card);
+    if let Some(card) = card(screen, pane) {
         frame.render_widget(Clear, card);
-        frame.render_widget(block, card);
-        inner
+        frame.render_widget(card_block(view.header), card);
     } else {
-        let header = screen.height.min(1);
         frame.render_widget(
             Paragraph::new(view.header),
             Rect {
-                height: header,
+                height: screen.height.min(1),
                 ..screen
             },
         );
-        Rect {
-            y: screen.y + header,
-            height: screen.height - header,
-            ..screen
-        }
-    };
-    let notice = view.notice.map(|text| {
-        Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
-            .wrap(Wrap { trim: false })
-    });
+    }
+    let area = inner(screen, pane);
+    let notice = view.notice.map(notice_paragraph);
     let keys = with_history(view.keys, view.history_key);
     let (mut areas, mut footer) = split(area, &keys, notice.as_ref(), pane);
     match view.body {
@@ -620,6 +602,39 @@ pub fn draw(frame: &mut Frame<'_>, view: View) {
             log_area,
         );
     }
+}
+
+/// The rows the log pane takes, borders included, when `open`.
+const fn log_pane(open: bool) -> u16 {
+    if open { LOG_PANE_LINES + 2 } else { 0 }
+}
+
+/// The card's border, titled with `header`.
+fn card_block(header: Line<'static>) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(header)
+        .padding(Padding::horizontal(1))
+}
+
+/// Where the screen draws on `screen` with a log pane `pane` rows tall: inside the card when
+/// there is room for one, else under the header row.
+fn inner(screen: Rect, pane: u16) -> Rect {
+    if let Some(card) = card(screen, pane) {
+        return card_block(Line::default()).inner(card);
+    }
+    let header = screen.height.min(1);
+    Rect {
+        y: screen.y + header,
+        height: screen.height - header,
+        ..screen
+    }
+}
+
+/// The notice `text`, in yellow and wrapped.
+fn notice_paragraph(text: String) -> Paragraph<'static> {
+    Paragraph::new(Line::styled(text, Style::default().fg(Color::Yellow)))
+        .wrap(Wrap { trim: false })
 }
 
 /// The body, notice, footer, and log pane areas of `area`, top to bottom, for `notice`, a
@@ -783,31 +798,46 @@ fn history_page(frame: &mut Frame<'_>, head: Vec<Row>, table: &Table, body: Rect
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
 }
 
-/// Draws a blank row, then `rows` from row `first` on in the rest of `body`. A start past
-/// the last one that still fills `body` draws from that one, so a body taller than the rows
-/// never scrolls.
+/// Draws a blank row, then the display rows of `rows` from display row `first` on in the
+/// rest of `body`, starting no later than [`detail_last`].
 fn detail_page(frame: &mut Frame<'_>, rows: Vec<Row>, first: usize, body: Rect) {
-    let laid: Vec<Vec<Line<'static>>> = rows
-        .into_iter()
-        .map(|row| {
-            let mut lines = Vec::new();
-            row.lay_out(usize::from(body.width), &mut lines);
-            lines
-        })
-        .collect();
-    let room = usize::from(body.height).saturating_sub(1);
-    let mut below = 0;
-    let mut last = 0;
-    for (at, lines) in laid.iter().enumerate().rev() {
-        below += lines.len();
-        if below >= room {
-            last = at;
-            break;
-        }
-    }
+    let laid = laid_out(rows, body.width);
+    let first = first.min(detail_last(laid.len(), body));
     let mut lines = vec![Line::default()];
-    lines.extend(laid.into_iter().skip(first.min(last)).flatten());
+    lines.extend(laid.into_iter().skip(first));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+}
+
+/// The display rows of `rows` in a body `width` columns wide.
+fn laid_out(rows: Vec<Row>, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for row in rows {
+        row.lay_out(usize::from(width), &mut lines);
+    }
+    lines
+}
+
+/// The last of `lines` display rows a detail can start from in `body`: the one that leaves
+/// the rows under its blank row full, 0 when all of them fit.
+fn detail_last(lines: usize, body: Rect) -> usize {
+    lines.saturating_sub(usize::from(body.height).saturating_sub(1))
+}
+
+/// [`detail_last`] for the details open in `app` on its `width` x `height` terminal, 0 when
+/// none show.
+pub fn detail_end(app: &App) -> usize {
+    let HistoryMode::Detail { first } = app.history_mode() else {
+        return 0;
+    };
+    let Body::Detail { rows, .. } = detail(app, first) else {
+        return 0;
+    };
+    let pane = log_pane(app.logs);
+    let notice = app.notice.clone().map(notice_paragraph);
+    let keys = with_history(keys(app), app.history_key() && !app.history_shown());
+    let area = inner(Rect::new(0, 0, app.width, app.height), pane);
+    let ([body, ..], _) = split(area, &keys, notice.as_ref(), pane);
+    detail_last(laid_out(rows, body.width).len(), body)
 }
 
 /// The side cat cropped to its pixels and where it goes in `body`: two columns right of the
@@ -1513,7 +1543,7 @@ fn history(app: &App) -> Body {
     }
 }
 
-/// The selected entry's details from detail line `first` on, each line whole and wrapped
+/// The selected entry's details from display row `first` on, each line whole and wrapped
 /// under itself; the table when nothing is selected or the entries read are about another
 /// account than the one in view.
 fn detail(app: &App, first: usize) -> Body {
@@ -3289,8 +3319,9 @@ mod tests {
     }
 
     #[test]
-    fn details_taller_than_the_body_scroll_by_line_until_their_last_row_shows() {
+    fn details_taller_than_the_body_scroll_by_row_until_their_last_row_shows() {
         let mut app = read(ready(), SENDER, five_entries());
+        (app.width, app.height) = (80, 16);
         press(&mut app, KeyCode::Char('h'));
         press(&mut app, KeyCode::Enter);
         let body = |app: &App| {
@@ -3306,17 +3337,53 @@ mod tests {
             ]
         );
         press(&mut app, KeyCode::Down);
+        assert_eq!(
+            body(&app)[1],
+            "    0x671eb606000de4305cab87a0f6b334fef8ac4be6e994536e05586d7752e24543"
+        );
+        press(&mut app, KeyCode::Down);
         assert_eq!(body(&app)[1], "  block        11,969,090 · 7 min ago");
-        for _ in 0..5 {
+        for _ in 0..10 {
             press(&mut app, KeyCode::Down);
         }
         let rows = body(&app);
-        assert_eq!(rows[1], "  status       success", "{rows:#?}");
         assert_eq!(
             rows.last().unwrap(),
             "    4be6e994536e05586d7752e24543",
             "{rows:#?}"
         );
+        press(&mut app, KeyCode::Up);
+        assert_eq!(body(&app)[2..], rows[1..rows.len() - 1]);
+    }
+
+    #[test]
+    fn a_detail_row_wrapped_past_a_short_body_scrolls_to_its_end_and_straight_back() {
+        let mut app = read(ready(), SENDER, five_entries());
+        (app.width, app.height) = (20, 8);
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Enter);
+        let body = |app: &App| {
+            let buffer = drawn(app, &[], 20, 8);
+            (1..8)
+                .map(|y| row_from(&buffer, 0, y).trim_end().to_owned())
+                .take_while(|row| !row.starts_with("Esc back"))
+                .collect::<Vec<_>>()
+        };
+        let url = "  https://sepolia.etherscan.io/tx/0x671eb606000de4305cab87a0f6b334fef8ac4be6e994536e05586d7752e24543";
+        let tail = hanging(url, 20).last().unwrap().to_string();
+        assert!(
+            body(&app).len() < hanging(url, 20).len(),
+            "{:#?}",
+            body(&app)
+        );
+        for _ in 0..100 {
+            press(&mut app, KeyCode::Down);
+        }
+        let end = body(&app);
+        assert_eq!(end.last(), Some(&tail), "{end:#?}");
+        press(&mut app, KeyCode::Up);
+        let up = body(&app);
+        assert_eq!(up[2..], end[1..end.len() - 1], "{up:#?}");
     }
 
     #[test]

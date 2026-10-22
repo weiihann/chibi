@@ -14,6 +14,7 @@ use crate::activity::{self, format_units};
 use crate::config::{AddressError, parse_address};
 use crate::tui::cat::Pose;
 use crate::tui::transfer::{Asset, Draft, Fee, Quote, Quoted};
+use crate::tui::view;
 use crate::tui::wallet::{self, SECRET_BYTES, Secret};
 
 /// Heads a sent transfer may stay pending before the screen says it is still pending.
@@ -510,9 +511,9 @@ pub enum HistoryMode {
     Closed,
     /// The table of entries, one selected.
     List,
-    /// The selected entry's details, from detail line `first` on.
+    /// The selected entry's details, from display row `first` on.
     Detail {
-        /// The first detail line shown.
+        /// The first display row shown.
         first: usize,
     },
 }
@@ -535,10 +536,10 @@ pub struct HistoryPane {
 impl HistoryPane {
     /// In the list, Up and Down move the selection by one entry, Enter opens its details when
     /// the entries read are about `account`, the one in view, and `h` or Esc closes the pane.
-    /// In the details, Up and Down scroll by a line, Esc or Backspace goes back to the list,
-    /// and `h` closes the pane. Every other key does nothing, so none reaches the screen
-    /// under the pane.
-    fn key(&mut self, key: Key, account: Option<Address>) {
+    /// In the details, Up and Down scroll by a display row, from the first to `end`, the last
+    /// a full body can start from; Esc or Backspace goes back to the list, and `h` closes the
+    /// pane. Every other key does nothing, so none reaches the screen under the pane.
+    fn key(&mut self, key: Key, account: Option<Address>, end: usize) {
         match self.mode {
             HistoryMode::Closed => {}
             HistoryMode::List => match key {
@@ -564,16 +565,12 @@ impl HistoryPane {
                 Key::Esc | Key::Backspace => self.mode = HistoryMode::List,
                 Key::Up => {
                     self.mode = HistoryMode::Detail {
-                        first: first.saturating_sub(1),
+                        first: first.min(end).saturating_sub(1),
                     };
                 }
                 Key::Down => {
-                    let lines = self
-                        .entries_of(account)
-                        .get(self.selected)
-                        .map_or(0, |entry| entry.detail.len());
                     self.mode = HistoryMode::Detail {
-                        first: (first + 1).min(lines.saturating_sub(1)),
+                        first: (first + 1).min(end),
                     };
                 }
                 Key::Char(_)
@@ -665,6 +662,8 @@ pub struct App {
     pub pixel_cats: bool,
     /// The terminal's width in columns.
     pub width: u16,
+    /// The terminal's height in rows.
+    pub height: u16,
     quit_armed: bool,
     address_back: Screen,
     balances_asked: Option<(u64, usize)>,
@@ -716,6 +715,7 @@ impl App {
             serving: false,
             pixel_cats: false,
             width: 0,
+            height: 0,
             entered: None,
         }
     }
@@ -1332,12 +1332,12 @@ impl App {
             self.logs = !self.logs;
             return None;
         }
-        let account = self.history_account();
+        let (account, end) = (self.history_account(), view::detail_end(self));
         if self.history_key()
             && let Some(pane) = &mut self.history
         {
             if pane.mode != HistoryMode::Closed {
-                pane.key(key, account);
+                pane.key(key, account, end);
                 return None;
             }
             if key == Key::Char('h') {
@@ -4233,8 +4233,9 @@ mod tests {
     }
 
     #[test]
-    fn up_and_down_scroll_the_details_by_a_line_within_their_lines() {
+    fn up_and_down_scroll_the_details_by_a_row_until_their_last_row_shows() {
         let mut app = with_history(watching());
+        (app.width, app.height) = (80, 4);
         press(&mut app, KeyCode::Char('h'));
         app.history_request(false);
         app.history_read(WEIHAN, Some(history_lines(2)));
